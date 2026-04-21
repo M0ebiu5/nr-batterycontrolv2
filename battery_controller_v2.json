@@ -1,0 +1,1040 @@
+{
+    "id": "flow_battery_v2",
+    "label": "Battery Controller v2",
+    "disabled": false,
+    "info": "Cost-optimized battery charge/discharge controller.\nQueries InfluxDB for prices, solar forecast, SOC, and load.\nOutputs optimal state for each 15-min price interval.",
+    "nodes": [
+        {
+            "id": "inject_manual",
+            "type": "inject",
+            "z": "flow_battery_v2",
+            "name": "Manual trigger",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "topic": "manual",
+            "payload": "",
+            "payloadType": "date",
+            "x": 130,
+            "y": 180,
+            "wires": [
+                [
+                    "query_soc",
+                    "query_acload",
+                    "query_power",
+                    "query_solar",
+                    "query_load_history",
+                    "query_prev_plan",
+                    "query_pv_hist_recent",
+                    "query_pv_hist_1y",
+                    "query_pv_hist_2y",
+                    "read_cached_prices",
+                    "query_pv_now"
+                ]
+            ]
+        },
+        {
+            "id": "query_soc",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "SOC from global",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "payload",
+                    "pt": "msg",
+                    "to": "[{\"soc\": $globalContext('ess').Soc}]",
+                    "tot": "jsonata"
+                }
+            ],
+            "x": 350,
+            "y": 80,
+            "wires": [
+                [
+                    "set_topic_soc"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_soc",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: soc",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "soc",
+                    "tot": "str"
+                }
+            ],
+            "x": 600,
+            "y": 40,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_acload",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra",
+            "name": "AC Load",
+            "query": "SELECT LAST(acload) AS acload FROM ess WHERE time > now() - 30m",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 360,
+            "y": 120,
+            "wires": [
+                [
+                    "set_topic_acload"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_acload",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: acload",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "acload",
+                    "tot": "str"
+                }
+            ],
+            "x": 610,
+            "y": 80,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_power",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra",
+            "name": "Power",
+            "query": "SELECT LAST(Power) AS power FROM ess WHERE time > now() - 30m",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 350,
+            "y": 160,
+            "wires": [
+                [
+                    "set_topic_power"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_power",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: power",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "power",
+                    "tot": "str"
+                }
+            ],
+            "x": 610,
+            "y": 120,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_prices",
+            "type": "http request",
+            "z": "flow_battery_v2",
+            "name": "Spotty Prices",
+            "method": "GET",
+            "ret": "obj",
+            "paytoqs": "ignore",
+            "url": "https://i.spottyenergie.at/api/prices/MARKET/f82f2a62-37b9-4310-b75b-c3a8d4219faa?timezone=at",
+            "tls": "",
+            "persist": false,
+            "proxy": "",
+            "insecureHTTPParser": false,
+            "authType": "",
+            "senderr": false,
+            "headers": [],
+            "x": 830,
+            "y": 520,
+            "wires": [
+                [
+                    "transform_prices"
+                ]
+            ]
+        },
+        {
+            "id": "transform_prices",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Cache & topic: prices",
+            "func": "msg.topic = \"prices\";\nconst prices = (msg.payload || []).map(p => ({\n    time: new Date(p.from).getTime(),\n    marketprice: p.price\n}));\nmsg.payload = prices;\n// Cache in flow context with date stamp\nconst today = new Date().toISOString().slice(0, 10);\nconst cached = flow.get(\"cachedPrices\") || {};\n// Check if prices contain tomorrow (new data)\nconst tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);\nconst hasTomorrow = prices.some(p => new Date(p.time).toISOString().slice(0, 10) === tomorrow);\nflow.set(\"cachedPrices\", {\n    date: today,\n    hasTomorrow: hasTomorrow,\n    prices: prices,\n    updatedAt: Date.now()\n});\nnode.status({ fill: hasTomorrow ? \"green\" : \"yellow\", shape: \"dot\", text: \"Prices updated \" + new Date().toLocaleTimeString(\"de-DE\", {timeZone: \"Europe/Berlin\"}) + (hasTomorrow ? \" (incl tomorrow)\" : \" (today only)\") });\nreturn null; // do NOT send to join — prices go via inject_read_prices",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 1060,
+            "y": 540,
+            "wires": [
+                [
+                    "retry_price_fetch"
+                ]
+            ]
+        },
+        {
+            "id": "query_solar",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_forecast",
+            "name": "Solar",
+            "query": "SELECT sunshineDurationInMinutes FROM forecastnew WHERE time >= now() - 1h ORDER BY time ASC",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 350,
+            "y": 200,
+            "wires": [
+                [
+                    "set_topic_solar"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_solar",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: solar",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "solar",
+                    "tot": "str"
+                }
+            ],
+            "x": 610,
+            "y": 160,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_load_history",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra",
+            "name": "Load History",
+            "query": "SELECT mean(acload) AS avg_load FROM ess WHERE time > now() - 24h GROUP BY time(1h) ORDER BY time ASC",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 370,
+            "y": 240,
+            "wires": [
+                [
+                    "set_topic_load_history"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_load_history",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: load_history",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "load_history",
+                    "tot": "str"
+                }
+            ],
+            "x": 630,
+            "y": 200,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_prev_plan",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra",
+            "name": "Prev Plan",
+            "query": "SELECT AcPowerSetPoint, Soc, reason, engdem FROM plan WHERE time >= now() - 1h ORDER BY time ASC LIMIT 10",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 360,
+            "y": 280,
+            "wires": [
+                [
+                    "set_topic_prev_plan"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_prev_plan",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: prev_plan",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "prev_plan",
+                    "tot": "str"
+                }
+            ],
+            "x": 620,
+            "y": 240,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "join_results",
+            "type": "join",
+            "z": "flow_battery_v2",
+            "name": "Join 9 queries",
+            "mode": "custom",
+            "build": "object",
+            "property": "payload",
+            "propertyType": "msg",
+            "key": "topic",
+            "joiner": "\\n",
+            "joinerType": "str",
+            "accumulate": false,
+            "timeout": "10",
+            "count": "9",
+            "reduceRight": false,
+            "reduceExp": "",
+            "reduceInit": "",
+            "reduceInitType": "",
+            "reduceFixup": "",
+            "x": 880,
+            "y": 160,
+            "wires": [
+                [
+                    "get_weather"
+                ]
+            ]
+        },
+        {
+            "id": "get_weather",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Add Weather Context",
+            "func": "// Get weather from global context\nconst weather = global.get('weather') || {\n    temp: 15,\n    humidity: 50,\n    solarradiation: 0,\n    rainrate: 0\n};\n// Don't set fake sunRise/sunSet — let isDaylight use its hour-based fallback\nif (weather.sunRise === weather.sunSet) {\n    delete weather.sunRise;\n    delete weather.sunSet;\n}\nmsg.weather = weather;\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 1080,
+            "y": 160,
+            "wires": [
+                [
+                    "optimizer"
+                ]
+            ]
+        },
+        {
+            "id": "optimizer",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Battery Optimizer",
+            "func": "// ============================================================\n// Battery Controller v2 - Cost Optimization Algorithm\n// ============================================================\n// Battery: 30 kWh, charger max 3500W, min SOC 3%\n// States: 1=charge from grid, 3=compensate load, 4=max discharge\n// Grid fee: +13 ct/kWh, reduced 20% in months 4-9 between 10:00-16:00\n// Hard rule: NEVER feed in at negative market prices (we'd pay the grid)\n// ============================================================\n\nconst BATTERY_CAPACITY_KWH = 30;\nconst MAX_CHARGE_W = 3500;\nconst MAX_DISCHARGE_W = 3500;\nconst AVG_LOAD_W = 700;\nconst MIN_SOC_PCT = 3;\nconst INTERVAL_HOURS = 0.25; // 15 minutes\nconst PV_PEAK_W = 5000;\nconst BASE_GRID_FEE = 13; // ct/kWh\nconst TIMEZONE = 'Europe/Berlin';\n\n// Timezone-aware time extraction (all logic must use local Berlin time, not UTC)\nconst _tzFmt = new Intl.DateTimeFormat('en-US', {\n    timeZone: TIMEZONE, hour: 'numeric', minute: 'numeric', month: 'numeric', hour12: false\n});\nfunction berlinTime(timeMs) {\n    const parts = _tzFmt.formatToParts(new Date(timeMs));\n    const get = type => parseInt(parts.find(p => p.type === type).value);\n    return { hour: get('hour'), minute: get('minute'), month: get('month') };\n}\n\n// --- Parse inputs ---\n// influxdb in nodes return arrays of {time, field1, field2, ...}\nconst raw = msg.payload;\nconst weather = msg.weather || {};\n\nfunction lastVal(arr, field) {\n    if (!arr || !arr.length) return null;\n    for (let i = arr.length - 1; i >= 0; i--) {\n        if (arr[i][field] !== null && arr[i][field] !== undefined) return arr[i][field];\n    }\n    return null;\n}\n\nfunction toTimeSeries(arr, field) {\n    if (!arr || !arr.length) return [];\n    return arr.filter(r => r[field] !== null && r[field] !== undefined).map(r => ({\n        time: typeof r.time === 'number' ? r.time : new Date(r.time).getTime(),\n        value: r[field]\n    }));\n}\n\n// Current SOC\nlet currentSoc = lastVal(raw.soc, 'soc');\nif (currentSoc === null) currentSoc = 50; // fallback\n\n// Current AC load\nlet currentLoad = lastVal(raw.acload, 'acload');\nif (currentLoad === null) currentLoad = AVG_LOAD_W;\n\n// Current battery power\nlet currentPower = lastVal(raw.power, 'power');\n\n// Current actual PV power from inverter\nlet currentPvPower = lastVal(raw.pv_now, 'pv_now');\nif (currentPvPower === null) currentPvPower = 0;\n\n// Price forecast\nconst prices = toTimeSeries(raw.prices, 'marketprice');\n\n// Solar forecast (sunshine minutes per hour)\nconst solarMinutes = toTimeSeries(raw.solar, 'sunshineDurationInMinutes');\n\n// Load history for hourly pattern\nconst loadHistory = toTimeSeries(raw.load_history, 'avg_load');\n\n// Build hourly load pattern (0-23h)\nconst hourlyLoad = new Array(24).fill(AVG_LOAD_W);\nif (loadHistory.length > 0) {\n    for (const lh of loadHistory) {\n        const h = berlinTime(lh.time).hour;\n        if (lh.value > 0) hourlyLoad[h] = lh.value;\n    }\n}\n\n// PV history for hourly production profile, filtered by similar calendar period\nconst pvHistoryRaw = raw.pv_history || [];\n\n// Filter to ±15 days of current day-of-year (same season from previous years)\nconst nowDate = new Date();\nconst dayOfYear = Math.floor((nowDate.getTime() - new Date(nowDate.getFullYear(), 0, 0).getTime()) / 86400000);\nconst pvHistoryFiltered = pvHistoryRaw.filter(r => {\n    const t = typeof r.time === 'number' ? new Date(r.time) : new Date(r.time);\n    const doy = Math.floor((t.getTime() - new Date(t.getFullYear(), 0, 0).getTime()) / 86400000);\n    const diff = Math.abs(doy - dayOfYear);\n    return Math.min(diff, 365 - diff) <= 15;\n});\n\n// Build per-day profiles: { dateStr: { peak, hours: {h: avgPv} } }\nconst pvDays = {};\nfor (const r of pvHistoryFiltered) {\n    if (r.avg_pv === null && r.max_pv === null) continue;\n    const t = typeof r.time === 'number' ? new Date(r.time) : new Date(r.time);\n    const dateStr = t.toISOString().slice(0, 10);\n    const h = berlinTime(t.getTime()).hour;\n    if (!pvDays[dateStr]) pvDays[dateStr] = { peak: 0, hours: {} };\n    if (r.avg_pv > 0) pvDays[dateStr].hours[h] = r.avg_pv;\n    if (r.max_pv > pvDays[dateStr].peak) pvDays[dateStr].peak = r.max_pv;\n}\n\n\n// Estimate today's expected peak from sunshine forecast\n// sunRatio ~1 = full sun → peak ~PV_PEAK_W, sunRatio ~0.3 = cloudy → peak ~1500W\nconst midDaySunRatio = solarMinutes.length > 0\n    ? Math.max(...solarMinutes.map(s => s.value)) / 60\n    : (weather.solarradiation > 0 ? Math.min(weather.solarradiation / 1000, 1) : 0.5);\nconst expectedPeak = midDaySunRatio * PV_PEAK_W;\n\n// Select days with similar peak (within 30% of expected)\nconst tolerance = Math.max(expectedPeak * 0.3, 500);\nconst matchingDates = Object.keys(pvDays).filter(d =>\n    Math.abs(pvDays[d].peak - expectedPeak) <= tolerance && pvDays[d].peak > 200\n);\n\n// Build hourly PV profile from matching days, fallback to all days\nconst hourlyPv = new Array(24).fill(0);\nconst baselineMatched = matchingDates.length >= 3;\nconst sourceDates = baselineMatched ? matchingDates : Object.keys(pvDays);\n// What sunshine ratio does the baseline represent? If we matched today's\n// peak, the baseline reflects midDaySunRatio. If we fell back to ALL days\n// (which happens whenever today's forecast is cloudy enough that <3 historical\n// days match — including fully-cloudy days with midDaySunRatio ≈ 0), the\n// baseline represents typical/sunny days, so the reference is ~1.\nconst baselineRefRatio = baselineMatched ? Math.max(midDaySunRatio, 0.1) : 1;\nconst pvByHour = new Array(24).fill(null).map(() => []);\nfor (const d of sourceDates) {\n    for (const [h, val] of Object.entries(pvDays[d].hours)) {\n        pvByHour[parseInt(h)].push(val);\n    }\n}\nfor (let h = 0; h < 24; h++) {\n    if (pvByHour[h].length > 0) {\n        hourlyPv[h] = pvByHour[h].reduce((a, b) => a + b, 0) / pvByHour[h].length;\n    }\n}\n\n\nif (prices.length === 0) {\n    node.warn('No price data available');\n    msg.payload = { error: 'No price data available' };\n    return msg;\n}\n\n// --- Helper functions ---\nconst now = Date.now();\nconst sunRise = weather.sunRise ? new Date(weather.sunRise).getTime() : null;\nconst sunSet = weather.sunSet ? new Date(weather.sunSet).getTime() : null;\n\nfunction isDaylight(timeMs) {\n    if (!sunRise || !sunSet) {\n        const h = berlinTime(timeMs).hour;\n        return h >= 5 && h <= 18;\n    }\n    const rise = berlinTime(sunRise);\n    const set = berlinTime(sunSet);\n    const cur = berlinTime(timeMs);\n    const mins = cur.hour * 60 + cur.minute;\n    return mins >= (rise.hour * 60 + rise.minute) && mins <= (set.hour * 60 + set.minute);\n}\n\nfunction getSunshineRatio(timeMs) {\n    // Find nearest sunshine forecast (hourly data)\n    let best = null;\n    let bestDist = Infinity;\n    for (const sm of solarMinutes) {\n        const dist = Math.abs(sm.time - timeMs);\n        if (dist < bestDist) {\n            bestDist = dist;\n            best = sm;\n        }\n    }\n    if (best && bestDist < 2 * 3600 * 1000) {\n        return Math.min(best.value / 60, 1); // 0-1 ratio\n    }\n    // Fallback: use current solar radiation from weather\n    if (weather.solarradiation > 0 && isDaylight(timeMs)) {\n        return Math.min(weather.solarradiation / 1000, 1);\n    }\n    return 0;\n}\n\n// Strict version: returns the forecast sunshine ratio for the slot, or null\n// if the hourly forecast doesn't actually cover this time. Unlike\n// getSunshineRatio, it does NOT fall back to the current weather station\n// solarradiation — that reading only describes the current moment and would\n// silently apply to every slot (wrong). Callers use null to mean \"no forecast\n// adjustment available\" rather than \"forecast says zero\".\nfunction getSunshineForecast(timeMs) {\n    let best = null;\n    let bestDist = Infinity;\n    for (const sm of solarMinutes) {\n        const dist = Math.abs(sm.time - timeMs);\n        if (dist < bestDist) {\n            bestDist = dist;\n            best = sm;\n        }\n    }\n    if (best && bestDist < 90 * 60 * 1000) {\n        return Math.min(Math.max(best.value / 60, 0), 1);\n    }\n    return null;\n}\n\nfunction estimatePvPower(timeMs) {\n    if (!isDaylight(timeMs)) return 0;\n    const now = Date.now();\n    const hoursAhead = (timeMs - now) / (3600 * 1000);\n    const h = berlinTime(timeMs).hour;\n    const basePvRaw = hourlyPv[h] || 0;\n\n    // Scale the historical-profile baseline by the per-slot sunshine\n    // forecast. The raw hourlyPv profile is built from historical days\n    // matching today's PEAK sunshine, but (a) on a fully cloudy day the\n    // matching filter falls back to ALL days (sunny baseline), and (b) even\n    // on a matched day the morning/afternoon forecast can differ from the\n    // peak hour. Without this scaling, when PAC=0 AND solarradiation=0 the\n    // function falls through to the raw sunny baseline.\n    let basePv = basePvRaw;\n    const slotForecast = getSunshineForecast(timeMs);\n    if (slotForecast !== null && basePvRaw > 0) {\n        basePv = basePvRaw * Math.min(slotForecast / baselineRefRatio, 1.2);\n    }\n\n    // Correct with real-time data for all remaining daylight slots today:\n    // 1. Actual inverter PV power (PAC) — most accurate\n    // 2. Solar radiation from weather station — good proxy when PAC unavailable\n    // Weather conditions persist, so apply correction broadly with gradual fade.\n    if (hoursAhead >= -0.5 && hoursAhead < 8) {\n        const currentH = berlinTime(now).hour;\n        const basePvNow = hourlyPv[currentH] || 1;\n        let scaleFactor = null;\n\n        // Prefer actual PV power from inverter\n        if (currentPvPower > 0 && basePvNow > 0) {\n            scaleFactor = currentPvPower / basePvNow;\n        }\n        // Fall back to solar radiation ratio (W/m² vs clear-sky ~1000 W/m²)\n        if (scaleFactor === null && weather.solarradiation > 0) {\n            const sunRatio = Math.min(weather.solarradiation / 1000, 1);\n            scaleFactor = sunRatio / Math.max(getSunshineRatio(now), 0.1);\n            scaleFactor = Math.max(0.1, Math.min(scaleFactor, 2.5));\n        }\n\n        if (scaleFactor !== null) {\n            if (basePvRaw <= 0) return hoursAhead < 0.5 ? (currentPvPower || 0) : 0;\n            // Blend: full correction now, fades to 30% correction at +8h\n            // Near-term (< 1h): 100% scaled, then gradual taper\n            const blend = hoursAhead <= 0 ? 1.0\n                : hoursAhead < 1 ? 1.0\n                : Math.max(0.3, 1 - (hoursAhead - 1) / 10); // 1.0 at 1h, 0.3 at 8h\n            // `scaled` uses the RAW hour baseline * scaleFactor so the PAC\n            // correction magnitude is preserved; we blend against the\n            // forecast-adjusted basePv (so weaker forecast means weaker far\n            // slots even when current PAC is strong).\n            const scaled = basePvRaw * scaleFactor;\n            return Math.min(basePv * (1 - blend) + scaled * blend, PV_PEAK_W);\n        }\n    }\n\n    if (basePv <= 0) return 0;\n\n    // Historical profile with rain adjustment for further-out slots\n    let rainFactor = 1;\n    if (weather.rainrate > 0) rainFactor = 0.3;\n\n    return Math.min(basePv * rainFactor, PV_PEAK_W);\n}\n\nfunction getGridFee(timeMs) {\n    const bt = berlinTime(timeMs);\n    let fee = BASE_GRID_FEE;\n    // 20% reduction in months 4-9, between 10:00-16:00 local time\n    if (bt.month >= 4 && bt.month <= 9 && bt.hour >= 10 && bt.hour < 16) {\n        fee = fee * 0.8;\n    }\n    return fee;\n}\n\nfunction getEffectivePrice(marketPrice, timeMs) {\n    // Total cost when charging from grid\n    return marketPrice + getGridFee(timeMs);\n}\n\nfunction getLoadEstimate(timeMs) {\n    const h = berlinTime(timeMs).hour;\n    return hourlyLoad[h] || AVG_LOAD_W;\n}\n\nfunction socToKwh(soc) {\n    return (soc / 100) * BATTERY_CAPACITY_KWH;\n}\n\nfunction kwhToSoc(kwh) {\n    return (kwh / BATTERY_CAPACITY_KWH) * 100;\n}\n\n// --- Main optimization ---\n// Strategy: plan-based price optimization\n//\n// Phase 1: Build schedule with PV/load estimates\n// Phase 2: Simulate SOC with PV+load only → find energy gaps and surpluses\n// Phase 3: Assign grid charging to cheapest slots where energy is needed\n// Phase 4: Assign feed-in to most expensive slots where surplus exists or\n//          battery capacity is needed for upcoming PV\n\n// Build the schedule array aligned to price data\nlet schedule = [];\n\n// First pass: compute effective prices and PV estimates\nfor (const p of prices) {\n    const t = p.time;\n    const marketPrice = p.value;\n    const effPrice = getEffectivePrice(marketPrice, t);\n    const pvPower = estimatePvPower(t);\n    const loadEst = getLoadEstimate(t);\n    const netPv = pvPower - loadEst; // positive = surplus, negative = deficit\n    \n    schedule.push({\n        time: t,\n        timeStr: new Date(t).toLocaleString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' }),\n        marketPrice: marketPrice,\n        effectivePrice: effPrice,\n        gridFee: getGridFee(t),\n        pvPower: Math.round(pvPower),\n        loadEst: Math.round(loadEst),\n        netPv: Math.round(netPv),\n        state: null,\n        predictedSoc: null,\n        reason: '',\n        acPowerSetPoint: 0\n    });\n}\n\n// Reserve SOC for the \"unplanned window\" past the last price slot. The\n// next optimizer run will be blind beyond its own horizon until fresh\n// prices publish (~24h cadence), so reserve enough to carry through.\n// The reserve is weighted by the forecast: sunny tomorrow → low reserve\n// (night gap dominates); cloudy/bad forecast → reserve climbs because\n// PV never offsets load in the walk. Phase 3 picks up the higher socNeeded\n// and plans extra grid charging at the cheapest in-horizon slots.\nlet _postSchedLoadKwh = 0;\nif (schedule.length > 0) {\n    const lastSlotEnd = schedule[schedule.length - 1].time + INTERVAL_HOURS * 3600 * 1000;\n    // Cover the \"blind window\" — midnight until the next day's prices\n    // publish around 13:00-14:00. Not a full 24h: once new prices arrive,\n    // the next optimizer run has full visibility and can plan freely.\n    const RESERVE_HOURS = 14;\n    const MAX_RESERVE_KWH = 6; // ~20% SOC cap on a 30 kWh battery\n\n    // Fallback PV ratio for walk hours past the forecast window. Average\n    // the daylight forecast ratios from the tail of the schedule. <4 tail\n    // samples → 0.5 (neutral; not \"sunny\" default because that would hide\n    // bad-weather reserves when the forecast window is short).\n    let tomorrowPvRatio = 0.5;\n    {\n        const tail = [];\n        for (let i = schedule.length - 1; i >= 0 && tail.length < 16; i--) {\n            const s = schedule[i];\n            if (!isDaylight(s.time)) continue;\n            const fc = getSunshineForecast(s.time);\n            if (fc !== null) tail.push(fc);\n        }\n        if (tail.length >= 4) {\n            tomorrowPvRatio = tail.reduce((a, b) => a + b, 0) / tail.length;\n        }\n    }\n\n    for (let h = 0; h < RESERVE_HOURS; h++) {\n        const t = lastSlotEnd + h * 3600000;\n        const loadW = getLoadEstimate(t);\n        let pvW = 0;\n        if (isDaylight(t)) {\n            const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;\n            const slotForecast = getSunshineForecast(t);\n            const ratio = slotForecast !== null ? slotForecast : tomorrowPvRatio;\n            pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);\n        }\n        _postSchedLoadKwh += Math.max(0, loadW - pvW) / 1000; // 1-hour step\n    }\n\n    if (_postSchedLoadKwh > MAX_RESERVE_KWH) _postSchedLoadKwh = MAX_RESERVE_KWH;\n}\n\n// Compute price statistics for thresholds\nconst allPrices = schedule.map(s => s.marketPrice);\nconst avgPrice = allPrices.reduce((a, b) => a + b, 0) / allPrices.length;\nconst minPrice = Math.min(...allPrices);\nconst maxPrice = Math.max(...allPrices);\nconst priceRange = maxPrice - minPrice;\n\n// Price range is used for feed-in candidate filtering\n\n// --- Pre-emptive discharge: empty battery before sunny day with negative prices ---\n// After ~13:00 tomorrow's prices are known. If tomorrow has strong solar AND\n// low/negative prices during solar hours, we should discharge tonight at the\n// highest available prices to create free capacity for tomorrow's PV.\nlet preemptiveDischargeSlots = new Set();\nlet targetSocForSunrise = null;\n\n(function computePreemptiveDischarge() {\n    if (schedule.length < 8) return;\n\n    // Find next sunrise using isDaylight (time-of-day based, works without forecast data).\n    // Look for future: night slot → then first daylight slot after it.\n    let foundNight = false;\n    let nextSunriseIdx = -1;\n    for (let k = 0; k < schedule.length; k++) {\n        if (schedule[k].time < now - 1800000) continue;\n        if (!isDaylight(schedule[k].time)) {\n            foundNight = true;\n        } else if (foundNight) {\n            nextSunriseIdx = k;\n            break;\n        }\n    }\n    if (nextSunriseIdx < 0) return;\n\n    const sunriseTime = schedule[nextSunriseIdx].time;\n\n    // Collect tomorrow's daylight slots\n    const nextDayDaylightSlots = [];\n    for (let k = nextSunriseIdx; k < schedule.length; k++) {\n        if (isDaylight(schedule[k].time)) {\n            nextDayDaylightSlots.push(schedule[k]);\n        } else if (nextDayDaylightSlots.length > 0) {\n            break;\n        }\n    }\n    if (nextDayDaylightSlots.length === 0) return;\n\n    // Check tomorrow's daylight prices: count negative/very low price slots\n    let negPriceSlots = 0;\n    let veryLowSlots = 0;\n    for (const s of nextDayDaylightSlots) {\n        if (s.marketPrice <= 0) negPriceSlots++;\n        if (s.marketPrice < 3) veryLowSlots++;\n    }\n\n    // Need at least 1h of negative prices OR 2h of very low prices during daylight\n    if (negPriceSlots < 4 && veryLowSlots < 8) return;\n\n    // Estimate tomorrow's PV surplus. Use pvPower from schedule if available (has forecast),\n    // otherwise estimate conservatively from today's pattern.\n    let totalSurplusKwh = 0;\n    let hasForecastPv = false;\n    for (const s of nextDayDaylightSlots) {\n        if (s.pvPower > 200) hasForecastPv = true;\n        const pvEst = s.pvPower > 0 ? s.pvPower : estimatePvPower(s.time);\n        const surplusW = Math.max(0, pvEst - s.loadEst);\n        totalSurplusKwh += surplusW * INTERVAL_HOURS / 1000;\n    }\n\n    // If no PV forecast exists but prices are negative during daylight,\n    // that itself signals solar overproduction — estimate conservatively.\n    if (!hasForecastPv && negPriceSlots >= 4) {\n        // Negative daylight prices = strong solar expected.\n        // Conservative estimate: 3kW avg surplus for neg-price hours.\n        totalSurplusKwh = Math.max(totalSurplusKwh, negPriceSlots * INTERVAL_HOURS * 3);\n    }\n\n    if (totalSurplusKwh < 3) return;\n\n    // Target SOC at sunrise: free capacity = expected PV surplus, floor at 15%\n    const capacityNeededPct = kwhToSoc(totalSurplusKwh);\n    targetSocForSunrise = Math.max(15, 100 - capacityNeededPct);\n    // Negative daylight prices = solar glut ahead. PV-surplus estimate can\n    // underestimate (forecast noise, fallback paths); the neg-price signal\n    // is the authoritative cue that capacity will be needed. Force ≤20%.\n    if (negPriceSlots >= 4) {\n        targetSocForSunrise = Math.min(targetSocForSunrise, 20);\n    }\n\n    // Evening/night slots before sunrise + early morning with negligible PV\n    const eveningSlots = schedule.filter(s =>\n        s.time >= now - 1800000 && s.time < sunriseTime && !isDaylight(s.time)\n    );\n    // Also include early morning slots (first 2h after sunrise) where PV < load\n    for (let k = nextSunriseIdx; k < Math.min(nextSunriseIdx + 8, schedule.length); k++) {\n        const s = schedule[k];\n        if (s.pvPower >= s.loadEst) break; // PV picks up, stop\n        if (s.time >= now - 1800000) eveningSlots.push(s);\n    }\n    if (eveningSlots.length === 0) return;\n\n    // How much SOC does compensate-only drain overnight?\n    let compensateDrainPct = 0;\n    for (const s of eveningSlots) {\n        compensateDrainPct += kwhToSoc(s.loadEst * INTERVAL_HOURS / 1000);\n    }\n\n    const socAtSunriseIfCompensate = currentSoc - compensateDrainPct;\n    const extraDrainNeeded = socAtSunriseIfCompensate - targetSocForSunrise;\n    if (extraDrainNeeded <= 3) return;\n\n    // Sort by market price descending: discharge at the highest prices first.\n    // Skip negative-price slots entirely — never feed to grid when we'd pay.\n    const sortedEvening = [...eveningSlots]\n        .filter(s => s.marketPrice > 0)\n        .sort((a, b) => b.marketPrice - a.marketPrice);\n\n    let extraDrainAccum = 0;\n    for (const s of sortedEvening) {\n        if (extraDrainAccum >= extraDrainNeeded) break;\n        const slotExtraDrain = kwhToSoc(MAX_DISCHARGE_W * INTERVAL_HOURS / 1000);\n        preemptiveDischargeSlots.add(s.time);\n        extraDrainAccum += slotExtraDrain;\n    }\n\n    node.warn(`Preemptive ACTIVE: target=${targetSocForSunrise.toFixed(1)}%, sunrise=${new Date(sunriseTime).toISOString()}, extraDrain=${extraDrainNeeded.toFixed(1)}%, slots=${preemptiveDischargeSlots.size}, surplus=${totalSurplusKwh.toFixed(1)}kWh, negSlots=${negPriceSlots}`);\n})();\n\n// Remove past slots, only keep current and future\nschedule = schedule.filter(s => s.time >= now - 900000);\n\nconst maxChargeEnergy = MAX_CHARGE_W * INTERVAL_HOURS / 1000; // 0.875 kWh per slot\nconst maxDischargeEnergy = MAX_DISCHARGE_W * INTERVAL_HOURS / 1000;\n\n// ================================================================\n// PHASE 2: Simulate SOC with PV + load only (no grid interaction)\n// Identify where deficits and surpluses occur\n// ================================================================\nlet passiveSoc = currentSoc;\nfor (let i = 0; i < schedule.length; i++) {\n    const s = schedule[i];\n    const pvW = s.pvPower;\n    const loadW = s.loadEst;\n    const netPvW = pvW - loadW;\n    const netEnergy = netPvW * INTERVAL_HOURS / 1000;\n    passiveSoc = Math.max(MIN_SOC_PCT, Math.min(100, passiveSoc + kwhToSoc(netEnergy)));\n    s._passiveSoc = passiveSoc;\n}\n\n// ================================================================\n// PHASE 3: Plan charging at cheapest slots and feed-in at most expensive\n// ================================================================\n\n// Mark each slot with a planned action: 'charge', 'feedin', or null (compensate)\nfor (const s of schedule) s._plan = null;\n\n// --- 3a. (removed) Never feed in at negative prices, regardless of magnitude ---\n\n// --- 3b. Force-assign preemptive discharge slots ---\nfor (const s of schedule) {\n    if (preemptiveDischargeSlots.has(s.time)) {\n        s._plan = 'feedin_preemptive';\n    }\n}\n\n// --- 3c. Plan charging: horizon-wide cheapest-slot selection ---\n// Iteratively simulate the SOC trajectory across the whole schedule.\n// Whenever a slot falls below MIN_SOC+5, pick the cheapest unplanned\n// upstream slot — across the WHOLE horizon, including PV-surplus slots —\n// and mark it as 'charge'. Grid charging and PV-to-battery are additive\n// (Phase 4 state=1 branch), so a cheap mid-day surplus slot is a valid\n// candidate for covering an evening deficit. If committing a candidate\n// doesn't actually raise SOC at the deficit slot (the extra charge was\n// clamped away by a full-battery stretch in between), revert and try the\n// next cheapest.\n{\n    const minTargetSoc = MIN_SOC_PCT + 5;\n\n    function simulateSocTrajectory() {\n        let s0 = currentSoc;\n        const traj = new Array(schedule.length);\n        for (let i = 0; i < schedule.length; i++) {\n            const s = schedule[i];\n            const pvW = s.pvPower;\n            const loadW = s.loadEst;\n            if (s._plan === 'charge') {\n                // Battery absorbs at most MAX_CHARGE_W total (grid + PV combined).\n                s0 += kwhToSoc(maxChargeEnergy);\n            } else if (s._plan === 'feedin_preemptive') {\n                const drainW = MAX_DISCHARGE_W + loadW - pvW;\n                s0 -= kwhToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);\n            } else {\n                s0 += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);\n            }\n            s0 = Math.max(MIN_SOC_PCT, Math.min(100, s0));\n            traj[i] = s0;\n        }\n        return traj;\n    }\n\n    // The final slot must end high enough to survive the post-schedule\n    // unplanned window (_postSchedLoadKwh). Every other slot only needs to\n    // stay above the plain minTargetSoc floor — PV/charging can refill them.\n    const endSlotTarget = minTargetSoc + kwhToSoc(_postSchedLoadKwh);\n    const lastIdx = schedule.length - 1;\n    function slotTarget(d) {\n        return d === lastIdx ? endSlotTarget : minTargetSoc;\n    }\n\n    const MAX_CHARGE_PICKS = schedule.length;\n    for (let iter = 0; iter < MAX_CHARGE_PICKS; iter++) {\n        const traj = simulateSocTrajectory();\n\n        let committed = false;\n        // Walk deficits in time order. For each one, try cheapest-first\n        // upstream candidates. If none help, move on to the next deficit.\n        deficitLoop:\n        for (let d = 0; d < schedule.length; d++) {\n            if (traj[d] >= slotTarget(d)) continue;\n\n            const eligible = [];\n            for (let i = 0; i <= d; i++) {\n                const s = schedule[i];\n                if (s._plan) continue;\n                // Never grid-charge at night during preemptive discharge.\n                if (targetSocForSunrise !== null && !isDaylight(s.time) && s.pvPower < 200) continue;\n                eligible.push({ idx: i, effPrice: s.effectivePrice });\n            }\n            eligible.sort((a, b) => a.effPrice - b.effPrice);\n\n            const socBefore = traj[d];\n            for (const cand of eligible) {\n                schedule[cand.idx]._plan = 'charge';\n                const newTraj = simulateSocTrajectory();\n                if (newTraj[d] > socBefore + 0.1) {\n                    committed = true;\n                    break deficitLoop;\n                }\n                schedule[cand.idx]._plan = null;\n            }\n        }\n        if (!committed) break;\n    }\n}\n\n// --- 3d. Feed-in planning: discharge at highest prices when we have excess ---\n// Excess = SOC above what's needed for upcoming load until next PV surplus.\n// Also: free capacity for upcoming PV by discharging before solar hours.\n\n// Simulate forward again with charge plan applied to find available surplus\nlet simSoc = currentSoc;\nfor (let i = 0; i < schedule.length; i++) {\n    const s = schedule[i];\n    const pvW = s.pvPower;\n    const loadW = s.loadEst;\n\n    if (s._plan === 'charge') {\n        simSoc += kwhToSoc(maxChargeEnergy);\n    } else if (s._plan === 'feedin_preemptive') {\n        const drainW = MAX_DISCHARGE_W + loadW - pvW;\n        simSoc -= kwhToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);\n    } else {\n        simSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);\n    }\n    simSoc = Math.max(MIN_SOC_PCT, Math.min(100, simSoc));\n    s._plannedSoc = simSoc;\n}\n\n// --- 3d. Feed-in planning: budget-based with rolling-horizon ---\n// The optimizer re-runs every cycle. By tomorrow afternoon we will have actual\n// PV data and re-decide for tomorrow evening. So today's planning horizon ends\n// at the *next PV refill point* — the slot where passive (PV-load only) SOC\n// climbs back to a high level after dipping. Slots beyond that horizon belong\n// to the next planning cycle and must NOT compete with today's slots for SOC.\n//\n// 1) Find the next PV-refill point (horizon end).\n// 2) Compute the total SOC budget available for feed-in within the horizon.\n// 3) Greedily pick highest-priced unplanned slots within the horizon until\n//    the budget is spent.\n// 4) Forward-walk the WHOLE schedule to demote infeasible feed-ins and update\n//    _plannedSoc for output.\n\nfunction feedinDrainSoc(slot) {\n    const drainW = Math.max(0, MAX_DISCHARGE_W + slot.loadEst - slot.pvPower);\n    return kwhToSoc(drainW * INTERVAL_HOURS / 1000);\n}\n\n// Find the rolling horizon: walk passive SOC (PV-load only). Track when SOC\n// has dipped below 70% and then climbs back to ≥85% — that's the next refill\n// point. If never reached (cloudy stretch), horizon = end of schedule.\nlet horizonIdx = schedule.length;\n{\n    let testSoc = currentSoc;\n    let dipped = currentSoc < 70;\n    for (let i = 0; i < schedule.length; i++) {\n        const s = schedule[i];\n        testSoc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);\n        testSoc = Math.max(MIN_SOC_PCT, Math.min(100, testSoc));\n        if (testSoc < 70) dipped = true;\n        if (dipped && testSoc >= 85) {\n            horizonIdx = i + 1; // include the refill slot itself\n            break;\n        }\n    }\n}\n\n// Project SOC to the horizon WITHOUT any feed-in plans. Track overflow\n// (curtailed PV above 100%) separately so the \"battery will actually be\n// full\" case still contributes a feed-in budget.\n{\n    let projSoc = currentSoc;\n    let overflowSoc = 0;\n    for (let i = 0; i < horizonIdx; i++) {\n        const s = schedule[i];\n        const pvW = s.pvPower;\n        const loadW = s.loadEst;\n        if (s._plan === 'charge') {\n            projSoc += kwhToSoc(maxChargeEnergy);\n        } else if (s._plan === 'feedin_preemptive') {\n            projSoc -= feedinDrainSoc(s);\n        } else {\n            projSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);\n        }\n        if (projSoc > 100) {\n            overflowSoc += projSoc - 100;\n            projSoc = 100;\n        }\n        if (projSoc < MIN_SOC_PCT) projSoc = MIN_SOC_PCT;\n    }\n\n    // Budget calculation depends on whether a PV refill lies within the\n    // horizon AND whether that refill is \"free\" (driven by solar glut).\n    //\n    // * NO refill (horizon = full schedule, e.g. evening with no PV left):\n    //   anything above the overnight reserve is genuinely \"unused\" SOC and\n    //   can be sold at the best prices, plus any projected curtailment.\n    //\n    // * REFILL ahead, EXPENSIVE (needs grid charging): pre-refill prices\n    //   aren't competitive with the post-refill peak the NEXT planning\n    //   cycle will see. Budget = overflow only so we don't sell SOC we'd\n    //   otherwise carry cheaply into tomorrow's peak.\n    //\n    // * REFILL ahead, FREE (daylight + low/neg marketPrice + PV surplus):\n    //   SOC held past the refill gets replaced by PV for nothing, so pre-\n    //   refill peaks at any positive price are pure profit. Expand budget\n    //   against end-of-schedule floor.\n    const horizonIsRefill = horizonIdx < schedule.length;\n    let freeRefillAhead = false;\n    if (horizonIsRefill) {\n        for (let i = 0; i < horizonIdx; i++) {\n            const s = schedule[i];\n            if (isDaylight(s.time) && s.marketPrice < 3 && s.pvPower > s.loadEst) {\n                freeRefillAhead = true;\n                break;\n            }\n        }\n    }\n    let feedinBudgetSoc;\n    if (horizonIsRefill && !freeRefillAhead) {\n        feedinBudgetSoc = overflowSoc;\n    } else {\n        const endFloorSoc = kwhToSoc(_postSchedLoadKwh) + MIN_SOC_PCT + 8;\n        feedinBudgetSoc = Math.max(0, projSoc + overflowSoc - endFloorSoc);\n    }\n\n    // Greedy: pick highest-priced positive-price unplanned slots WITHIN the\n    // horizon until budget spent. Slots beyond horizon are not eligible —\n    // they belong to the next planning cycle.\n    const candidates = schedule\n        .slice(0, horizonIdx)\n        .map((s, idx) => ({ idx, s }))\n        .filter(({ s }) => !s._plan && s.marketPrice > 0)\n        .sort((a, b) => b.s.marketPrice - a.s.marketPrice);\n\n    // Round-trip economic check: non-overflow feed-in must beat the\n    // cheapest effective price at which we could replace the drained SOC.\n    // Otherwise we'd sell at evening price and buy back at morning+gridFee\n    // on the next cycle — a net loss. Overflow SOC (curtailment) is\n    // exempt: that energy is lost anyway, so any positive revenue wins.\n    const minReplacementEffPrice = schedule\n        .filter(s => !s._plan)\n        .reduce((m, s) => Math.min(m, s.effectivePrice), Infinity);\n\n    let usedBudget = 0;\n    for (const { s } of candidates) {\n        const drain = feedinDrainSoc(s);\n        if (drain <= 0) continue;\n        if (usedBudget + drain > feedinBudgetSoc) break; // stop at first overflow\n        // Overflow portion is free revenue; beyond that, require economic viability.\n        const isOverflowOnly = usedBudget + drain <= overflowSoc;\n        if (!isOverflowOnly && s.marketPrice <= minReplacementEffPrice) break;\n        s._plan = 'feedin_surplus';\n        usedBudget += drain;\n    }\n    // Rationale for `break` (not `continue`): candidates are sorted by\n    // marketPrice DESC. If the current slot doesn't fit, falling through to\n    // cheaper-but-smaller slots would replace a potentially big high-priced\n    // slot with a small low-priced one — strictly worse revenue. Leave the\n    // remaining budget unused; it'll carry over into the next planning cycle\n    // or, if curtailment actually happens, Phase 4's runtime \"battery full\"\n    // branch handles it.\n}\n\n// Forward-validate: walk schedule in time order, demoting any feed-in that\n// would dip SOC below MIN+5 at its slot. Recompute _plannedSoc along the way.\n{\n    let walkSoc = currentSoc;\n    for (let i = 0; i < schedule.length; i++) {\n        const s = schedule[i];\n        const pvW = s.pvPower;\n        const loadW = s.loadEst;\n        if (s._plan === 'charge') {\n            walkSoc += kwhToSoc(maxChargeEnergy);\n        } else if (s._plan === 'feedin_preemptive' || s._plan === 'feedin_surplus') {\n            const drain = feedinDrainSoc(s);\n            if (walkSoc - drain < MIN_SOC_PCT + 5) {\n                // Local infeasibility — demote to compensate\n                s._plan = null;\n                walkSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);\n            } else {\n                walkSoc -= drain;\n            }\n        } else {\n            walkSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);\n        }\n        walkSoc = Math.max(MIN_SOC_PCT, Math.min(100, walkSoc));\n        s._plannedSoc = walkSoc;\n    }\n}\n\n// (Phase 3e removed: the legacy \"free capacity for upcoming PV\" loop iterated\n// per high-PV slot and greedily marked any unplanned earlier slot as feed-in,\n// which would drain SOC at LOW mid-day prices — exactly the wrong choice when\n// the evening peak is hours away. The Phase 3d budget already prioritises the\n// highest-priced slots within the rolling horizon, and Phase 4's runtime\n// \"Battery full + PV surplus\" branch (mp > 0) handles any actual full-battery\n// curtailment situation. Pre-planning capacity feed-in is no longer needed.)\n\n// (Phase 3f removed: the budget-based Phase 3d already guarantees end-of-schedule\n// SOC ≥ MIN_SOC + post-schedule overnight load + safety margin, so no further\n// revocation pass is needed.)\n\n// ================================================================\n// PHASE 4: Execute plan with accurate SOC tracking\n// ================================================================\nlet soc = currentSoc;\n\nfor (let i = 0; i < schedule.length; i++) {\n    const slot = schedule[i];\n    const t = slot.time;\n    const mp = slot.marketPrice;\n    const ep = slot.effectivePrice;\n    const pvW = slot.pvPower;\n    const loadW = slot.loadEst;\n    const plan = slot._plan;\n\n    let state, reason, setPoint;\n\n    // Hard guard: any feedin_* plan at mp < 0 → compensate instead (never pay grid)\n    if (plan && plan.startsWith('feedin') && mp < 0) {\n        state = 3; setPoint = -AVG_LOAD_W;\n        reason = `Skip feed-in at ${mp.toFixed(1)}ct (neg price), compensate instead`;\n    }\n    else if (plan === 'feedin_preemptive' && soc > targetSocForSunrise + 3) {\n        // Preemptive discharge for tomorrow's solar (only fires when mp >= 0 due to guard above)\n        if (soc > targetSocForSunrise + kwhToSoc(maxDischargeEnergy)) {\n            state = 4; setPoint = -MAX_DISCHARGE_W;\n            reason = `Pre-emptive discharge at ${mp.toFixed(1)}ct, target ${targetSocForSunrise.toFixed(0)}% for solar`;\n        } else {\n            state = 3; setPoint = -AVG_LOAD_W;\n            reason = `Pre-emptive compensate at ${mp.toFixed(1)}ct, near target ${targetSocForSunrise.toFixed(0)}%`;\n        }\n    }\n    else if (plan === 'charge') {\n        // Planned cheapest-slot charging\n        state = 1; setPoint = MAX_CHARGE_W;\n        reason = `Planned charge at ${ep.toFixed(1)}ct (cheapest available)`;\n    }\n    else if ((plan === 'feedin_surplus' || plan === 'feedin_capacity')\n             && soc > MIN_SOC_PCT + kwhToSoc(maxDischargeEnergy) + 5) {\n        // Planned feed-in — already validated in Phase 3 with price-aware revocation\n        state = 4; setPoint = -MAX_DISCHARGE_W;\n        const tag = plan === 'feedin_capacity' ? 'free capacity for PV' : 'surplus energy';\n        reason = `Planned feed-in at ${mp.toFixed(1)}ct (${tag})`;\n    }\n    // Strong PV surplus: let solar charge battery\n    else if (pvW - loadW > 1000 && soc < 95) {\n        state = 3; setPoint = -AVG_LOAD_W;\n        reason = `Strong PV surplus ${(pvW - loadW)}W, solar charges battery`;\n    }\n    // PV surplus but battery nearly full: feed in only if price > 0\n    else if (pvW - loadW > 500 && soc >= 95 && mp > 0) {\n        state = 4; setPoint = -MAX_DISCHARGE_W;\n        reason = `Battery full ${soc.toFixed(0)}%, PV surplus, feed-in at ${mp.toFixed(1)}ct`;\n    }\n    // PV surplus, battery full, but price ≤ 0: curtail instead of paying to feed in\n    else if (pvW - loadW > 500 && soc >= 95) {\n        state = 3; setPoint = -AVG_LOAD_W;\n        reason = `Battery full ${soc.toFixed(0)}%, PV surplus but price ${mp.toFixed(1)}ct ≤ 0, curtail`;\n    }\n    // Default: compensate or charge based on future need\n    else {\n        // Look ahead: how much SOC do we need from battery for remaining slots + overnight?\n        let futureNeedKwh = 0;\n        for (let j = i + 1; j < schedule.length; j++) {\n            const net = (schedule[j].loadEst - schedule[j].pvPower) * INTERVAL_HOURS / 1000;\n            if (net > 0) futureNeedKwh += net;\n            if (schedule[j]._plan === 'charge') futureNeedKwh -= maxChargeEnergy;\n        }\n        futureNeedKwh += _postSchedLoadKwh;\n        const socNeeded = kwhToSoc(futureNeedKwh) + MIN_SOC_PCT + 5;\n\n        if (soc > socNeeded) {\n            state = 3; setPoint = -AVG_LOAD_W;\n            reason = `Compensate load, SOC ${soc.toFixed(0)}% > ${socNeeded.toFixed(0)}% needed`;\n        } else if (targetSocForSunrise !== null && !isDaylight(t)) {\n            // Preemptive active at night — never charge from grid, just compensate\n            state = 3; setPoint = -AVG_LOAD_W;\n            reason = `Compensate (no grid charge during preemptive), SOC ${soc.toFixed(0)}%`;\n        } else if (ep > 0) {\n            // Price is positive — just compensate, don't pay to charge\n            state = 3; setPoint = -AVG_LOAD_W;\n            reason = `Compensate (price ${ep.toFixed(1)}ct > 0, SOC ${soc.toFixed(0)}%)`;\n        } else {\n            // Not enough SOC for future load and price <= 0 — charge now\n            state = 1; setPoint = MAX_CHARGE_W;\n            reason = `Charge at ${ep.toFixed(1)}ct, SOC ${soc.toFixed(0)}% < ${socNeeded.toFixed(0)}% needed`;\n        }\n    }\n\n    // === Update SOC prediction ===\n    let socDelta = 0;\n\n    if (state === 1) {\n        // Battery absorbs at most MAX_CHARGE_W total (grid + PV combined).\n        socDelta += kwhToSoc(maxChargeEnergy);\n    } else if (state === 3) {\n        // Compensate: PV covers load first, surplus charges battery, deficit drains battery\n        const netPvW = pvW - loadW;\n        socDelta += kwhToSoc(netPvW * INTERVAL_HOURS / 1000);\n    } else if (state === 4) {\n        // Max discharge: battery feeds grid at max rate + covers load, PV offsets some\n        const drainW = MAX_DISCHARGE_W + loadW - pvW;\n        socDelta -= kwhToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);\n    }\n\n    soc = Math.max(MIN_SOC_PCT, Math.min(100, soc + socDelta));\n\n    // Safety: if SOC hits minimum, override to charge\n    // But NEVER charge from grid during preemptive discharge (night before solar day)\n    if (soc <= MIN_SOC_PCT && state !== 1\n        && !(targetSocForSunrise !== null && !isDaylight(t))) {\n        state = 1; setPoint = MAX_CHARGE_W;\n        reason = `SOC safety override - must charge`;\n        soc = MIN_SOC_PCT + kwhToSoc(maxChargeEnergy);\n    }\n\n    slot.state = state;\n    slot.predictedSoc = Math.round(soc * 10) / 10;\n    slot.reason = reason;\n    slot.acPowerSetPoint = setPoint;\n}\n\n// === Build output ===\nconst output = schedule.map(s => ({\n    time: s.timeStr,\n    state: s.state,\n    acPowerSetPoint: s.acPowerSetPoint,\n    predictedSoc: s.predictedSoc,\n    marketPrice: s.marketPrice,\n    effectivePrice: Math.round(s.effectivePrice * 100) / 100,\n    pvPower: s.pvPower,\n    loadEst: s.loadEst,\n    reason: s.reason\n}));\n\n// Current action (first slot at or after now)\nconst currentSlot = output.find(s => new Date(s.time).getTime() >= now - 900000) || output[0];\n\n// Prepare messages\n// msg1: full schedule for debug\nmsg.payload = output;\nmsg.currentAction = currentSlot;\nmsg.summary = {\n    currentSoc: currentSoc,\n    currentLoad: currentLoad,\n    priceRange: `${minPrice.toFixed(1)} - ${maxPrice.toFixed(1)} ct/kWh`,\n    avgPrice: avgPrice.toFixed(1),\n    slotsPlanned: output.length,\n    currentState: currentSlot ? currentSlot.state : null,\n    currentReason: currentSlot ? currentSlot.reason : 'no data',\n    preemptiveDischarge: targetSocForSunrise !== null,\n    targetSocSunrise: targetSocForSunrise,\n    preemptiveSlots: preemptiveDischargeSlots.size\n};\n\n// msg2: write to batterycontrol.plan via influxdb batch node\n// Array of {measurement, fields, timestamp}\nconst msg2 = {\n    payload: schedule.map(s => ({\n        measurement: 'plan',\n        fields: {\n            AcPowerSetPoint: s.acPowerSetPoint,\n            Soc: s.predictedSoc,\n            reason: s.state,\n            engdem: parseFloat(socToKwh(s.predictedSoc).toFixed(2)),\n            nxd: 0\n        },\n        timestamp: new Date(s.time)\n    }))\n};\n\n// msg3: current setpoint for ESS control\nvar weather7 = global.get(\"weather7days\", \"file\")\nconst msg3 = {\n    topic: 'mac/ess/cmd',\n    payload: {\n        state: currentSlot ? currentSlot.state : 3,\n        reason: currentSlot ? currentSlot.reason : 'no data',\n        val: currentSlot.marketPrice,\n        sun: weather7.sun7[0].value,\n        slots: output\n    }\n};\n\nreturn [msg, msg2, msg3];",
+            "outputs": 3,
+            "timeout": "30",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 770,
+            "y": 640,
+            "wires": [
+                [
+                    "debug_schedule"
+                ],
+                [
+                    "write_plan"
+                ],
+                [
+                    "debug_action",
+                    "ess_output"
+                ]
+            ]
+        },
+        {
+            "id": "write_plan",
+            "type": "influxdb batch",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra",
+            "precision": "ms",
+            "retentionPolicy": "",
+            "name": "Write to infra.plan",
+            "database": "infra",
+            "precisionV18FluxV20": "ms",
+            "retentionPolicyV18Flux": "",
+            "org": "",
+            "bucket": "",
+            "x": 1140,
+            "y": 620,
+            "wires": []
+        },
+        {
+            "id": "debug_schedule",
+            "type": "debug",
+            "z": "flow_battery_v2",
+            "name": "Full Schedule",
+            "active": true,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": true,
+            "complete": "true",
+            "targetType": "full",
+            "statusVal": "summary.currentReason",
+            "statusType": "msg",
+            "x": 1200,
+            "y": 580,
+            "wires": []
+        },
+        {
+            "id": "debug_action",
+            "type": "debug",
+            "z": "flow_battery_v2",
+            "name": "Current Action",
+            "active": true,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": true,
+            "complete": "true",
+            "targetType": "full",
+            "statusVal": "payload.reason",
+            "statusType": "msg",
+            "x": 1100,
+            "y": 340,
+            "wires": []
+        },
+        {
+            "id": "ess_output",
+            "type": "mqtt out",
+            "z": "flow_battery_v2",
+            "name": "ESS Command",
+            "topic": "",
+            "qos": "1",
+            "retain": "false",
+            "respTopic": "",
+            "contentType": "",
+            "userProps": "",
+            "correl": "",
+            "expiry": "",
+            "broker": "e36a332b.c61f3",
+            "x": 1180,
+            "y": 660,
+            "wires": []
+        },
+        {
+            "id": "comment_main",
+            "type": "comment",
+            "z": "flow_battery_v2",
+            "name": "=== Battery Controller v2 - Main Flow ===",
+            "info": "Runs every 15 minutes.\n1. Queries InfluxDB for SOC, prices, solar forecast, load\n2. Optimizes battery state for each price interval\n3. Writes plan to batterycontrol.plan\n4. Outputs current setpoint",
+            "x": 230,
+            "y": 40,
+            "wires": []
+        },
+        {
+            "id": "comment_test",
+            "type": "comment",
+            "z": "flow_battery_v2",
+            "name": "=== Test Cases ===",
+            "info": "Three test scenarios using historic/simulated data",
+            "x": 150,
+            "y": 520,
+            "wires": []
+        },
+        {
+            "id": "test1_inject",
+            "type": "inject",
+            "z": "flow_battery_v2",
+            "name": "Test 1: Sunny day, neg prices",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "topic": "test1",
+            "payload": "",
+            "payloadType": "date",
+            "x": 180,
+            "y": 580,
+            "wires": [
+                [
+                    "test1_setup"
+                ]
+            ]
+        },
+        {
+            "id": "test1_setup",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Test 1: Sunny Apr 7 neg prices",
+            "func": "// Test Case 1: Sunny spring day with negative midday prices\n// Based on April 7, 2026 forecast data\n// Scenario: SOC starts at 50%, sunny day with prices going negative\n\nconst baseTime = new Date('2026-04-07T04:00:00Z').getTime();\n\n// Simulated price data (from actual Apr 7 forecast)\nconst priceData = [\n    [4,0, 12.99],[4,15, 14.56],[4,30, 15.91],[4,45, 17.95],\n    [5,0, 17.68],[5,15, 17.33],[5,30, 14.64],[5,45, 11.67],\n    [6,0, 18.17],[6,15, 13.26],[6,30, 9.90],[6,45, 7.30],\n    [7,0, 11.94],[7,15, 7.49],[7,30, 6.19],[7,45, 2.85],\n    [8,0, 4.88],[8,15, 1.49],[8,30, 0.14],[8,45, 0.00],\n    [9,0, 0.11],[9,15, 0.00],[9,30, -0.01],[9,45, -0.10],\n    [10,0, -0.02],[10,15, -0.20],[10,30, -0.47],[10,45, -0.51],\n    [11,0, -0.54],[11,15, -0.81],[11,30, -1.16],[11,45, -1.22],\n    [12,0, -1.25],[12,15, -1.22],[12,30, -0.85],[12,45, -0.49],\n    [13,0, -0.50],[13,15, -0.39],[13,30, -0.02],[13,45, 0.00],\n    [14,0, 0.00],[14,15, 0.00],[14,30, 0.00],[14,45, 1.80],\n    [15,0, 1.24],[15,15, 7.51],[15,30, 11.06],[15,45, 14.29],\n    [16,0, 9.90],[16,15, 13.39],[16,30, 14.87],[16,45, 15.87],\n    [17,0, 13.41],[17,15, 15.38],[17,30, 18.32],[17,45, 19.68],\n    [18,0, 19.71],[18,15, 18.79],[18,30, 15.53],[18,45, 13.46],\n    [19,0, 17.67],[19,15, 14.61],[19,30, 13.85],[19,45, 12.29],\n    [20,0, 13.91],[20,15, 12.66],[20,30, 12.24],[20,45, 11.32],\n    [21,0, 12.22],[21,15, 11.62],[21,30, 11.17],[21,45, 10.69]\n];\n\n// Build influxdb node format (arrays of row objects)\nconst priceValues = priceData.map(p => {\n    const t = new Date('2026-04-07T00:00:00Z');\n    t.setUTCHours(p[0], p[1], 0, 0);\n    return { time: t.getTime(), marketprice: p[2] };\n});\n\nconst sunValues = [\n    { time: new Date('2026-04-07T05:00:00Z').getTime(), sunshineDurationInMinutes: 48 },\n    { time: new Date('2026-04-07T06:00:00Z').getTime(), sunshineDurationInMinutes: 49 },\n    { time: new Date('2026-04-07T07:00:00Z').getTime(), sunshineDurationInMinutes: 52 },\n    { time: new Date('2026-04-07T08:00:00Z').getTime(), sunshineDurationInMinutes: 54 },\n    { time: new Date('2026-04-07T09:00:00Z').getTime(), sunshineDurationInMinutes: 42 },\n    { time: new Date('2026-04-07T10:00:00Z').getTime(), sunshineDurationInMinutes: 34 },\n    { time: new Date('2026-04-07T11:00:00Z').getTime(), sunshineDurationInMinutes: 40 },\n    { time: new Date('2026-04-07T12:00:00Z').getTime(), sunshineDurationInMinutes: 49 },\n    { time: new Date('2026-04-07T13:00:00Z').getTime(), sunshineDurationInMinutes: 57 },\n    { time: new Date('2026-04-07T14:00:00Z').getTime(), sunshineDurationInMinutes: 58 },\n    { time: new Date('2026-04-07T15:00:00Z').getTime(), sunshineDurationInMinutes: 58 },\n    { time: new Date('2026-04-07T16:00:00Z').getTime(), sunshineDurationInMinutes: 58 },\n    { time: new Date('2026-04-07T17:00:00Z').getTime(), sunshineDurationInMinutes: 0 },\n    { time: new Date('2026-04-07T18:00:00Z').getTime(), sunshineDurationInMinutes: 0 }\n];\n\nmsg.payload = {\n    soc: [{ time: '2026-04-07T04:00:00Z', soc: 50 }],\n    acload: [{ time: '2026-04-07T04:00:00Z', acload: 500 }],\n    power: [{ time: '2026-04-07T04:00:00Z', power: -500 }],\n    prices: priceValues,\n    solar: sunValues,\n    load_history: [\n        { time: new Date('2026-04-07T00:00:00Z').getTime(), avg_load: 500 },\n        { time: new Date('2026-04-07T06:00:00Z').getTime(), avg_load: 600 },\n        { time: new Date('2026-04-07T10:00:00Z').getTime(), avg_load: 800 },\n        { time: new Date('2026-04-07T12:00:00Z').getTime(), avg_load: 750 },\n        { time: new Date('2026-04-07T18:00:00Z').getTime(), avg_load: 900 },\n        { time: new Date('2026-04-07T21:00:00Z').getTime(), avg_load: 700 }\n    ],\n    prev_plan: []\n};\n\nmsg.weather = {\n    sunSet: '2026-04-07T17:42:00.000Z',\n    sunRise: '2026-04-07T04:33:00.000Z',\n    temp: 16.3,\n    humidity: 42,\n    solarradiation: 501.6,\n    rainrate: 0\n};\n\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 460,
+            "y": 580,
+            "wires": [
+                [
+                    "optimizer"
+                ]
+            ]
+        },
+        {
+            "id": "test2_inject",
+            "type": "inject",
+            "z": "flow_battery_v2",
+            "name": "Test 2: Cloudy, high prices",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "topic": "test2",
+            "payload": "",
+            "payloadType": "date",
+            "x": 180,
+            "y": 640,
+            "wires": [
+                [
+                    "test2_setup"
+                ]
+            ]
+        },
+        {
+            "id": "test2_setup",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Test 2: Cloudy day, high prices",
+            "func": "// Test Case 2: Cloudy winter-like day with consistently high prices\n// Scenario: SOC starts at 30%, minimal solar, prices 10-25 ct\n// Tests: smart charging at cheapest windows, conservation\n\nconst priceData = [\n    [0,0, 12.0],[0,15, 11.5],[0,30, 10.8],[0,45, 10.2],\n    [1,0, 9.8],[1,15, 9.5],[1,30, 9.2],[1,45, 9.0],\n    [2,0, 8.5],[2,15, 8.2],[2,30, 8.0],[2,45, 8.3],\n    [3,0, 8.8],[3,15, 9.5],[3,30, 10.2],[3,45, 11.5],\n    [4,0, 13.0],[4,15, 14.5],[4,30, 16.0],[4,45, 17.5],\n    [5,0, 18.0],[5,15, 19.5],[5,30, 20.0],[5,45, 21.0],\n    [6,0, 22.0],[6,15, 23.0],[6,30, 24.0],[6,45, 25.0],\n    [7,0, 24.5],[7,15, 23.0],[7,30, 22.0],[7,45, 21.0],\n    [8,0, 20.0],[8,15, 19.0],[8,30, 18.5],[8,45, 18.0],\n    [9,0, 17.0],[9,15, 16.5],[9,30, 16.0],[9,45, 15.5],\n    [10,0, 15.0],[10,15, 14.5],[10,30, 14.0],[10,45, 14.5],\n    [11,0, 15.0],[11,15, 15.5],[11,30, 16.0],[11,45, 16.5],\n    [12,0, 17.0],[12,15, 17.5],[12,30, 18.0],[12,45, 18.5],\n    [13,0, 18.0],[13,15, 17.0],[13,30, 16.0],[13,45, 15.0],\n    [14,0, 14.0],[14,15, 13.5],[14,30, 13.0],[14,45, 13.5],\n    [15,0, 14.0],[15,15, 15.0],[15,30, 16.0],[15,45, 17.0],\n    [16,0, 18.0],[16,15, 19.0],[16,30, 20.0],[16,45, 21.0],\n    [17,0, 22.0],[17,15, 23.0],[17,30, 24.0],[17,45, 25.0],\n    [18,0, 24.0],[18,15, 23.0],[18,30, 22.0],[18,45, 21.0],\n    [19,0, 20.0],[19,15, 19.0],[19,30, 18.0],[19,45, 17.0],\n    [20,0, 16.0],[20,15, 15.0],[20,30, 14.5],[20,45, 14.0],\n    [21,0, 13.5],[21,15, 13.0],[21,30, 12.5],[21,45, 12.0]\n];\n\nconst priceValues = priceData.map(p => {\n    const t = new Date('2026-01-15T00:00:00Z');\n    t.setUTCHours(p[0], p[1], 0, 0);\n    return { time: t.getTime(), marketprice: p[2] };\n});\n\nconst sunValues = [\n    { time: new Date('2026-01-15T08:00:00Z').getTime(), sunshineDurationInMinutes: 5 },\n    { time: new Date('2026-01-15T09:00:00Z').getTime(), sunshineDurationInMinutes: 8 },\n    { time: new Date('2026-01-15T10:00:00Z').getTime(), sunshineDurationInMinutes: 10 },\n    { time: new Date('2026-01-15T11:00:00Z').getTime(), sunshineDurationInMinutes: 8 },\n    { time: new Date('2026-01-15T12:00:00Z').getTime(), sunshineDurationInMinutes: 5 },\n    { time: new Date('2026-01-15T13:00:00Z').getTime(), sunshineDurationInMinutes: 3 },\n    { time: new Date('2026-01-15T14:00:00Z').getTime(), sunshineDurationInMinutes: 5 },\n    { time: new Date('2026-01-15T15:00:00Z').getTime(), sunshineDurationInMinutes: 0 },\n    { time: new Date('2026-01-15T16:00:00Z').getTime(), sunshineDurationInMinutes: 0 }\n];\n\nmsg.payload = {\n    soc: [{ time: '2026-01-15T00:00:00Z', soc: 30 }],\n    acload: [{ time: '2026-01-15T00:00:00Z', acload: 800 }],\n    power: [{ time: '2026-01-15T00:00:00Z', power: -700 }],\n    prices: priceValues,\n    solar: sunValues,\n    load_history: [\n        { time: new Date('2026-01-15T00:00:00Z').getTime(), avg_load: 600 },\n        { time: new Date('2026-01-15T06:00:00Z').getTime(), avg_load: 750 },\n        { time: new Date('2026-01-15T10:00:00Z').getTime(), avg_load: 900 },\n        { time: new Date('2026-01-15T18:00:00Z').getTime(), avg_load: 1000 },\n        { time: new Date('2026-01-15T22:00:00Z').getTime(), avg_load: 700 }\n    ],\n    prev_plan: []\n};\n\nmsg.weather = {\n    sunSet: '2026-01-15T15:40:00.000Z',\n    sunRise: '2026-01-15T07:15:00.000Z',\n    temp: 2.0,\n    humidity: 85,\n    solarradiation: 30,\n    rainrate: 0.5\n};\n\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 460,
+            "y": 640,
+            "wires": [
+                [
+                    "optimizer"
+                ]
+            ]
+        },
+        {
+            "id": "test3_inject",
+            "type": "inject",
+            "z": "flow_battery_v2",
+            "name": "Test 3: Evening low SOC",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "topic": "test3",
+            "payload": "",
+            "payloadType": "date",
+            "x": 170,
+            "y": 700,
+            "wires": [
+                [
+                    "test3_setup"
+                ]
+            ]
+        },
+        {
+            "id": "test3_setup",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Test 3: Evening, SOC=10%, mixed prices",
+            "func": "// Test Case 3: Evening scenario with very low SOC\n// Scenario: SOC at 10%, evening prices mixed, sunrise in ~10 hours\n// Tests: emergency charging, price-smart charging, survival until solar\n\nconst priceData = [\n    [17,0, 20.0],[17,15, 22.0],[17,30, 24.0],[17,45, 25.0],\n    [18,0, 23.0],[18,15, 21.0],[18,30, 19.0],[18,45, 17.0],\n    [19,0, 16.0],[19,15, 15.0],[19,30, 14.0],[19,45, 13.0],\n    [20,0, 12.0],[20,15, 11.0],[20,30, 10.5],[20,45, 10.0],\n    [21,0, 9.5],[21,15, 9.0],[21,30, 8.5],[21,45, 8.0],\n    [22,0, 7.5],[22,15, 7.0],[22,30, 6.5],[22,45, 6.0],\n    [23,0, 5.5],[23,15, 5.0],[23,30, 4.5],[23,45, 4.0]\n];\n\n// Next day prices\nconst nextDayPrices = [\n    [0,0, 3.5],[0,15, 3.0],[0,30, 2.5],[0,45, 2.0],\n    [1,0, 1.5],[1,15, 1.0],[1,30, 0.8],[1,45, 0.5],\n    [2,0, 0.3],[2,15, 0.5],[2,30, 1.0],[2,45, 1.5],\n    [3,0, 2.0],[3,15, 3.0],[3,30, 4.0],[3,45, 5.0],\n    [4,0, 7.0],[4,15, 9.0],[4,30, 11.0],[4,45, 13.0],\n    [5,0, 14.0],[5,15, 13.0],[5,30, 11.0],[5,45, 9.0],\n    [6,0, 8.0],[6,15, 7.0],[6,30, 5.0],[6,45, 3.0],\n    [7,0, 2.0],[7,15, 1.0],[7,30, 0.0],[7,45, -0.5],\n    [8,0, -1.0],[8,15, -0.5],[8,30, 0.0],[8,45, 1.0]\n];\n\nconst allPrices = priceData.concat(nextDayPrices);\nconst priceValues = allPrices.map(p => {\n    const t = new Date(p[0] < 17 ? '2026-06-15T00:00:00Z' : '2026-06-14T00:00:00Z');\n    t.setUTCHours(p[0], p[1], 0, 0);\n    return { time: t.getTime(), marketprice: p[2] };\n});\n\nconst sunValues = [\n    { time: new Date('2026-06-15T05:00:00Z').getTime(), sunshineDurationInMinutes: 50 },\n    { time: new Date('2026-06-15T06:00:00Z').getTime(), sunshineDurationInMinutes: 55 },\n    { time: new Date('2026-06-15T07:00:00Z').getTime(), sunshineDurationInMinutes: 58 },\n    { time: new Date('2026-06-15T08:00:00Z').getTime(), sunshineDurationInMinutes: 60 }\n];\n\nmsg.payload = {\n    soc: [{ time: '2026-06-14T17:00:00Z', soc: 10 }],\n    acload: [{ time: '2026-06-14T17:00:00Z', acload: 900 }],\n    power: [{ time: '2026-06-14T17:00:00Z', power: -800 }],\n    prices: priceValues,\n    solar: sunValues,\n    load_history: [\n        { time: new Date('2026-06-14T17:00:00Z').getTime(), avg_load: 900 },\n        { time: new Date('2026-06-14T20:00:00Z').getTime(), avg_load: 800 },\n        { time: new Date('2026-06-14T23:00:00Z').getTime(), avg_load: 600 },\n        { time: new Date('2026-06-15T02:00:00Z').getTime(), avg_load: 400 },\n        { time: new Date('2026-06-15T06:00:00Z').getTime(), avg_load: 600 }\n    ],\n    prev_plan: []\n};\n\nmsg.weather = {\n    sunSet: '2026-06-14T19:30:00.000Z',\n    sunRise: '2026-06-15T03:20:00.000Z',\n    temp: 22.0,\n    humidity: 55,\n    solarradiation: 0,\n    rainrate: 0\n};\n\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 470,
+            "y": 700,
+            "wires": [
+                [
+                    "optimizer"
+                ]
+            ]
+        },
+        {
+            "id": "inject_prices",
+            "type": "inject",
+            "z": "flow_battery_v2",
+            "name": "Price fetch (13:05 + retry)",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "*/10 13 * * *",
+            "once": true,
+            "onceDelay": "10",
+            "topic": "fetch_prices",
+            "payload": "",
+            "payloadType": "date",
+            "x": 160,
+            "y": 480,
+            "wires": [
+                [
+                    "check_price_cache"
+                ]
+            ]
+        },
+        {
+            "id": "check_price_cache",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Need fresh prices?",
+            "func": "const cached = flow.get(\"cachedPrices\") || {};\nconst today = new Date().toISOString().slice(0, 10);\n// If we have today's prices with tomorrow included, skip fetch\nif (cached.date === today && cached.hasTomorrow) {\n    node.status({ fill: \"green\", shape: \"ring\", text: \"Cached, skip fetch\" });\n    return null; // stop — no need to re-fetch\n}\nnode.status({ fill: \"yellow\", shape: \"dot\", text: \"Fetching prices...\" });\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 610,
+            "y": 520,
+            "wires": [
+                [
+                    "query_prices"
+                ]
+            ]
+        },
+        {
+            "id": "retry_price_fetch",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Retry if no tomorrow",
+            "func": "const cached = flow.get(\"cachedPrices\") || {};\nif (!cached.hasTomorrow) {\n    // Schedule retry in 15 min via delay\n    node.status({ fill: \"yellow\", shape: \"dot\", text: \"No tomorrow prices, retry in 15m\" });\n    return msg;\n}\nnode.status({ fill: \"green\", shape: \"dot\", text: \"Tomorrow prices OK\" });\nreturn null;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 1200,
+            "y": 480,
+            "wires": [
+                [
+                    "retry_delay"
+                ]
+            ]
+        },
+        {
+            "id": "retry_delay",
+            "type": "delay",
+            "z": "flow_battery_v2",
+            "name": "Wait 15 min",
+            "pauseType": "delay",
+            "timeout": "15",
+            "timeoutUnits": "minutes",
+            "rate": "1",
+            "nbRateUnits": "1",
+            "rateUnits": "second",
+            "randomFirst": "1",
+            "randomLast": "5",
+            "randomUnits": "seconds",
+            "drop": true,
+            "allowrate": false,
+            "outputs": 1,
+            "x": 870,
+            "y": 440,
+            "wires": [
+                [
+                    "check_price_cache"
+                ]
+            ]
+        },
+        {
+            "id": "read_cached_prices",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Read cached prices",
+            "func": "const cached = flow.get(\"cachedPrices\") || {};\nmsg.topic = \"prices\";\nmsg.payload = cached.prices || [];\nif (msg.payload.length === 0) {\n    node.warn(\"No cached prices available\");\n}\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 860,
+            "y": 80,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_pv_now",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra",
+            "name": "PV Now",
+            "query": "SELECT LAST(PAC) AS pv_now FROM pv WHERE time > now() - 30m",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 400,
+            "y": 400,
+            "wires": [
+                [
+                    "set_topic_pv_now"
+                ]
+            ]
+        },
+        {
+            "id": "set_topic_pv_now",
+            "type": "change",
+            "z": "flow_battery_v2",
+            "name": "topic: pv_now",
+            "rules": [
+                {
+                    "t": "set",
+                    "p": "topic",
+                    "pt": "msg",
+                    "to": "pv_now",
+                    "tot": "str"
+                }
+            ],
+            "x": 620,
+            "y": 340,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "query_pv_hist_recent",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra_2y",
+            "name": "PV Hist recent",
+            "query": "SELECT mean(mean_PAC) AS avg_pv, max(mean_PAC) AS max_pv FROM pv WHERE time > now() - 15d GROUP BY time(1h) ORDER BY time ASC",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 400,
+            "y": 320,
+            "wires": [
+                [
+                    "join_pv_history"
+                ]
+            ]
+        },
+        {
+            "id": "query_pv_hist_1y",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra_2y",
+            "name": "PV Hist 1y ago",
+            "query": "SELECT mean(mean_PAC) AS avg_pv, max(mean_PAC) AS max_pv FROM pv WHERE time > now() - 380d AND time < now() - 350d GROUP BY time(1h) ORDER BY time ASC",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 400,
+            "y": 360,
+            "wires": [
+                [
+                    "join_pv_history"
+                ]
+            ]
+        },
+        {
+            "id": "query_pv_hist_2y",
+            "type": "influxdb in",
+            "z": "flow_battery_v2",
+            "influxdb": "influxdb_config_infra_2y",
+            "name": "PV Hist 2y ago",
+            "query": "SELECT mean(mean_PAC) AS avg_pv, max(mean_PAC) AS max_pv FROM pv WHERE time > now() - 745d AND time < now() - 715d GROUP BY time(1h) ORDER BY time ASC",
+            "rawOutput": false,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "",
+            "x": 400,
+            "y": 440,
+            "wires": [
+                [
+                    "join_pv_history"
+                ]
+            ]
+        },
+        {
+            "id": "join_pv_history",
+            "type": "join",
+            "z": "flow_battery_v2",
+            "name": "Join 3 PV",
+            "mode": "custom",
+            "build": "array",
+            "property": "payload",
+            "propertyType": "msg",
+            "key": "",
+            "joiner": "",
+            "joinerType": "str",
+            "accumulate": false,
+            "timeout": "10",
+            "count": "3",
+            "reduceRight": false,
+            "reduceExp": "",
+            "reduceInit": "",
+            "reduceInitType": "",
+            "reduceFixup": "",
+            "x": 610,
+            "y": 280,
+            "wires": [
+                [
+                    "merge_pv_history"
+                ]
+            ]
+        },
+        {
+            "id": "merge_pv_history",
+            "type": "function",
+            "z": "flow_battery_v2",
+            "name": "Merge & topic: pv_history",
+            "func": "// Flatten the 3 query results into one array\nconst merged = [];\nfor (const arr of msg.payload) {\n    if (Array.isArray(arr)) {\n        for (const row of arr) merged.push(row);\n    }\n}\nmsg.payload = merged;\nmsg.topic = 'pv_history';\nreturn msg;",
+            "outputs": 1,
+            "timeout": "",
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 910,
+            "y": 280,
+            "wires": [
+                [
+                    "join_results"
+                ]
+            ]
+        },
+        {
+            "id": "491dfd601a89cda1",
+            "type": "cronplus",
+            "z": "flow_battery_v2",
+            "name": "",
+            "outputField": "payload",
+            "timeZone": "",
+            "storeName": "",
+            "commandResponseMsgOutput": "output1",
+            "defaultLocation": "",
+            "defaultLocationType": "default",
+            "outputs": 1,
+            "options": [
+                {
+                    "name": "schedule1",
+                    "topic": "schedule1",
+                    "payloadType": "default",
+                    "payload": "",
+                    "expressionType": "cron",
+                    "expression": "0 0/15 * * * * *",
+                    "location": "",
+                    "offset": "0",
+                    "solarType": "all",
+                    "solarEvents": "sunrise,sunset"
+                }
+            ],
+            "x": 120,
+            "y": 120,
+            "wires": [
+                [
+                    "query_soc",
+                    "query_acload",
+                    "query_power",
+                    "query_solar",
+                    "query_load_history",
+                    "query_prev_plan",
+                    "query_pv_hist_recent",
+                    "query_pv_hist_1y",
+                    "query_pv_hist_2y",
+                    "read_cached_prices",
+                    "query_pv_now"
+                ]
+            ]
+        },
+        {
+            "id": "comment_changelog",
+            "type": "comment",
+            "z": "flow_battery_v2",
+            "name": "=== Changelog ===",
+            "info": "## Changelog\n\n### 2026-04-17\n- Phase 3d: add round-trip economic check on planned feed-in.\n  Non-overflow feed-in now requires marketPrice > cheapest future\n  effectivePrice (marketPrice + gridFee) among unplanned slots.\n  Overflow (curtailment) SOC remains exempt — pure revenue.\n  Fixes: evening feed-in followed by morning grid-charge at a net loss.",
+            "x": 1350,
+            "y": 40,
+            "wires": []
+        }
+    ],
+    "configs": [
+        {
+            "id": "influxdb_config_infra",
+            "type": "influxdb",
+            "z": "flow_battery_v2",
+            "hostname": "192.168.4.221",
+            "port": "8076",
+            "protocol": "http",
+            "database": "infra",
+            "name": "InfluxDB infra",
+            "usetls": false,
+            "tls": "",
+            "influxdbVersion": "1.x",
+            "url": "http://192.168.4.221:8076",
+            "timeout": "",
+            "rejectUnauthorized": true
+        },
+        {
+            "id": "influxdb_config_infra_2y",
+            "type": "influxdb",
+            "z": "flow_battery_v2",
+            "hostname": "192.168.4.221",
+            "port": "8076",
+            "protocol": "http",
+            "database": "infra_2y",
+            "name": "InfluxDB infra_2y",
+            "usetls": false,
+            "tls": "",
+            "influxdbVersion": "1.x",
+            "url": "http://192.168.4.221:8076",
+            "timeout": "",
+            "rejectUnauthorized": true
+        },
+        {
+            "id": "influxdb_config_forecast",
+            "type": "influxdb",
+            "z": "flow_battery_v2",
+            "hostname": "192.168.4.221",
+            "port": "8076",
+            "protocol": "http",
+            "database": "forecast",
+            "name": "InfluxDB forecast",
+            "usetls": false,
+            "tls": "",
+            "influxdbVersion": "1.x",
+            "url": "http://192.168.4.221:8076",
+            "timeout": "",
+            "rejectUnauthorized": true
+        },
+        {
+            "id": "mqtt_broker_config",
+            "type": "mqtt-broker",
+            "z": "flow_battery_v2",
+            "name": "MQTT 192.168.4.221",
+            "broker": "192.168.4.221",
+            "port": "1883",
+            "clientid": "",
+            "autoConnect": true,
+            "usetls": false,
+            "protocolVersion": "4",
+            "keepalive": "60",
+            "cleansession": true,
+            "autoUnsubscribe": true,
+            "birthTopic": "",
+            "birthQos": "0",
+            "birthPayload": "",
+            "birthMsg": {},
+            "closeTopic": "",
+            "closeQos": "0",
+            "closePayload": "",
+            "closeMsg": {},
+            "willTopic": "",
+            "willQos": "0",
+            "willPayload": "",
+            "willMsg": {},
+            "userProps": "",
+            "sessionExpiry": ""
+        }
+    ]
+}

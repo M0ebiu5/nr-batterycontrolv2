@@ -1,0 +1,56 @@
+Write a node-red flow which controls the charging and discharging of a battery. This battery is used in a household. The household has solar panels and charges the battery during the day. The goal is to optimize the cost for electricity. 
+It is essential to predict the future soc to avoid buying electricity from the grid.
+The optimization should prioritize the cost.
+Feeding-in too much energy could result in the necessity to charge the battery earlier.
+
+The battery charger can work in different states: 
+- "1" means charging from grid. 
+- "3" is discharging to compensate the used energy in the household.
+- "4" maximum discharge to feed energy back into the grid.
+
+The battery has a capacity of 30kWh. The charger/discharger works with a maximum of 3500W. The average load on the battery is 700W. The soc of the battery is an input parameter and should never fall under 3%. The cost of power changes every 15 minutes.
+
+All relevant data of the household and solar forecast can be found in this influx database (host: 192.168.4.221)
+influx -username 'admin' -password 'admin' -port 8076 -precision rfc3339! -port 8076 -precision rfc3339
+There are different databases: 
+infra - current data
+infra_2y - history data
+forecast - weather forecast
+tmp - short lived data
+
+Get the price info from this url: https://i.spottyenergie.at/api/prices/MARKET/f82f2a62-37b9-4310-b75b-c3a8d4219faa?timezone=at
+The system should run with the Berlin time.
+The price information is updated once a day at 13:00.
+The price information is only a part of the total price. For every kwh charged from grid an additional fee of 13ct is added.
+
+A negative price means the grid pays this price on feed-in. 
+The battery has a capacity of 30kwh. 
+The charge of the battery must be optimized so that it never runs out, has enough free capacity to store the pv power. the battery should can idle, charge , compensate or discharge.
+
+When taking electricity from the grid an additional 13 ct / kwh is added to the price. In the months from 4 to 9 this fee is reduced by 20% in the time between 10:00 to 16:00.
+
+Feed in at a price < 0  means a negative profit when feeding in.
+Never feed in at a negative price.
+If the price is < -13 charge for profit.
+There should be no state 5. 
+
+
+The peak power of the solar inverter is 5000W on a sunny day.
+You can use the table "ess" in the tmp database to optimize the function further.
+
+Use the influxdb node to communicate with the database.
+
+The predicted solar minutes are in the forecastnew table in the forecast database. 
+
+Use the global context object "weather" to optimize the function if possible. Example weather:
+  {"gtst":"2026-03-26T20:32:43.764Z","gname":"weather","greplace":false,"sunSet":"2026-03-26T17:25:00.000Z","sunRise":"2026-03-26T04:58:00.000Z","temp":1
+  .7,"humidity":41,"maxdailygust":22,"solarradiation":0,"rainrate":0,"tempin":25.2}
+
+Use the historic data in the database and all other available info to come up with a highly cost efficient algorithm.
+Calculate the optimal state for now and in the future.
+Output should be the optimal battery charger state, the predicted soc and the reason for this state (very short info) in an array for every datapoint in the price info.
+
+Also create 3 test cases where you use historic data each for a different day.
+
+Example weather:
+{"gtst":"2026-04-06T12:37:29.500Z","gname":"weather","greplace":false,"sunSet":"2026-04-06T17:40:00.000Z","sunRise":"2026-04-06T04:35:00.000Z","temp":16.3,"humidity":42,"maxdailygust":20.2,"solarradiation":501.6,"rainrate":0,"tempin":26.1}
