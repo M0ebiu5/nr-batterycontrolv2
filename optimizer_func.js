@@ -92,8 +92,10 @@ for (let h = 0; h < 24; h++) {
 // PV history for hourly production profile, filtered by similar calendar period
 const pvHistoryRaw = raw.pv_history || [];
 
-// Filter to ±15 days of current day-of-year (same season from previous years)
-const nowDate = new Date();
+// Filter to ±15 days of current day-of-year (same season from previous years).
+// Use Date.now() (not `new Date()`) so this respects time mocks in tests:
+// `new Date()` bypasses a mocked Date.now and reads V8's wall clock directly.
+const nowDate = new Date(Date.now());
 const dayOfYear = Math.floor((nowDate.getTime() - new Date(nowDate.getFullYear(), 0, 0).getTime()) / 86400000);
 const pvHistoryFiltered = pvHistoryRaw.filter(r => {
     const t = typeof r.time === 'number' ? new Date(r.time) : new Date(r.time);
@@ -714,19 +716,28 @@ function feedinDrainSoc(slot) {
     return kwhToSoc(drainW * INTERVAL_HOURS / 1000);
 }
 
-// Find the rolling horizon: walk passive SOC (PV-load only). Track when SOC
-// has dipped below 70% and then climbs back to ≥85% — that's the next refill
-// point. If never reached (cloudy stretch), horizon = end of schedule.
+// Find the rolling horizon by walking passive SOC (PV-load only) and
+// looking for a dip-and-recover pattern RELATIVE to the running peak:
+// flag `dipped` once SOC falls ≥5 points below the max seen so far,
+// then close the horizon at the first slot within 3 points of that peak.
+// Absolute thresholds (was: <70 / ≥85) missed cases where starting SOC
+// was already high enough that the overnight trough never broke 70 —
+// horizon would stay at schedule end, budget would collapse to 0, and
+// a legitimate evening peak wouldn't be picked for feed-in. Flat or
+// cloudy stretches never satisfy the 5-point dip, so horizon still
+// falls through to schedule end in those cases (end-floor path).
 let horizonIdx = schedule.length;
 {
     let testSoc = currentSoc;
-    let dipped = currentSoc < 70;
+    let peakSoc = currentSoc;
+    let dipped = false;
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
         testSoc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
         testSoc = Math.max(MIN_SOC_PCT, Math.min(100, testSoc));
-        if (testSoc < 70) dipped = true;
-        if (dipped && testSoc >= 85) {
+        if (testSoc > peakSoc) peakSoc = testSoc;
+        if (peakSoc - testSoc >= 5) dipped = true;
+        if (dipped && peakSoc - testSoc <= 3) {
             horizonIdx = i + 1; // include the refill slot itself
             break;
         }
