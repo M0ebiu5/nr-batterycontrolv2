@@ -408,15 +408,16 @@ let targetSocForSunrise = null;
 (function computePreemptiveDischarge() {
     if (schedule.length < 8) return;
 
-    // Find next sunrise using isDaylight (time-of-day based, works without forecast data).
-    // Look for future: night slot → then first daylight slot after it.
-    let foundNight = false;
+    // Find the glut day = the current or next daylight period. Previously
+    // this required a night→day transition, which silently disabled
+    // preemptive for any cron run after sunrise on the glut day itself
+    // (because tomorrow's prices haven't published yet, so the schedule
+    // contains no second sunrise to match). The right glut day to plan
+    // for is whatever daylight period is currently in front of us.
     let nextSunriseIdx = -1;
     for (let k = 0; k < schedule.length; k++) {
         if (schedule[k].time < now - 1800000) continue;
-        if (!isDaylight(schedule[k].time)) {
-            foundNight = true;
-        } else if (foundNight) {
+        if (isDaylight(schedule[k].time)) {
             nextSunriseIdx = k;
             break;
         }
@@ -425,7 +426,7 @@ let targetSocForSunrise = null;
 
     const sunriseTime = schedule[nextSunriseIdx].time;
 
-    // Collect tomorrow's daylight slots
+    // Collect glut day's daylight slots (contiguous from nextSunriseIdx)
     const nextDayDaylightSlots = [];
     for (let k = nextSunriseIdx; k < schedule.length; k++) {
         if (isDaylight(schedule[k].time)) {
@@ -478,26 +479,55 @@ let targetSocForSunrise = null;
         targetSocForSunrise = Math.min(targetSocForSunrise, 20);
     }
 
-    // Evening/night slots before sunrise + early morning with negligible PV
-    const eveningSlots = schedule.filter(s =>
-        s.time >= now - 1800000 && s.time < sunriseTime && !isDaylight(s.time)
-    );
-    // Also include early morning slots (first 2h after sunrise) where PV < load
-    for (let k = nextSunriseIdx; k < Math.min(nextSunriseIdx + 8, schedule.length); k++) {
-        const s = schedule[k];
-        if (s.pvPower >= s.loadEst) break; // PV picks up, stop
-        if (s.time >= now - 1800000) eveningSlots.push(s);
+    // Drain deadline: the sunrise AFTER the glut day's sunset. The drain
+    // must be complete by then; the glut day itself (morning peak +
+    // mid-day trough + evening peak) is INSIDE the eligibility window
+    // and competes for slot picks on price.
+    //
+    // Why not just "next sunrise"? When the optimizer runs pre-dawn on
+    // the glut day, "next sunrise" is the start of the glut day — only
+    // hours away — and the morning price peak (which is technically
+    // "during" the glut day's daylight) gets excluded. Today's PV will
+    // refill any SOC drained at the morning peak, so the drain is free
+    // revenue. The post-glut sunrise is the right deadline.
+    let postGluteSunsetSeen = false;
+    let drainDeadlineTime = null;
+    for (let k = nextSunriseIdx + 1; k < schedule.length; k++) {
+        if (!isDaylight(schedule[k].time)) {
+            postGluteSunsetSeen = true;
+        } else if (postGluteSunsetSeen) {
+            drainDeadlineTime = schedule[k].time;
+            break;
+        }
     }
+    if (drainDeadlineTime === null) {
+        // Schedule doesn't extend past the glut day — fall back to
+        // schedule end (next planning cycle, with fresher data, will
+        // continue from there).
+        drainDeadlineTime = schedule[schedule.length - 1].time + INTERVAL_HOURS * 3600 * 1000;
+    }
+
+    const eveningSlots = schedule.filter(s =>
+        s.time >= now - 1800000 && s.time < drainDeadlineTime
+    );
     if (eveningSlots.length === 0) return;
 
-    // How much SOC does compensate-only drain overnight?
-    let compensateDrainPct = 0;
+    // Project SOC under PV+load only (no preemptive drain) across the window.
+    // Track overflow (curtailed PV above 100%) — that energy is also drainable
+    // if we make room for it. Without PV in this calc, drain need is
+    // under-estimated whenever the window includes daylight hours.
+    let projSocAtSunrise = currentSoc;
+    let overflowPct = 0;
     for (const s of eveningSlots) {
-        compensateDrainPct += kwhToSoc(s.loadEst * INTERVAL_HOURS / 1000);
+        const netKwh = (s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000;
+        projSocAtSunrise += kwhToSoc(netKwh);
+        if (projSocAtSunrise > 100) {
+            overflowPct += projSocAtSunrise - 100;
+            projSocAtSunrise = 100;
+        }
+        if (projSocAtSunrise < MIN_SOC_PCT) projSocAtSunrise = MIN_SOC_PCT;
     }
-
-    const socAtSunriseIfCompensate = currentSoc - compensateDrainPct;
-    const extraDrainNeeded = socAtSunriseIfCompensate - targetSocForSunrise;
+    const extraDrainNeeded = projSocAtSunrise + overflowPct - targetSocForSunrise;
     if (extraDrainNeeded <= 3) return;
 
     // Sort by market price descending: discharge at the highest prices first.
@@ -719,6 +749,38 @@ let horizonIdx = schedule.length;
         if (projSoc < MIN_SOC_PCT) projSoc = MIN_SOC_PCT;
     }
 
+    // Continue projection PAST horizonIdx to capture PV curtailment beyond
+    // the refill slot. Without this, an evening with SOC≈100% + strong-PV
+    // tomorrow has budget=0: overnight drains SOC below 100, morning PV
+    // refills to 85% (horizon end), SOC never exceeds 100 in [0, horizonIdx),
+    // so overflowSoc=0 and no evening-peak feed-in is planned — even though
+    // tomorrow's PV will actually curtail once the battery hits 100.
+    // Walk to the end of the first post-horizon daylight period.
+    let postHorizonOverflow = 0;
+    if (horizonIdx < schedule.length) {
+        let extSoc = projSoc;
+        let sawDaylight = false;
+        for (let i = horizonIdx; i < schedule.length; i++) {
+            const s = schedule[i];
+            const pvW = s.pvPower;
+            const loadW = s.loadEst;
+            if (s._plan === 'charge') {
+                extSoc += kwhToSoc(maxChargeEnergy);
+            } else if (s._plan === 'feedin_preemptive') {
+                extSoc -= feedinDrainSoc(s);
+            } else {
+                extSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+            }
+            if (extSoc > 100) {
+                postHorizonOverflow += extSoc - 100;
+                extSoc = 100;
+            }
+            if (extSoc < MIN_SOC_PCT) extSoc = MIN_SOC_PCT;
+            if (isDaylight(s.time)) sawDaylight = true;
+            else if (sawDaylight) break;
+        }
+    }
+
     // Budget calculation depends on whether a PV refill lies within the
     // horizon AND whether that refill is "free" (driven by solar glut).
     //
@@ -748,7 +810,7 @@ let horizonIdx = schedule.length;
     }
     let feedinBudgetSoc;
     if (horizonIsRefill && !freeRefillAhead) {
-        feedinBudgetSoc = overflowSoc;
+        feedinBudgetSoc = overflowSoc + postHorizonOverflow;
     } else {
         const endFloorSoc = kwhToSoc(_postSchedLoadKwh) + MIN_SOC_PCT + 8;
         feedinBudgetSoc = Math.max(0, projSoc + overflowSoc - endFloorSoc);

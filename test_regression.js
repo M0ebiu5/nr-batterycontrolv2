@@ -592,6 +592,202 @@ function scenario6_endOfScheduleReserveBadForecast() {
     return false;
 }
 
+// =========================================================
+// SCENARIO 7: User report 2026-04-23 — preemptive picked
+// 04:15-05:00 (mp ~0.5ct) instead of 08:00-08:15 morning peak
+// (mp 6.7-7.3ct). Root cause: original eligibility window was
+// "night + early morning before PV>=load", which broke right
+// at the morning price peak. Fix: window = now → next-day
+// sunrise; price-DESC sort then picks the genuine top slots.
+// =========================================================
+function scenario7_preemptivePicksMorningPeak() {
+    console.log('\n=== SCENARIO 7: Preemptive picks morning peak, not low-price night ===');
+
+    // "Now" = 2026-04-23 03:00 Berlin (UTC 01:00) — pre-dawn.
+    // Schedule = 36h, so it includes both today's full day and tomorrow's
+    // daylight (the solar-glut day that triggers preemptive).
+    const NOW = Date.UTC(2026, 3, 23, 1, 0);
+    const startMs = NOW;
+    const slots = 144;
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const d = new Date(t);
+        const dayOffset = Math.floor((d.getTime() - NOW) / 86400000);
+        const hour = ((d.getUTCHours() + 2) % 24 + 24) % 24;
+        // Today (dayOffset 0): real shape from user's report
+        if (dayOffset === 0) {
+            if (hour < 6) return 0.3 + Math.random() * 0.3;       // night ~0.3-0.6 ct
+            if (hour < 8) return 0.5 + (hour - 6) * 1.5;          // ramp 0.5 → 3.5
+            if (hour === 8) return 7.0;                            // morning peak
+            if (hour < 10) return 4 + Math.random() * 2;
+            if (hour < 18) return 0.3 + Math.random() * 1.5;      // mid-day trough
+            if (hour < 22) return 5 + Math.random() * 2;          // evening peak ~5-7
+            return 1.5 + Math.random();
+        }
+        // Tomorrow (dayOffset 1): solar-glut day — many <3ct daylight slots
+        if (hour >= 6 && hour < 18) return 0.5 + Math.random() * 2; // 0.5-2.5
+        if (hour >= 18 && hour < 22) return 5 + Math.random() * 3;
+        return 2 + Math.random() * 2;
+    });
+
+    // Force the morning peak slots so the assertion is unambiguous
+    const force = (hUtc, mUtc, mp) => {
+        const t = Date.UTC(2026, 3, 23, hUtc, mUtc);
+        const p = prices.find(x => x.time === t);
+        if (p) p.marketprice = mp;
+    };
+    force(6, 0, 6.7); // Berlin 08:00
+    force(6, 15, 7.3); // Berlin 08:15
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 55 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 0 }],
+            prices,
+            solar: buildSolarForecast(startMs, 36),
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 3, 23, 3, 30)).toISOString(), // ~05:30 Berlin
+            sunSet: new Date(Date.UTC(2026, 3, 23, 18, 0)).toISOString(),
+            solarradiation: 0,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+
+    const mp0800 = schedule.find(s => typeof s.time === 'string' && s.time.includes('23.04.') && s.time.includes('08:00'));
+    const mp0815 = schedule.find(s => typeof s.time === 'string' && s.time.includes('23.04.') && s.time.includes('08:15'));
+    const mp0415 = schedule.find(s => typeof s.time === 'string' && s.time.includes('23.04.') && s.time.includes('04:15'));
+    const mp0445 = schedule.find(s => typeof s.time === 'string' && s.time.includes('23.04.') && s.time.includes('04:45'));
+
+    if (!mp0800 || !mp0815 || !mp0415) {
+        console.error('  setup error: target slots not found');
+        console.error('  first 6 times:', schedule.slice(0, 6).map(s => s.time));
+        return false;
+    }
+
+    console.log(`  04:15 (low):  ${fmtSlot(mp0415)}`);
+    if (mp0445) console.log(`  04:45 (low):  ${fmtSlot(mp0445)}`);
+    console.log(`  08:00 (peak): ${fmtSlot(mp0800)}`);
+    console.log(`  08:15 (peak): ${fmtSlot(mp0815)}`);
+
+    let ok = true;
+    if (mp0815.state !== 4) {
+        console.error(`  FAIL: 08:15 (mp ${mp0815.marketPrice}ct) should be state=4, got ${mp0815.state}`);
+        ok = false;
+    }
+    if (mp0800.state !== 4) {
+        console.error(`  FAIL: 08:00 (mp ${mp0800.marketPrice}ct) should be state=4, got ${mp0800.state}`);
+        ok = false;
+    }
+    // The big symptom: low-price 04:15-05:00 slots draining at <1ct.
+    // After the fix, those slots should NOT be feeding in (their price
+    // is way below the morning peak alternatives within the same window).
+    if (mp0415.state === 4) {
+        console.error(`  FAIL: 04:15 (mp ${mp0415.marketPrice}ct) is state=4 — still picking low-price night slots`);
+        ok = false;
+    }
+
+    if (ok) {
+        console.log('  PASS: morning peak picked, low-price night skipped');
+        return true;
+    }
+    return false;
+}
+
+// =========================================================
+// SCENARIO 8: User report 2026-04-23 — at 07:00 (current
+// daylight, tomorrow's prices not yet published), the new
+// preemptive logic stopped triggering at all. Result: no
+// feed-in plan for the morning peak that's still ahead.
+// Root cause: original "find night→day transition" loop
+// returned -1 when current is already daylight and the
+// schedule doesn't extend past tonight. Fix: identify the
+// CURRENT or next daylight period as the glut day.
+// =========================================================
+function scenario8_preemptivePostSunriseNoTomorrow() {
+    console.log('\n=== SCENARIO 8: Preemptive runs post-sunrise even without tomorrow data ===');
+
+    // "Now" = 2026-04-23 07:00 Berlin (UTC 05:00). Current slot is
+    // already daylight; schedule ends today at 23:45 (tomorrow's prices
+    // arrive at 13:00).
+    const NOW = Date.UTC(2026, 3, 23, 5, 0);
+    const startMs = NOW;
+    const slots = 68; // 07:00 → 23:45
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
+        if (hour === 8) return 7.0;                          // morning peak
+        if (hour < 9) return 1 + (hour - 7) * 2;             // 07-08 ramp
+        if (hour < 18) return 0.3 + Math.random() * 1.5;    // mid-day trough
+        if (hour < 22) return 5 + Math.random() * 2;        // evening peak
+        return 1.5 + Math.random();
+    });
+    const force = (hUtc, mUtc, mp) => {
+        const t = Date.UTC(2026, 3, 23, hUtc, mUtc);
+        const p = prices.find(x => x.time === t);
+        if (p) p.marketprice = mp;
+    };
+    force(6, 0, 6.7); // Berlin 08:00
+    force(6, 15, 7.3); // Berlin 08:15
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 47 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 800 }], // PV ramping up
+            prices,
+            solar: buildSolarForecast(startMs, 17),
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 3, 23, 3, 30)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 3, 23, 18, 0)).toISOString(),
+            solarradiation: 200,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+
+    const mp0800 = schedule.find(s => typeof s.time === 'string' && s.time.includes('23.04.') && s.time.includes('08:00'));
+    const mp0815 = schedule.find(s => typeof s.time === 'string' && s.time.includes('23.04.') && s.time.includes('08:15'));
+
+    if (!mp0800 || !mp0815) {
+        console.error('  setup error: morning-peak slots not found');
+        console.error('  first 6 times:', schedule.slice(0, 6).map(s => s.time));
+        return false;
+    }
+
+    console.log(`  08:00 (peak): ${fmtSlot(mp0800)}`);
+    console.log(`  08:15 (peak): ${fmtSlot(mp0815)}`);
+
+    let ok = true;
+    if (mp0800.state !== 4) {
+        console.error(`  FAIL: 08:00 (mp ${mp0800.marketPrice}ct) should be state=4, got ${mp0800.state}`);
+        ok = false;
+    }
+    if (mp0815.state !== 4) {
+        console.error(`  FAIL: 08:15 (mp ${mp0815.marketPrice}ct) should be state=4, got ${mp0815.state}`);
+        ok = false;
+    }
+
+    if (ok) {
+        console.log('  PASS: morning peak feeds in even when current is daylight & no tomorrow data');
+        return true;
+    }
+    return false;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -599,7 +795,9 @@ const results = [
     ['top-priced feed-in',          scenario3_topPricedFeedIn],
     ['preserve afternoon SOC',      scenario4_preserveAfternoonSoc],
     ['cloudy forecast honored',     scenario5_cloudyForecastHonored],
-    ['end-of-schedule reserve bad forecast', scenario6_endOfScheduleReserveBadForecast]
+    ['end-of-schedule reserve bad forecast', scenario6_endOfScheduleReserveBadForecast],
+    ['preemptive picks morning peak', scenario7_preemptivePicksMorningPeak],
+    ['preemptive post-sunrise no tomorrow', scenario8_preemptivePostSunriseNoTomorrow]
 ];
 
 let passed = 0;
