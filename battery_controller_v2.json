@@ -952,7 +952,7 @@
             "type": "comment",
             "z": "flow_battery_v2",
             "name": "=== Changelog ===",
-            "info": "## Changelog\n\n### 2026-04-17\n- Phase 3d: add round-trip economic check on planned feed-in.\n  Non-overflow feed-in now requires marketPrice > cheapest future\n  effectivePrice (marketPrice + gridFee) among unplanned slots.\n  Overflow (curtailment) SOC remains exempt \u2014 pure revenue.\n  Fixes: evening feed-in followed by morning grid-charge at a net loss.",
+            "info": "## Changelog\n\n### 2026-04-24\n- Preemptive glut day is now the current-or-next daylight period,\n  so preemptive still runs when the cron fires after sunrise on\n  the glut day itself (old code required a night\u2192day transition\n  and silently disabled preemptive in that case).\n- Preemptive eligibility window extended from \"night + pre-PV morning\"\n  to \"now \u2192 post-glut sunrise\", sorted by price DESC, so the morning\n  peak wins over sub-1ct pre-dawn slots.\n- Preemptive drain sizing projects SOC with PV+load (+ overflow above\n  100%) across the window instead of assuming load-only.\n- Feed-in budget projection continues past horizonIdx through the next\n  daylight period to catch PV curtailment after the refill slot.\n- Added regression scenarios 7 and 8.\n\n### 2026-04-17\n- Phase 3d: add round-trip economic check on planned feed-in.\n  Non-overflow feed-in now requires marketPrice > cheapest future\n  effectivePrice (marketPrice + gridFee) among unplanned slots.\n  Overflow (curtailment) SOC remains exempt \u2014 pure revenue.\n  Fixes: evening feed-in followed by morning grid-charge at a net loss.",
             "x": 1350,
             "y": 40,
             "wires": []
