@@ -58,12 +58,17 @@ function buildLoadHistory(refMs) {
         750, 700, 650, 600, 700, 900,
         1100, 1000, 800, 600, 450, 350
     ];
+    // Optimizer groups by hour-of-day and takes median across samples with
+    // ≥3 samples required per hour. Emit 7 days × 24 hours of data so every
+    // hour has enough history to pass the threshold.
     const out = [];
-    for (let h = 0; h < 24; h++) {
-        out.push({
-            time: refMs - 7 * 86400000 + h * 3600000,
-            avg_load: profile[h]
-        });
+    for (let d = 0; d < 7; d++) {
+        for (let h = 0; h < 24; h++) {
+            out.push({
+                time: refMs - (d + 1) * 86400000 + h * 3600000,
+                avg_load: profile[h]
+            });
+        }
     }
     return out;
 }

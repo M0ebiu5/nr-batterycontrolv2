@@ -72,13 +72,21 @@ const solarMinutes = toTimeSeries(raw.solar, 'sunshineDurationInMinutes');
 // Load history for hourly pattern
 const loadHistory = toTimeSeries(raw.load_history, 'avg_load');
 
-// Build hourly load pattern (0-23h)
+// Build hourly load pattern (0-23h). Query returns one row per hour
+// over the last N days; aggregate across days per hour-of-day using
+// median so a single spike day (EV charge, heater, etc.) can't poison
+// the forecast. Fall back to AVG_LOAD_W for hours with <3 samples.
 const hourlyLoad = new Array(24).fill(AVG_LOAD_W);
-if (loadHistory.length > 0) {
-    for (const lh of loadHistory) {
-        const h = berlinTime(lh.time).hour;
-        if (lh.value > 0) hourlyLoad[h] = lh.value;
-    }
+const loadByHour = new Array(24).fill(null).map(() => []);
+for (const lh of loadHistory) {
+    if (lh.value > 0) loadByHour[berlinTime(lh.time).hour].push(lh.value);
+}
+for (let h = 0; h < 24; h++) {
+    const vals = loadByHour[h];
+    if (vals.length < 3) continue;
+    const sorted = [...vals].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    hourlyLoad[h] = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 // PV history for hourly production profile, filtered by similar calendar period
