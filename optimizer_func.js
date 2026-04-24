@@ -1100,4 +1100,10 @@ const msg3 = {
     }
 };
 
+// Persist current schedule into global.pp.prediction (file store) so other
+// flows/nodes can read the optimizer's output without subscribing to msgs.
+const pp = global.get('pp', 'file') || {};
+pp.prediction = output;
+global.set('pp', pp, 'file');
+
 return [msg, msg2, msg3];
