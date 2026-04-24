@@ -479,9 +479,14 @@ let targetSocForSunrise = null;
 
     if (totalSurplusKwh < 3) return;
 
-    // Target SOC at sunrise: free capacity = expected PV surplus, floor at 15%
+    // Target SOC at sunrise: free capacity = expected PV surplus.
+    // Floor is conditional: 20% when neg-prices confirm the glut (external
+    // signal, not just forecast), else 35% — forecast alone isn't trusted
+    // enough to drain deeper, and a higher floor protects the morning peak
+    // if PV underperforms.
     const capacityNeededPct = kwhToSoc(totalSurplusKwh);
-    targetSocForSunrise = Math.max(15, 100 - capacityNeededPct);
+    const socFloor = negPriceSlots >= 4 ? 20 : 35;
+    targetSocForSunrise = Math.max(socFloor, 100 - capacityNeededPct);
     // Negative daylight prices = solar glut ahead. PV-surplus estimate can
     // underestimate (forecast noise, fallback paths); the neg-price signal
     // is the authoritative cue that capacity will be needed. Force ≤20%.
