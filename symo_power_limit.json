@@ -1,0 +1,309 @@
+{
+    "id": "flow_symo",
+    "label": "Symo Power Limit",
+    "disabled": false,
+    "info": "Fronius Symo active-power limit via Modbus TCP (SunSpec Model 123).\n\nTrigger: MQTT topic `red/cmd/symo/setlimit`, payload = number 0..100 (percent of WMax) or the string \"disable\".\n\nOn each trigger: walks the SunSpec model chain to locate Model 123 (offset varies by firmware), reads WMaxLimPct_SF, computes raw = round(percent * 10^(-SF)), then writes WMaxLimPct, WMaxLimPct_RvrtTms=0, WMaxLim_Ena=1. \"disable\" writes WMaxLim_Ena=0 only.\n",
+    "nodes": [
+        {
+            "id": "symo_mqtt_in",
+            "type": "mqtt in",
+            "z": "flow_symo",
+            "name": "red/cmd/symo/setlimit",
+            "topic": "red/cmd/symo/setlimit",
+            "qos": "0",
+            "datatype": "auto-detect",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 180,
+            "y": 80,
+            "wires": [
+                [
+                    "symo_parse_input"
+                ]
+            ]
+        },
+        {
+            "id": "symo_inject_0",
+            "type": "inject",
+            "z": "flow_symo",
+            "name": "set 0%",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "onceDelay": 0.1,
+            "topic": "red/cmd/symo/setlimit",
+            "payload": "0",
+            "payloadType": "str",
+            "x": 180,
+            "y": 140,
+            "wires": [
+                [
+                    "symo_parse_input"
+                ]
+            ]
+        },
+        {
+            "id": "symo_inject_50",
+            "type": "inject",
+            "z": "flow_symo",
+            "name": "set 50%",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "onceDelay": 0.1,
+            "topic": "red/cmd/symo/setlimit",
+            "payload": "50",
+            "payloadType": "str",
+            "x": 180,
+            "y": 180,
+            "wires": [
+                [
+                    "symo_parse_input"
+                ]
+            ]
+        },
+        {
+            "id": "symo_inject_100",
+            "type": "inject",
+            "z": "flow_symo",
+            "name": "set 100%",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "onceDelay": 0.1,
+            "topic": "red/cmd/symo/setlimit",
+            "payload": "100",
+            "payloadType": "str",
+            "x": 180,
+            "y": 220,
+            "wires": [
+                [
+                    "symo_parse_input"
+                ]
+            ]
+        },
+        {
+            "id": "symo_inject_disable",
+            "type": "inject",
+            "z": "flow_symo",
+            "name": "disable",
+            "props": [
+                {
+                    "p": "payload"
+                },
+                {
+                    "p": "topic",
+                    "vt": "str"
+                }
+            ],
+            "repeat": "",
+            "crontab": "",
+            "once": false,
+            "onceDelay": 0.1,
+            "topic": "red/cmd/symo/setlimit",
+            "payload": "disable",
+            "payloadType": "str",
+            "x": 180,
+            "y": 260,
+            "wires": [
+                [
+                    "symo_parse_input"
+                ]
+            ]
+        },
+        {
+            "id": "symo_parse_input",
+            "type": "function",
+            "z": "flow_symo",
+            "name": "parse input",
+            "func": "\n// Trigger payload: number 0..100 (percent), or string \"disable\",\n// or numeric string \"0..100\". Initialize symo state and emit the\n// first modbus read (SunS marker @ 40000, qty 2).\nconst SUNSPEC_BASE = 40000;\nconst UNIT = 1;\nlet mode, percent;\nconst p = msg.payload;\nif (p === 'disable' || p === 'DISABLE') {\n    mode = 'disable';\n} else {\n    const n = (typeof p === 'number') ? p : parseFloat(p);\n    if (!isFinite(n) || n < 0 || n > 100) {\n        node.error('symo: invalid trigger payload ' + JSON.stringify(p), msg);\n        return null;\n    }\n    mode = 'percent';\n    percent = n;\n}\nmsg.symo = {\n    mode: mode, percent: percent,\n    step: 'check_marker', walkAddr: SUNSPEC_BASE, base: null,\n    raw: null, sf: null\n};\nmsg.payload = { fc: 3, unitid: UNIT, address: SUNSPEC_BASE, quantity: 2 };\nreturn msg;\n",
+            "outputs": 1,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 420,
+            "y": 120,
+            "wires": [
+                [
+                    "symo_flex_getter"
+                ]
+            ]
+        },
+        {
+            "id": "symo_flex_getter",
+            "type": "modbus-flex-getter",
+            "z": "flow_symo",
+            "name": "Symo read",
+            "showStatusActivities": false,
+            "showErrors": true,
+            "showWarnings": true,
+            "logIOActivities": false,
+            "delayOnStart": false,
+            "startDelayTime": "",
+            "server": "symo_modbus_client",
+            "useIOFile": false,
+            "ioFile": "",
+            "useIOForPayload": false,
+            "emptyMsgOnFail": false,
+            "keepMsgProperties": true,
+            "x": 620,
+            "y": 120,
+            "wires": [
+                [
+                    "symo_controller"
+                ],
+                []
+            ]
+        },
+        {
+            "id": "symo_controller",
+            "type": "function",
+            "z": "flow_symo",
+            "name": "controller",
+            "func": "\n// State machine driving the SunSpec walk + writes.\n// Inputs: from flex-getter (msg.payload = uint16 array, msg.symo preserved\n// by keepMsgProperties=true) or from flex-write (msg.payload = response,\n// msg.symo preserved). Outputs:\n//   0 -> flex-getter (next read)\n//   1 -> flex-write  (next write)\n//   2 -> status/log\nconst UNIT = 1;\nconst SUNS_MARKER = [0x5375, 0x6E53];\nconst TARGET_MODEL = 123;\nconst END_MARKER = 0xFFFF;\nconst OFF_PCT      = 5;\nconst OFF_RVRT     = 7;\nconst OFF_ENA      = 9;\nconst OFF_PCT_SF   = 23;\n\nconst sym = msg.symo;\nif (!sym) {\n    node.warn('symo controller: no msg.symo (keepMsgProperties off?)');\n    return [null, null, { payload: { error: 'lost state' } }];\n}\n\nfunction read(addr, qty) {\n    return { payload: { fc: 3, unitid: UNIT, address: addr, quantity: qty }, symo: sym };\n}\nfunction write(addr, value) {\n    return { payload: { fc: 6, unitid: UNIT, address: addr, value: value, quantity: 1 }, symo: sym };\n}\nfunction done(detail) {\n    return { payload: detail, topic: 'red/cmd/symo/setlimit/result' };\n}\n\n// Normalize getter payload to a plain number array\nlet regs = msg.payload;\nif (regs && typeof regs === 'object' && Array.isArray(regs.data)) regs = regs.data;\nif (Buffer.isBuffer(regs)) {\n    const arr = [];\n    for (let i = 0; i + 1 < regs.length; i += 2) arr.push(regs.readUInt16BE(i));\n    regs = arr;\n}\n\nif (sym.step === 'check_marker') {\n    if (!Array.isArray(regs) || regs[0] !== SUNS_MARKER[0] || regs[1] !== SUNS_MARKER[1]) {\n        return [null, null, done({ ok: false, error: 'SunS marker not found', got: regs })];\n    }\n    sym.step = 'walk';\n    sym.walkAddr = 40002;\n    return [read(sym.walkAddr, 2), null, null];\n}\n\nif (sym.step === 'walk') {\n    if (!Array.isArray(regs) || regs.length < 2) {\n        return [null, null, done({ ok: false, error: 'walk read returned no data', got: regs })];\n    }\n    const model_id = regs[0];\n    const length = regs[1];\n    if (model_id === END_MARKER) {\n        return [null, null, done({ ok: false, error: 'Model ' + TARGET_MODEL + ' not present' })];\n    }\n    if (model_id === TARGET_MODEL) {\n        sym.base = sym.walkAddr;\n        if (sym.mode === 'disable') {\n            sym.step = 'write_disable';\n            return [null, write(sym.base + OFF_ENA, 0), null];\n        }\n        sym.step = 'read_sf';\n        return [read(sym.base + OFF_PCT_SF, 1), null, null];\n    }\n    sym.walkAddr += 2 + length;\n    return [read(sym.walkAddr, 2), null, null];\n}\n\nif (sym.step === 'read_sf') {\n    const sfRaw = regs[0];\n    const sf = sfRaw >= 0x8000 ? sfRaw - 0x10000 : sfRaw;\n    const raw = Math.round(sym.percent * Math.pow(10, -sf));\n    if (raw < 0 || raw > 0xFFFF) {\n        return [null, null, done({ ok: false, error: 'raw out of uint16 range', raw, percent: sym.percent, sf })];\n    }\n    sym.raw = raw;\n    sym.sf = sf;\n    sym.step = 'write_pct';\n    return [null, write(sym.base + OFF_PCT, raw), null];\n}\n\nif (sym.step === 'write_pct') {\n    sym.step = 'write_rvrt';\n    return [null, write(sym.base + OFF_RVRT, 0), null];\n}\n\nif (sym.step === 'write_rvrt') {\n    sym.step = 'write_ena';\n    return [null, write(sym.base + OFF_ENA, 1), null];\n}\n\nif (sym.step === 'write_ena') {\n    return [null, null, done({ ok: true, percent: sym.percent, raw: sym.raw, sf: sym.sf, base: sym.base })];\n}\n\nif (sym.step === 'write_disable') {\n    return [null, null, done({ ok: true, disabled: true, base: sym.base })];\n}\n\nnode.warn('symo controller: unknown step ' + sym.step);\nreturn [null, null, done({ ok: false, error: 'unknown step', step: sym.step })];\n",
+            "outputs": 3,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 820,
+            "y": 180,
+            "wires": [
+                [
+                    "symo_flex_getter"
+                ],
+                [
+                    "symo_flex_write"
+                ],
+                [
+                    "symo_status",
+                    "symo_mqtt_out"
+                ]
+            ]
+        },
+        {
+            "id": "symo_flex_write",
+            "type": "modbus-flex-write",
+            "z": "flow_symo",
+            "name": "Symo write",
+            "showStatusActivities": false,
+            "showErrors": true,
+            "showWarnings": true,
+            "delayOnStart": false,
+            "startDelayTime": "",
+            "server": "symo_modbus_client",
+            "emptyMsgOnFail": false,
+            "keepMsgProperties": true,
+            "x": 1020,
+            "y": 220,
+            "wires": [
+                [
+                    "symo_controller"
+                ]
+            ]
+        },
+        {
+            "id": "symo_status",
+            "type": "debug",
+            "z": "flow_symo",
+            "name": "result",
+            "active": true,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "payload",
+            "targetType": "msg",
+            "statusVal": "payload",
+            "statusType": "auto",
+            "x": 1180,
+            "y": 200,
+            "wires": []
+        },
+        {
+            "id": "symo_mqtt_out",
+            "type": "mqtt out",
+            "z": "flow_symo",
+            "name": "result -> MQTT",
+            "topic": "",
+            "qos": "0",
+            "retain": "false",
+            "respTopic": "",
+            "contentType": "",
+            "userProps": "",
+            "correl": "",
+            "expiry": "",
+            "broker": "mqtt_broker_config",
+            "x": 1200,
+            "y": 240,
+            "wires": []
+        },
+        {
+            "id": "symo_changelog",
+            "type": "comment",
+            "z": "flow_symo",
+            "name": "Changelog",
+            "info": "### 2026-04-25 (Initial)\n- Port of `~/Projects/symo/set_power_limit_zero.py`.\n- Trigger: MQTT `red/cmd/symo/setlimit` (payload `0`..`100` or `\"disable\"`)\n  + on-tab inject buttons for manual test.\n- Walks SunSpec model chain @ 40000 to locate Model 123 (Immediate\n  Inverter Controls); reads `WMaxLimPct_SF`; computes raw = round(pct *\n  10^(-SF)); writes `WMaxLimPct`, `WMaxLimPct_RvrtTms=0`, `WMaxLim_Ena=1`.\n  `\"disable\"` writes `WMaxLim_Ena=0` only.\n- Verified against the live inverter on first deploy: Model 123 at 40237,\n  SF=-2, pct=100 -> raw=10000.\n",
+            "x": 180,
+            "y": 320,
+            "wires": []
+        }
+    ],
+    "configs": [
+        {
+            "id": "symo_modbus_client",
+            "type": "modbus-client",
+            "name": "Symo 192.168.4.170",
+            "clienttype": "tcp",
+            "bufferCommands": true,
+            "stateLogEnabled": false,
+            "tcpHost": "192.168.4.170",
+            "tcpPort": "502",
+            "tcpType": "DEFAULT",
+            "serialPort": "/dev/ttyUSB",
+            "serialType": "RTU-BUFFERD",
+            "serialBaudrate": "9600",
+            "serialDatabits": "8",
+            "serialStopbits": "1",
+            "serialParity": "none",
+            "serialConnectionDelay": "100",
+            "unit_id": "1",
+            "commandDelay": "1",
+            "clientTimeout": "1000",
+            "reconnectOnTimeout": true,
+            "reconnectTimeout": "2000",
+            "parallelUnitIdsAllowed": true,
+            "z": "flow_symo"
+        }
+    ]
+}
