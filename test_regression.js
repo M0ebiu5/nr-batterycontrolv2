@@ -35,7 +35,8 @@ function runOptimizer(msg) {
         get: (key) => {
             if (key === 'weather7days') return { sun7: [{ value: 0.5 }] };
             return null;
-        }
+        },
+        set: () => {}
     };
     return fn(msg, node, flow, global);
 }
@@ -793,6 +794,88 @@ function scenario8_preemptivePostSunriseNoTomorrow() {
     return false;
 }
 
+// =========================================================
+// SCENARIO 9: User report 2026-05-06 — at 16:00, optimizer
+// fed-in at mp=9.06ct (state=4 via runtime "battery full +
+// PV surplus" branch) even though 17:45 in the same saturation
+// cluster had mp=14.45ct AND replacement cost (weak PV
+// tomorrow) was ~22ct/kWh — so EVERY slot in the cluster
+// was a round-trip loser. Right answer: don't feed in at all,
+// preserve SOC for tomorrow's load. Fix: runtime "battery
+// full" branch now requires mp>replacementPrice OR soc≥99
+// (genuine curtailment).
+// =========================================================
+function scenario9_saturationClusterRoundTrip() {
+    console.log('\n=== SCENARIO 9: Saturation cluster mid-day must respect round-trip economics ===');
+
+    // NOW = today 16:00 Berlin (UTC 14:00). currentSoc=95% (right at the
+    // saturation threshold the buggy branch was triggering on). PV moderate
+    // (1700W) so soc creeps up but never reaches 99% (true curtailment).
+    // Tomorrow's PV is weak so replacement cost stays ~22ct; mp at 16:00
+    // is 9.06ct → round-trip loss → MUST hold (state=3), not fire.
+    const NOW = Date.UTC(2026, 4, 6, 14, 0);
+    const startMs = NOW;
+    const slots = 32; // 16:00 today → 23:45 today (today-only horizon for clarity)
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
+        if (hour === 16) return 9.06;             // <-- local-min, the bug's trigger
+        if (hour < 18) return 10.5 + (hour - 16) * 0.5;
+        if (hour < 21) return 14 + (hour - 18) * 1; // climbing evening peak
+        return 12;
+    });
+
+    // Solar: moderate (~1700W peak this afternoon, fading), zero overnight.
+    const solar = [];
+    for (let h = 0; h < 9; h++) {
+        const t = startMs + h * 3600000;
+        const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
+        solar.push({ time: t, sunshineDurationInMinutes: hour >= 16 && hour <= 18 ? 18 : 0 });
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 95 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 1700 }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 4, 6, 3, 30)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 4, 6, 18, 30)).toISOString(),
+            solarradiation: 200,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+
+    const slot1600 = schedule.find(s => typeof s.time === 'string' && s.time.includes('06.05.') && s.time.includes('16:00'));
+    if (!slot1600) {
+        console.error('  setup error: 16:00 slot not found');
+        return false;
+    }
+    console.log(`  16:00: ${fmtSlot(slot1600)}`);
+
+    if (slot1600.state === 4) {
+        console.error('  FAIL: 16:00 fired state=4 despite round-trip loss (mp=9.06 < replacement, soc<99)');
+        return false;
+    }
+    if (slot1600.predictedSoc >= 99) {
+        // Setup drift — if SOC ran up to 99 at 16:00, the curtailment branch
+        // is the right call and the test has lost its meaning.
+        console.error(`  setup drift: 16:00 soc=${slot1600.predictedSoc}% — curtailment fired, not the bug we want to test`);
+        return false;
+    }
+    console.log('  PASS: 16:00 holds (no feed-in at sub-replacement mp without curtailment)');
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -802,7 +885,8 @@ const results = [
     ['cloudy forecast honored',     scenario5_cloudyForecastHonored],
     ['end-of-schedule reserve bad forecast', scenario6_endOfScheduleReserveBadForecast],
     ['preemptive picks morning peak', scenario7_preemptivePicksMorningPeak],
-    ['preemptive post-sunrise no tomorrow', scenario8_preemptivePostSunriseNoTomorrow]
+    ['preemptive post-sunrise no tomorrow', scenario8_preemptivePostSunriseNoTomorrow],
+    ['saturation cluster round-trip', scenario9_saturationClusterRoundTrip]
 ];
 
 let passed = 0;
