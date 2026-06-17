@@ -17,6 +17,8 @@ const PV_PEAK_W = 5000;
 const BASE_GRID_FEE = 13; // ct/kWh
 const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear + inverter losses exceed sub-ct revenue)
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
+const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
+const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
 const TIMEZONE = 'Europe/Berlin';
 
 // Timezone-aware time extraction (all logic must use local Berlin time, not UTC)
@@ -392,47 +394,114 @@ for (const p of prices) {
 // PV never offsets load in the walk. Phase 3 picks up the higher socNeeded
 // and plans extra grid charging at the cheapest in-horizon slots.
 let _postSchedLoadKwh = 0;
+let _reserveDeferred = false;
 if (schedule.length > 0) {
     const lastSlotEnd = schedule[schedule.length - 1].time + INTERVAL_HOURS * 3600 * 1000;
-    // Cover the "blind window" — midnight until the next day's prices
-    // publish around 13:00-14:00. Not a full 24h: once new prices arrive,
-    // the next optimizer run has full visibility and can plan freely.
-    const RESERVE_HOURS = 14;
-    const MAX_RESERVE_KWH = 6; // ~20% SOC cap on a 30 kWh battery
+    // Defer the multi-day reserve until tomorrow's prices publish (~13:00
+    // Berlin EPEX). Before publish, lastSchedTime is only ~24h out; we
+    // can't compare today's mid-day grid-charge cost against tomorrow's
+    // actual cheapest slots, so reserve picks become a blind bet that the
+    // forecast-driven walk overweights vs. real price data. User report
+    // 2026-05-19: 25 mid-day grid picks at ~18ct effective fired overnight
+    // (run at 01:00 Berlin) against a 48h walk forecasting bad PV — but
+    // tomorrow's prices weren't yet visible to confirm the bet. With
+    // pricesCoverTomorrow=true the 36h horizon already includes tomorrow's
+    // own slots, so the planner naturally picks the cheaper of {today,
+    // tomorrow} — no separate post-horizon reserve needed.
+    // 2026-05-20: bumped 25h->30h. At 25h an evening run (~20:45 Berlin) saw
+    // prices ~27h out — past 25h, so the reserve fired — yet those prices
+    // only cover *tomorrow*, not the day-after the reserve actually bets on.
+    // Result: ~8 kWh of ~11ct grid-charge committed in tomorrow-morning slots
+    // (e.g. 10:30) before the day-after prices publish. 30h defers the reserve
+    // until prices extend into the day-after (only true after the next ~13:00
+    // publish), while still deferring the overnight/early-morning blind case.
+    const pricesCoverTomorrow = (schedule[schedule.length - 1].time - now) > 30 * 3600 * 1000;
+    if (!pricesCoverTomorrow) {
+        _reserveDeferred = true;
+        // Overnight-bridge reserve: the multi-day (day-after) reserve is a blind
+        // bet before tomorrow's prices publish, so it's deferred. But the load
+        // from schedule-end until the NEXT sunrise is a KNOWN quantity, not a
+        // bet. Without it, evening feed-in drains SOC to the bare MIN+8 floor
+        // right as the horizon closes mid-night (schedule ends ~23:45 local
+        // pre-publish), emptying the battery into the small hours and forcing a
+        // morning grid rebuy / selling the marginal ~14ct late-evening tail
+        // (user report 2026-05-22: plan ended 23:45 local at ~11% with 5.5h of
+        // darkness left). Walk hour-by-hour from schedule-end to the first
+        // daylight hour, summing load (PV~=0 overnight), and hold that as the
+        // end-of-schedule floor so feed-in stops at the high-value peaks.
+        let _bridgeKwh = 0;
+        for (let h = 0; h < 18; h++) {
+            const t = lastSlotEnd + h * 3600000;
+            if (h > 0 && isDaylight(t)) break; // reached next sunrise
+            const loadW = getLoadEstimate(t);
+            let pvW = 0;
+            if (isDaylight(t)) {
+                const { profile: hourlyPv, refRatio: baselineRefRatio } = getDayBaseline(t);
+                const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
+                const slotForecast = getSunshineForecast(t);
+                const ratio = slotForecast !== null ? slotForecast : 0.5;
+                pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
+            }
+            _bridgeKwh += Math.max(0, loadW - pvW) / 1000;
+        }
+        _postSchedLoadKwh = _bridgeKwh;
+    } else {
+        // Multi-day post-horizon reserve. The walk weighs PV via
+        // getSunshineForecast (7d horizon), so good-weather days don't pad
+        // the reserve — only sustained PV deficits do. Needs both a long
+        // enough walk (48h) and a high enough cap (21 kWh ≈ 70% SOC) to
+        // surface a dead-PV streak; otherwise tonight's feed-in silently
+        // drains into a PV desert and forces peak-price grid recharge.
+        const RESERVE_HOURS = 48;
+        const MAX_RESERVE_KWH = 21; // ~70% SOC cap on a 30 kWh battery; survives multi-day PV deficits
 
-    // Fallback PV ratio for walk hours past the forecast window. Average
-    // the daylight forecast ratios from the tail of the schedule. <4 tail
-    // samples → 0.5 (neutral; not "sunny" default because that would hide
-    // bad-weather reserves when the forecast window is short).
-    let tomorrowPvRatio = 0.5;
-    {
-        const tail = [];
-        for (let i = schedule.length - 1; i >= 0 && tail.length < 16; i--) {
-            const s = schedule[i];
-            if (!isDaylight(s.time)) continue;
-            const fc = getSunshineForecast(s.time);
-            if (fc !== null) tail.push(fc);
+        // Fallback PV ratio for walk hours past the forecast window. Average
+        // the daylight forecast ratios from the tail of the schedule. <4 tail
+        // samples → 0.5 (neutral; not "sunny" default because that would hide
+        // bad-weather reserves when the forecast window is short).
+        let tomorrowPvRatio = 0.5;
+        {
+            const tail = [];
+            for (let i = schedule.length - 1; i >= 0 && tail.length < 16; i--) {
+                const s = schedule[i];
+                if (!isDaylight(s.time)) continue;
+                const fc = getSunshineForecast(s.time);
+                if (fc !== null) tail.push(fc);
+            }
+            if (tail.length >= 4) {
+                tomorrowPvRatio = tail.reduce((a, b) => a + b, 0) / tail.length;
+            }
         }
-        if (tail.length >= 4) {
-            tomorrowPvRatio = tail.reduce((a, b) => a + b, 0) / tail.length;
+
+        // Net cumulative walk (allows PV surplus to offset prior deficit). The
+        // earlier Math.max(0, load-pv) form accumulated deficit-only and never
+        // discounted post-schedule sunny days — a 22nd at 694 sun-min would not
+        // offset a 21st deficit, so the cap pinned _postSchedLoadKwh near 21 kWh
+        // and endFloorSoc forced Phase 3c into ~18 noon grid charges on a bad-PV
+        // tomorrow. Track the running running cumulative net and floor at 0 (we
+        // can't pre-charge from future PV; max needed reserve is the deepest
+        // dip below end-of-schedule SOC across the walk).
+        let walkDef = 0;
+        let peakWalkDef = 0;
+        for (let h = 0; h < RESERVE_HOURS; h++) {
+            const t = lastSlotEnd + h * 3600000;
+            const loadW = getLoadEstimate(t);
+            let pvW = 0;
+            if (isDaylight(t)) {
+                const { profile: hourlyPv, refRatio: baselineRefRatio } = getDayBaseline(t);
+                const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
+                const slotForecast = getSunshineForecast(t);
+                const ratio = slotForecast !== null ? slotForecast : tomorrowPvRatio;
+                pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
+            }
+            walkDef += (loadW - pvW) / 1000; // can subtract on surplus hours
+            if (walkDef < 0) walkDef = 0; // can't pre-charge from future PV
+            if (walkDef > peakWalkDef) peakWalkDef = walkDef;
         }
+        _postSchedLoadKwh = peakWalkDef;
+
+        if (_postSchedLoadKwh > MAX_RESERVE_KWH) _postSchedLoadKwh = MAX_RESERVE_KWH;
     }
-
-    for (let h = 0; h < RESERVE_HOURS; h++) {
-        const t = lastSlotEnd + h * 3600000;
-        const loadW = getLoadEstimate(t);
-        let pvW = 0;
-        if (isDaylight(t)) {
-            const { profile: hourlyPv, refRatio: baselineRefRatio } = getDayBaseline(t);
-            const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
-            const slotForecast = getSunshineForecast(t);
-            const ratio = slotForecast !== null ? slotForecast : tomorrowPvRatio;
-            pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
-        }
-        _postSchedLoadKwh += Math.max(0, loadW - pvW) / 1000; // 1-hour step
-    }
-
-    if (_postSchedLoadKwh > MAX_RESERVE_KWH) _postSchedLoadKwh = MAX_RESERVE_KWH;
 }
 
 // Compute price statistics for thresholds
@@ -767,11 +836,25 @@ for (const s of schedule) {
             for (let i = 0; i <= d; i++) {
                 const s = schedule[i];
                 if (s._plan) continue;
-                // Never grid-charge at night during preemptive discharge.
-                if (targetSocForSunrise !== null && !isDaylight(s.time) && s.pvPower < 200) continue;
-                eligible.push({ idx: i, effPrice: s.effectivePrice });
+                // No grid-charge at all during preemptive (confirmed glut day ahead):
+                // midday PV refills the battery for free, so defending the MIN+5 floor
+                // with pre-PV grid charges at retail is the sell-low/buy-high the user
+                // vetoes. Let SOC coast (household draws grid; the Phase 4 safety
+                // override is likewise suppressed during preemptive pre-PV). The prior
+                // gate keyed on isDaylight (flips at civil sunrise ~05:00 local, hours
+                // before PV ramps) then on pvPower<load, but Phase 3c just moved the
+                // charge to the next eligible slot each time (user report 2026-05-22:
+                // 2 morning charges at ~26ct before a 749 sun-min day). Negative-price
+                // profit charging is unaffected — that is Phase 3f, not 3c.
+                if (targetSocForSunrise !== null) continue;
+                eligible.push({ idx: i, effPrice: s.effectivePrice, prePublish: berlinTime(s.time).hour < 13 });
             }
-            eligible.sort((a, b) => a.effPrice - b.effPrice);
+            // Prefer slots at/after the ~13:00 Berlin price publish. Grid-charging
+            // earlier is a blind bet on prices that haven't published yet (user
+            // 2026-05-20: "charge after 13:00, no need before — price diff is small").
+            // Pre-13:00 slots stay a fallback so a genuine morning deficit is still
+            // covered: the sort lists them last, used only if no post-publish slot helps.
+            eligible.sort((a, b) => (a.prePublish - b.prePublish) || (a.effPrice - b.effPrice));
 
             const socBefore = traj[d];
             for (const cand of eligible) {
@@ -788,7 +871,7 @@ for (const s of schedule) {
         if (!committed) break;
     }
     const finalTraj = simulateSocTrajectory();
-    node.warn(`Phase 3c: picks=${picks} endTarget=${slotTarget(lastIdx).toFixed(1)}% endTraj=${finalTraj[lastIdx].toFixed(1)}% peakTraj=${Math.max(...finalTraj).toFixed(1)}% (cap ${MAX_GRID_CHARGE_SOC_PCT}%)`);
+    node.warn(`Phase 3c: picks=${picks} endTarget=${slotTarget(lastIdx).toFixed(1)}% endTraj=${finalTraj[lastIdx].toFixed(1)}% peakTraj=${Math.max(...finalTraj).toFixed(1)}% (cap ${MAX_GRID_CHARGE_SOC_PCT}%)${_reserveDeferred ? ` [multi-day reserve deferred; overnight bridge ${_postSchedLoadKwh.toFixed(1)}kWh]` : ''}`);
 }
 
 // --- 3d. Feed-in planning: discharge at highest prices when we have excess ---
@@ -1060,30 +1143,147 @@ let replacementPrice = Infinity;
             if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
         }
     }
-    const pvWillCurtail = pvOnlyOverflow > 0;
+    // pvOnlyOverflow > 0 was too loose: 0.6% of phantom overflow (~0.18 kWh) on a
+    // bad-PV day (74 sun-min) was enough to trigger pvOpportunityPrice (~11 ct) as
+    // replacement, letting a 22.39 ct evening feed-in pass against a 14ct real grid
+    // refill cost. The non-overflow portion of feed-in needs grid-refill (~18.69 ct
+    // here), not PV — only treat curtailment as the replacement when PV overflow is
+    // substantive (≥ 5 % SOC ≈ 1.5 kWh).
+    const PV_CURTAIL_MIN_SOC = 5;
+    const pvWillCurtail = pvOnlyOverflow >= PV_CURTAIL_MIN_SOC;
+
+    // Post-schedule PV overflow walk (48h past schedule end). When the next
+    // 48h forecast a strong PV refill (e.g. day-after-tomorrow with 600+
+    // sun-min), the energy we feed-in at tomorrow's evening peak is replaced
+    // by free post-schedule PV rather than grid recharge. The in-schedule
+    // pvOnlyOverflow misses this because the horizon ends before the refill.
+    let postSchedPvOverflow = 0;
+    if (schedule.length > 0) {
+        const lastSlotEnd_3d = schedule[schedule.length - 1].time + INTERVAL_HOURS * 3600 * 1000;
+        let walkSoc = projSoc;
+        for (let h = 0; h < 48; h++) {
+            const t = lastSlotEnd_3d + h * 3600000;
+            const loadW = getLoadEstimate(t);
+            let pvW = 0;
+            if (isDaylight(t)) {
+                const { profile: hourlyPv, refRatio: baselineRefRatio } = getDayBaseline(t);
+                const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
+                const slotForecast = getSunshineForecast(t);
+                const ratio = slotForecast !== null ? slotForecast : 0.5;
+                pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
+            }
+            walkSoc += kwhToSoc((pvW - loadW) / 1000);
+            if (walkSoc > 99) { postSchedPvOverflow += walkSoc - 99; walkSoc = 99; }
+            if (walkSoc < MIN_SOC_PCT) walkSoc = MIN_SOC_PCT;
+        }
+    }
+    const postSchedPvWillCurtail = postSchedPvOverflow >= PV_CURTAIL_MIN_SOC;
+
+    // Position guard: post-schedule PV only refills energy we feed-in AFTER
+    // the last planned grid-charge. A slot before any planned charge is
+    // replaced by that grid charge, not by post-schedule PV — applying the
+    // looser late-slot economics there would re-create the sell-low/buy-high
+    // round trip the strict check blocks.
+    let lastPlannedChargeIdx = -1;
+    for (let i = schedule.length - 1; i >= 0; i--) {
+        if (schedule[i]._plan === 'charge') { lastPlannedChargeIdx = i; break; }
+    }
+
     replacementPrice = (cheapPvRefillAhead || pvWillCurtail)
         ? Math.min(minReplacementEffPrice, pvOpportunityPrice)
         : minReplacementEffPrice;
+    const replacementPriceLate = (cheapPvRefillAhead || pvWillCurtail || postSchedPvWillCurtail)
+        ? Math.min(minReplacementEffPrice, pvOpportunityPrice)
+        : minReplacementEffPrice;
+    const eligibleOverflowLate = pvOnlyOverflow + postSchedPvOverflow;
+
+    // Single-pass selection with per-slot replacement logic. Candidates are
+    // sorted by mp DESC, so picks happen in best-revenue-first order globally.
+    //
+    // For each candidate, the replacement source depends on its position
+    // relative to the last planned Phase 3c grid-charge:
+    //   - AFTER lastPlannedChargeIdx ("late"): post-schedule PV refills it,
+    //     so use min(minReplaceEff, pvOpportunityPrice) when post-sched (or
+    //     in-horizon) PV will curtail. Overflow budget includes postSchedPvOverflow.
+    //   - AT-OR-BEFORE lastPlannedChargeIdx ("early"): the replacement is the
+    //     next-cheapest unplanned grid-charge slot (= minReplaceEff). No
+    //     pvOpportunity bypass — future PV lies beyond a planned charge wall
+    //     and won't actually refill the energy we drain here.
+    //
+    // Failed round-trip check uses `continue` (not `break`): a high-mp early
+    // slot may fail strict check while a lower-mp late slot still passes its
+    // looser check. Within the SAME pass-eligibility class (early or late),
+    // mp DESC ordering means cheaper-but-lower-mp slots strictly fail the same
+    // check, so continue is harmless. usedBudget guard still breaks the loop
+    // once the feed-in budget is spent.
+    // Early feed-in (before/at the last planned grid-charge) is replaced by
+    // EXTENDING tomorrow's grid-charge into its MARGINAL (most-expensive) slots,
+    // not the single globally-cheapest unplanned slot. Holding 1 kWh tonight
+    // drops the priciest planned charge slot, so the marginal refill cost is the
+    // max effective price among planned 'charge' slots. Using minReplaceEff here
+    // (e.g. a 12.7 ct summer-discounted midday slot) let tonight's ~18 ct evening
+    // peak pass the round-trip check while the real rebuy cost was ~22 ct
+    // effective — the "discharge today, charge tomorrow" loss the user flagged.
+    const _plannedChargeEffs = schedule.filter(s => s._plan === 'charge').map(s => s.effectivePrice);
+    const _marginalChargeEff = _plannedChargeEffs.length ? Math.max(..._plannedChargeEffs) : -Infinity;
+    const replacementPriceEarly = Math.max(minReplacementEffPrice, _marginalChargeEff);
+
+    // --- Cross-day feed-in hold (opportunity-cost floor) ---
+    // Tonight's candidates only span [0, horizonIdx); a materially higher
+    // feed-in peak BEYOND the horizon (tomorrow evening) is invisible to this
+    // greedy pass, and the round-trip check only guards grid REBUY cost. When
+    // pvWillCurtail is true it even uses pvOpportunityPrice (~PV-time mp, low) as
+    // replacement, so tonight's stored energy sells at 14–18ct while tomorrow's
+    // 46ct peak is missed (the reported case). Fix: when a refill horizon exists,
+    // find the best stored-energy (pv<load) feed-in peak BEYOND the horizon and
+    // require tonight's feed-in to clear it (minus slack) to sell — otherwise
+    // hold the SOC for that better peak (captured next cycle as the horizon
+    // advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is
+    // still sold tonight (see the exemption in the loop): that energy would be
+    // lost to curtailment if held, so selling it at any price beats wasting it.
+    let futurePeakHoldPrice = -Infinity;
+    if (horizonIsRefill) {
+        let futurePeakMp = -Infinity;
+        for (let i = horizonIdx; i < schedule.length; i++) {
+            const s = schedule[i];
+            // Only stored-energy slots (pv<load): a high price during a PV
+            // surplus is served by PV, not the battery — no reason to hold for it.
+            if (s.pvPower < s.loadEst && s.marketPrice > futurePeakMp) futurePeakMp = s.marketPrice;
+        }
+        if (isFinite(futurePeakMp)) {
+            futurePeakHoldPrice = futurePeakMp - CROSSDAY_HOLD_SLACK_CT;
+            node.warn(`Cross-day hold: future peak ${futurePeakMp.toFixed(1)}ct beyond horizon → hold tonight stored-energy feed-in below ${futurePeakHoldPrice.toFixed(1)}ct (curtailment-bound ${pvOnlyOverflow.toFixed(1)}% still sells)`);
+        }
+    }
 
     let usedBudget = 0;
-    for (const { s } of candidates) {
+    for (const { s, idx } of candidates) {
         const relief = feedinReliefSoc(s);
         if (relief <= 0) continue;
-        // Round-up: stop AFTER first slot that meets or crosses budget. The
-        // strict `usedBudget + relief > budget → break` was off-by-one against
-        // discretization: a 19.3% budget with 2.92%/slot picks 6 slots
-        // (17.52%), leaving 1.78% residual. The 7th slot pushes total relief
-        // to 20.44% — a tiny overshoot, but enough to drop runtime peak below
-        // the soc≥99 curtailment trigger. As long as mp still beats
-        // replacementPrice, picking that 7th slot is strictly better than
-        // leaving the residual to fire as curtailment at low mp.
         if (usedBudget >= feedinBudgetSoc) break;
-        // Overflow portion is free revenue; beyond that, require economic
-        // viability. Use PV-only overflow here too: grid-charge-induced
-        // overflow doesn't make feed-in free — the drained SOC still has to
-        // be refilled from grid at minReplacementEffPrice.
-        const isOverflowOnly = usedBudget + relief <= pvOnlyOverflow;
-        if (!isOverflowOnly && (blindToTomorrow || s.marketPrice <= replacementPrice)) break;
+        const isLate = idx > lastPlannedChargeIdx;
+        const slotReplacementPrice = isLate ? replacementPriceLate : replacementPriceEarly;
+        const slotEligibleOverflow = isLate ? eligibleOverflowLate : pvOnlyOverflow;
+        // Curtailment ("overflow") energy only physically exists in slots where
+        // PV actually exceeds load and the battery is at cap. Feeding the early
+        // overflow budget into a PV<=load slot (e.g. tonight's evening peak,
+        // PV=0) drains STORED energy that a later grid-charge then replaces at
+        // retail — the "discharge today, charge tomorrow" round-trip loss. So an
+        // early (pre-grid-charge) slot is overflow-exempt only when it is itself
+        // a real PV-surplus slot; otherwise it must pass the round-trip check.
+        // Late slots (after the last planned grid-charge) keep the existing
+        // next-day-PV-refill exemption via isLate.
+        const isOverflowOnly = usedBudget + relief <= slotEligibleOverflow
+            && (isLate || s.pvPower > s.loadEst);
+        // Cross-day hold: don't sell STORED energy tonight below a materially
+        // higher future peak. Exempt only the genuinely curtailment-bound
+        // portion (within pvOnlyOverflow — real in-schedule PV curtailment that
+        // would be lost if held), NOT the postSched-inclusive isOverflowOnly
+        // budget (post-schedule overflow is speculative and days past the peak).
+        const genuineOverflowExempt = (usedBudget + relief <= pvOnlyOverflow)
+            && (isLate || s.pvPower > s.loadEst);
+        if (!genuineOverflowExempt && s.marketPrice < futurePeakHoldPrice) continue;
+        if (!isOverflowOnly && (blindToTomorrow || s.marketPrice <= slotReplacementPrice + FEEDIN_ROUNDTRIP_MARGIN_CT)) continue;
         s._plan = 'feedin_surplus';
         usedBudget += relief;
     }
@@ -1285,6 +1485,63 @@ let replacementPrice = Infinity;
     if (stretchStart >= 0) closeStretch(schedule.length);
 }
 
+// Overnight-survival guard: the per-slot forward-validate below only keeps
+// each feed-in slot's OWN SOC above MIN+5; it ignores the household load that
+// keeps draining AFTER the last feed-in. On a sunny-tomorrow plan Phase 3d
+// drains the evening peak down to ~MIN+5 (tomorrow's free PV is the assumed
+// replacement), then overnight compensate slides SOC to MIN and Phase 4 fires
+// emergency grid charges at ~retail effective price — buying back what was
+// just sold cheaper. User report 2026-05-21: 15 evening feed-in slots (15-23ct)
+// drained SOC to 10%, then 4 overnight grid charges at ~27ct effective.
+// Walk the WHOLE trajectory; while its trough breaches MIN+5, give back the
+// lowest-mp feed-in slot at/before the trough and re-walk. This drops only the
+// marginal feed-ins that force the rebuy and preserves the high-mp peaks that
+// tomorrow's PV genuinely refills.
+{
+    const SURVIVAL_FLOOR = MIN_SOC_PCT + 5;
+    function feedinTrough() {
+        let soc = currentSoc;
+        let minSoc = Infinity, minIdx = -1;
+        for (let i = 0; i < schedule.length; i++) {
+            const s = schedule[i];
+            if (s._plan === 'charge') {
+                soc += kwhToSoc(maxChargeEnergy);
+            } else if (s._plan === 'feedin_preemptive'
+                       || s._plan === 'feedin_surplus'
+                       || s._plan === 'feedin_capacity') {
+                soc -= feedinDrainSoc(s);
+            } else {
+                soc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+            }
+            if (soc > 100) soc = 100;
+            // Do NOT clamp at MIN here: we need the true trough depth to know
+            // how much feed-in to give back.
+            if (soc < minSoc) { minSoc = soc; minIdx = i; }
+        }
+        return { minSoc, minIdx };
+    }
+    let _demoted = 0;
+    let guard = 0;
+    while (guard++ < schedule.length) {
+        const { minSoc, minIdx } = feedinTrough();
+        if (minSoc >= SURVIVAL_FLOOR || minIdx < 0) break;
+        let demoteIdx = -1, demoteMp = Infinity;
+        for (let i = 0; i <= minIdx; i++) {
+            const s = schedule[i];
+            if ((s._plan === 'feedin_surplus'
+                 || s._plan === 'feedin_capacity'
+                 || s._plan === 'feedin_preemptive')
+                && s.marketPrice < demoteMp) {
+                demoteMp = s.marketPrice; demoteIdx = i;
+            }
+        }
+        if (demoteIdx < 0) break; // trough is structural (load-driven); Phase 4 will charge
+        schedule[demoteIdx]._plan = null;
+        _demoted++;
+    }
+    if (_demoted > 0) node.warn(`Overnight-survival guard: demoted ${_demoted} feed-in slot(s) to keep trough >= ${SURVIVAL_FLOOR}%`);
+}
+
 // Forward-validate: walk schedule in time order, demoting any feed-in that
 // would dip SOC below MIN+5 at its slot. Recompute _plannedSoc along the way.
 {
@@ -1358,9 +1615,18 @@ for (let i = 0; i < schedule.length; i++) {
         }
     }
     else if (plan === 'charge') {
-        // Planned cheapest-slot charging
-        state = 1; setPoint = MAX_CHARGE_W;
-        reason = `Planned charge at ${ep.toFixed(1)}ct (cheapest available)`;
+        // Planned cheapest-slot charging. Skip when PV has already overfilled the
+        // battery past the planning cap: real SOC tracks above MAX_GRID_CHARGE_SOC_PCT
+        // while the planner's clamped sim assumed ~cap, so the pick would grid-charge an
+        // almost-full battery at a positive price. Profit charges (ep<0, paid to import)
+        // still fill.
+        if (soc < MAX_GRID_CHARGE_SOC_PCT || ep < 0) {
+            state = 1; setPoint = MAX_CHARGE_W;
+            reason = `Planned charge at ${ep.toFixed(1)}ct (cheapest available)`;
+        } else {
+            state = 3; setPoint = -AVG_LOAD_W;
+            reason = `Skip planned charge, SOC ${soc.toFixed(0)}% >= ${MAX_GRID_CHARGE_SOC_PCT}% cap (PV overfilled), compensate`;
+        }
     }
     else if ((plan === 'feedin_surplus' || plan === 'feedin_capacity' || plan === 'feedin_saturation')
              && soc > MIN_SOC_PCT + kwhToSoc(maxDischargeEnergy) + 5) {
@@ -1450,7 +1716,7 @@ for (let i = 0; i < schedule.length; i++) {
     // Safety: if SOC hits minimum, override to charge
     // But NEVER charge from grid during preemptive discharge (night before solar day)
     if (soc <= MIN_SOC_PCT && state !== 1
-        && !(targetSocForSunrise !== null && !isDaylight(t))) {
+        && !(targetSocForSunrise !== null && pvW < loadW)) {
         state = 1; setPoint = MAX_CHARGE_W;
         reason = `SOC safety override - must charge`;
         soc = MIN_SOC_PCT + kwhToSoc(maxChargeEnergy);

@@ -876,6 +876,106 @@ function scenario9_saturationClusterRoundTrip() {
     return true;
 }
 
+// =========================================================
+// SCENARIO 10: User report — heavy feed-in tonight at a low
+// peak (≤17ct) while tomorrow's 46ct peak is skipped. Today's
+// SOC is sold down at 14-17ct because a single cheap PV slot
+// tomorrow flips `freeRefillAhead` true (loose existence test),
+// but tomorrow is cloudy so PV can't actually refill. The
+// cross-day hold must block tonight's sub-peak feed-in.
+// =========================================================
+function scenario10_crossDayHold() {
+    console.log('\n=== SCENARIO 10: Cross-day hold — don\'t sell tonight @17ct vs tomorrow @46ct ===');
+
+    const NOW = Date.UTC(2026, 5, 17, 9, 0); // 2026-06-17 11:00 Berlin
+    const startMs = NOW;
+    const slots = 144; // 36h → reaches tomorrow evening peak
+
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW)) / 86400000);
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const h = berlinHour(t), day = dayOffset(t);
+        if (day === 0) {                       // today
+            if (h >= 18 && h < 22) return 16;  // today evening peak ~16-17ct
+            if (h >= 22) return 11;
+            return 8;                          // today daytime/afternoon
+        }
+        if (h >= 9 && h < 15) return 1.5;      // tomorrow cheap PV midday → freeRefillAhead
+        if (h >= 19 && h < 22) return 44;      // tomorrow evening BIG peak
+        if (h < 5) return 9;
+        return 12;
+    });
+    const today2000 = Date.UTC(2026, 5, 17, 18, 0); // Berlin 20:00 today
+    const tom2000   = Date.UTC(2026, 5, 18, 18, 0); // Berlin 20:00 tomorrow
+    for (const p of prices) {
+        if (p.time === today2000) p.marketprice = 17;
+        if (p.time === tom2000)   p.marketprice = 46;
+    }
+
+    // Weak/cloudy PV baseline (~1800W peak): midday pv>load (so the cheap slot
+    // counts as PV-surplus) but total surplus never curtails the battery.
+    const pvHistory = [];
+    for (let day = 1; day <= 10; day++) {
+        const past = new Date(NOW - day * 86400000);
+        const dayMidnightUtc = Date.UTC(past.getUTCFullYear(), past.getUTCMonth(), past.getUTCDate(), -2, 0);
+        for (let h = 0; h < 24; h++) {
+            let pv = 0;
+            if (h >= 7 && h <= 18) pv = Math.max(0, 1800 * Math.sin(Math.PI * (h - 7) / 11));
+            pvHistory.push({ time: dayMidnightUtc + h * 3600000, avg_pv: pv > 100 ? pv : null, max_pv: pv > 100 ? pv * 1.2 : null });
+        }
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 70 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 1500 }],
+            prices,
+            solar: buildSolarForecast(startMs, 36),
+            load_history: buildLoadHistory(NOW),
+            pv_history: pvHistory
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 5, 17, 3, 0)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 5, 17, 19, 30)).toISOString(),
+            solarradiation: 250,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+
+    // schedule slot .time is a formatted Berlin string "DD.MM., HH:MM".
+    const parseT = (s) => {
+        const m = String(s.time).match(/(\d{2})\.(\d{2})\.,?\s+(\d{2}):(\d{2})/);
+        return m ? { dd: +m[1], mm: +m[2], hh: +m[3] } : null;
+    };
+    const isToday = (s) => { const p = parseT(s); return p && p.dd === 17 && p.mm === 6; };
+    const isTomorrow = (s) => { const p = parseT(s); return p && p.dd === 18 && p.mm === 6; };
+
+    const futurePeak = Math.max(0, ...schedule.filter(isTomorrow).map(s => s.marketPrice));
+    const tonightFeedins = schedule.filter(s => s.state === 4 && isToday(s) && parseT(s).hh >= 18);
+    const target = schedule.find(s => isToday(s) && parseT(s).hh === 20 && Math.abs(s.marketPrice - 17) < 0.5);
+
+    console.log(`  tomorrow peak mp=${futurePeak.toFixed(1)}ct; tonight evening feed-in slots: ${tonightFeedins.length}`);
+    if (target) console.log(`  target (17ct today 20:00): ${fmtSlot(target)}`);
+    if (futurePeak < 40) { console.error(`  setup error: tomorrow peak ${futurePeak}ct not in schedule`); return false; }
+
+    // The plan must NOT feed in tonight's sub-peak energy: those slots (≤17ct)
+    // are worth far more held for tomorrow's 46ct peak that weak PV can't refill.
+    if (tonightFeedins.length === 0) {
+        console.log('  PASS: no tonight feed-in below tomorrow\'s peak (energy held)');
+        return true;
+    }
+    console.error(`  FAIL: ${tonightFeedins.length} tonight slot(s) fed in at ≤17ct despite 46ct peak tomorrow`);
+    tonightFeedins.slice(0, 5).forEach(s => console.error('   ', fmtSlot(s)));
+    return false;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -886,7 +986,8 @@ const results = [
     ['end-of-schedule reserve bad forecast', scenario6_endOfScheduleReserveBadForecast],
     ['preemptive picks morning peak', scenario7_preemptivePicksMorningPeak],
     ['preemptive post-sunrise no tomorrow', scenario8_preemptivePostSunriseNoTomorrow],
-    ['saturation cluster round-trip', scenario9_saturationClusterRoundTrip]
+    ['saturation cluster round-trip', scenario9_saturationClusterRoundTrip],
+    ['cross-day hold (sell tonight vs tomorrow peak)', scenario10_crossDayHold]
 ];
 
 let passed = 0;
