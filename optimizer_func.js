@@ -19,6 +19,11 @@ const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
 const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
 const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
+// Phase 3b-arb (arbitrage grid-charge): on exceptional-delta days, grid-charge cheap slots SPECIFICALLY to resell at a high feed-in peak before the next free PV refill. This deliberately opens the grid→feed-in path that the other phases block — guarded by a high NET hurdle so it only fires when the round-trip is genuinely profitable. Charged slots are tagged _plan='charge', so all existing charge handling (SOC sims, state=1 emit, Phase 3d feed-in budget + round-trip checks) sells the resulting surplus at the peak automatically.
+const ARB_MIN_NET_CT = 16;      // required NET profit per kWh after round-trip loss + cycle wear: peakMp*ARB_RT_EFF − chargeEff − ARB_CYCLE_WEAR_CT ≥ this
+const ARB_RT_EFF = 0.9;         // inverter+round-trip efficiency applied to sell revenue (~10% loss)
+const ARB_CYCLE_WEAR_CT = 1.5;  // battery cycle-wear cost per kWh cycled
+const ARB_CHARGE_SOC_PCT = 100; // arbitrage may fill to 100% (energy is dumped within hours; relaxes the normal 90% Phase 3c headroom cap)
 const TIMEZONE = 'Europe/Berlin';
 
 // Timezone-aware time extraction (all logic must use local Berlin time, not UTC)
@@ -767,6 +772,107 @@ for (const s of schedule) {
         s._plan = 'feedin_preemptive';
     }
 }
+
+// --- 3b-arb. Arbitrage grid-charge: charge cheap, resell at a high-delta peak ---
+// On exceptional-delta days, proactively grid-charge cheap slots to feed in
+// MORE energy at a high feed-in peak that lies BEFORE the next free PV refill.
+// The energy drained at the peak is replaced by tomorrow's free PV (the refill),
+// so the only real cost is the cheap grid charge + round-trip loss + cycle wear.
+// Gated by a high NET hurdle (ARB_MIN_NET_CT) so it stays dormant on normal days.
+// Pre-marking these as _plan='charge' (before Phase 3c) means: (a) the 3c
+// preemptive no-charge gate can't strip them (it only blocks 3c's OWN new picks),
+// and (b) Phase 3d sells the resulting surplus at the peak via its existing budget
+// + round-trip machinery (the peak mp ≫ the marginal charge cost).
+(function arbitrageGridCharge() {
+    if (schedule.length < 4) return;
+
+    // Forward bound: the next FREE PV refill (daylight slot where PV > load).
+    // Charging before it to sell before it is a clean intraday round-trip —
+    // the drained SOC is refilled by free PV, not a future grid recharge.
+    // Charging to sell PAST the refill would be a cross-day bet (left to the
+    // next cycle once that day's prices/PV firm up).
+    let arbHorizonIdx = schedule.length;
+    for (let i = 0; i < schedule.length; i++) {
+        if (isDaylight(schedule[i].time) && schedule[i].pvPower > schedule[i].loadEst) {
+            arbHorizonIdx = i;
+            break;
+        }
+    }
+    if (arbHorizonIdx < 2) return; // refill is already upon us; nothing to charge for
+
+    // Best feed-in peak within the bound (positive, above the feed-in floor).
+    // Include slots already tagged for feed-in (e.g. preemptive discharge) —
+    // those ARE where we resell; only 'charge' slots can't be the sell peak.
+    let peakIdx = -1, peakMp = -Infinity;
+    for (let i = 0; i < arbHorizonIdx; i++) {
+        const s = schedule[i];
+        if (s._plan === 'charge') continue;
+        if (s.marketPrice > FEEDIN_MIN_MP_CT && s.marketPrice > peakMp) {
+            peakMp = s.marketPrice;
+            peakIdx = i;
+        }
+    }
+    if (peakIdx < 1) return;
+
+    // Candidate charge slots: unplanned, before the peak, where grid is the real
+    // source (pv < load) and importing isn't already free/paid (eff ≥ 0; eff < 0
+    // is Phase 4 profit-charge territory). Must clear the NET round-trip hurdle
+    // against the peak: peakMp*ARB_RT_EFF − eff − wear ≥ ARB_MIN_NET_CT.
+    const cands = [];
+    for (let i = 0; i < peakIdx; i++) {
+        const s = schedule[i];
+        if (s._plan) continue;
+        if (s.pvPower >= s.loadEst) continue;
+        if (s.effectivePrice < 0) continue;
+        const net = peakMp * ARB_RT_EFF - s.effectivePrice - ARB_CYCLE_WEAR_CT;
+        if (net < ARB_MIN_NET_CT) continue;
+        cands.push({ idx: i, eff: s.effectivePrice, net, prePublish: berlinTime(s.time).hour < 13 });
+    }
+    if (cands.length === 0) return;
+    // Cheapest charge first; prefer post-13:00 (prices published) on ties.
+    cands.sort((a, b) => (a.prePublish - b.prePublish) || (a.eff - b.eff));
+
+    // Project SOC at the peak slot, capped at the arbitrage ceiling. Each kept
+    // pick must actually raise it (i.e. not be clamped away by a full battery
+    // in between) — this bounds total arbitrage charge to real battery room.
+    function projPeakSoc() {
+        let s0 = currentSoc;
+        for (let i = 0; i < peakIdx; i++) { // SOC entering the peak = deliverable energy
+            const s = schedule[i];
+            if (s._plan === 'charge') {
+                s0 += kwhToSoc(maxChargeEnergy);
+            } else if (s._plan === 'feedin_preemptive') {
+                const drainW = Math.max(0, MAX_DISCHARGE_W + s.loadEst - s.pvPower);
+                s0 -= kwhToSoc(drainW * INTERVAL_HOURS / 1000);
+            } else if (isProfitChargeSlot(s)) {
+                s0 += kwhToSoc(maxChargeEnergy);
+            } else {
+                s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+            }
+            s0 = Math.max(MIN_SOC_PCT, Math.min(ARB_CHARGE_SOC_PCT, s0));
+        }
+        return s0;
+    }
+
+    let picks = 0;
+    let before = projPeakSoc();
+    for (const c of cands) {
+        if (before >= ARB_CHARGE_SOC_PCT - 0.1) break; // battery full at the peak
+        schedule[c.idx]._plan = 'charge';
+        const after = projPeakSoc();
+        if (after > before + 0.1) {
+            picks++;
+            before = after;
+        } else {
+            schedule[c.idx]._plan = null; // clamped — didn't add deliverable energy
+        }
+    }
+
+    if (picks > 0) {
+        const cheapest = cands[0];
+        node.warn(`Phase 3b-arb: picks=${picks} peakMp=${peakMp.toFixed(1)}ct cheapestEff=${cheapest.eff.toFixed(1)}ct net=${cheapest.net.toFixed(1)}ct peakSoc→${before.toFixed(1)}% (cap ${ARB_CHARGE_SOC_PCT}%)`);
+    }
+})();
 
 // --- 3c. Plan charging: horizon-wide cheapest-slot selection ---
 // Iteratively simulate the SOC trajectory across the whole schedule.

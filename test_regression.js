@@ -976,6 +976,184 @@ function scenario10_crossDayHold() {
     return false;
 }
 
+// =========================================================
+// SCENARIO 11: Arbitrage grid-charge fires on exceptional delta.
+// Evening peak today = 60ct, cheap pre-peak slots ~5ct (eff ~18ct),
+// tomorrow sunny (free PV refill). NET = 60*0.9 - 18 - 1.5 = 34.5ct
+// >> 16ct hurdle → Phase 3b-arb must grid-charge cheap slots
+// (state=1) before the peak and feed in (state=4) at the 60ct peak.
+// =========================================================
+function scenario11_arbitrageFiresOnBigDelta() {
+    console.log('\n=== SCENARIO 11: Arbitrage charge fires on exceptional delta (60ct peak) ===');
+
+    const NOW = Date.UTC(2026, 5, 17, 17, 0); // 2026-06-17 19:00 Berlin (PV winding down)
+    const startMs = NOW;
+    const slots = 144; // 36h → reaches tomorrow's free PV refill
+
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW)) / 86400000);
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const h = berlinHour(t), day = dayOffset(t);
+        if (day === 0) { // today
+            if (h === 21) return 60;          // exceptional evening peak
+            if (h >= 19 && h < 21) return 5;  // cheap pre-peak charge window
+            if (h >= 22) return 10;
+            return 8;
+        }
+        // tomorrow: sunny → cheap midday (free PV refill), normal evening
+        if (h >= 9 && h < 15) return 2;
+        if (h >= 19 && h < 22) return 22;
+        return 9;
+    });
+
+    // Strong-sun 48h forecast so the multi-day reserve is non-binding: the
+    // energy sold at tonight's peak is refilled by tomorrow's free PV, which
+    // is exactly the round-trip the arbitrage phase relies on. (A weak/default
+    // forecast would push the reserve floor above the post-charge SOC and the
+    // peak would be held instead of sold — that path is covered elsewhere.)
+    const solarStrong = [];
+    for (let h = 0; h < 48; h++) {
+        const t = startMs + h * 3600000;
+        const hod = (new Date(t).getUTCHours() + 2) % 24;
+        solarStrong.push({ time: t, sunshineDurationInMinutes: hod >= 6 && hod <= 19 ? 60 : 0 });
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 50 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 0 }],
+            prices,
+            solar: solarStrong,
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 5, 17, 3, 0)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 5, 17, 19, 45)).toISOString(),
+            solarradiation: 0,
+            rainrate: 0
+        }
+    };
+
+    const warns = [];
+    const origWarn = node.warn;
+    node.warn = (...a) => { warns.push(a.join(' ')); };
+    let result;
+    try {
+        result = withMockedNow(NOW, () => runOptimizer(msg));
+    } finally {
+        node.warn = origWarn;
+    }
+    const schedule = getSchedule(result);
+
+    const arbWarn = warns.find(w => w.includes('Phase 3b-arb'));
+    console.log(`   arbWarn: ${arbWarn || '(none)'}`);
+
+    const parseT = (s) => {
+        const m = String(s.time).match(/(\d{2})\.(\d{2})\.,?\s+(\d{2}):(\d{2})/);
+        if (!m) return null;
+        return Date.UTC(2026, parseInt(m[2]) - 1, parseInt(m[1]), parseInt(m[3]) - 2, parseInt(m[4]));
+    };
+    const peakIdx = bDay(NOW); // today
+    const todayChargesBeforePeak = schedule.filter(s => {
+        const tt = parseT(s); if (tt === null) return false;
+        return dayOffset(tt) === 0 && berlinHour(tt) >= 19 && berlinHour(tt) < 21 && s.state === 1;
+    });
+    const peakFeedins = schedule.filter(s => {
+        const tt = parseT(s); if (tt === null) return false;
+        return dayOffset(tt) === 0 && berlinHour(tt) === 21 && s.state === 4;
+    });
+
+    console.log(`   pre-peak charge slots (state=1): ${todayChargesBeforePeak.length}`);
+    todayChargesBeforePeak.slice(0, 4).forEach(s => console.log('     ', fmtSlot(s)));
+    console.log(`   peak feed-in slots (state=4): ${peakFeedins.length}`);
+    peakFeedins.slice(0, 4).forEach(s => console.log('     ', fmtSlot(s)));
+
+    let ok = true;
+    if (!arbWarn) { console.error('   FAIL: no Phase 3b-arb warn (arbitrage did not fire)'); ok = false; }
+    if (todayChargesBeforePeak.length === 0) { console.error('   FAIL: no state=1 grid-charge slots before the peak'); ok = false; }
+    if (peakFeedins.length === 0) { console.error('   FAIL: no state=4 feed-in at the 60ct peak'); ok = false; }
+
+    if (ok) {
+        console.log(`   PASS: arbitrage charged ${todayChargesBeforePeak.length} cheap slot(s), fed in at peak`);
+        return true;
+    }
+    return false;
+}
+
+// =========================================================
+// SCENARIO 12 (negative): normal delta → NO arbitrage.
+// Peak 20ct, charge 7ct (eff 20ct). NET = 20*0.9 - 20 - 1.5
+// = -3.5ct, far below the 16ct hurdle → Phase 3b-arb must NOT
+// fire (no warn, no grid-charge purely to resell).
+// =========================================================
+function scenario12_noArbitrageOnNormalDelta() {
+    console.log('\n=== SCENARIO 12: Normal delta (20ct peak) → no arbitrage charge ===');
+
+    const NOW = Date.UTC(2026, 5, 17, 17, 0); // 2026-06-17 19:00 Berlin
+    const startMs = NOW;
+    const slots = 144;
+
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW)) / 86400000);
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const h = berlinHour(t), day = dayOffset(t);
+        if (day === 0) {
+            if (h === 21) return 20;          // ordinary evening peak
+            if (h >= 19 && h < 21) return 7;  // cheap-ish pre-peak slots
+            if (h >= 22) return 10;
+            return 8;
+        }
+        if (h >= 9 && h < 15) return 2;
+        if (h >= 19 && h < 22) return 18;
+        return 9;
+    });
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 50 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 0 }],
+            prices,
+            solar: buildSolarForecast(startMs, 36),
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 5, 17, 3, 0)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 5, 17, 19, 45)).toISOString(),
+            solarradiation: 0,
+            rainrate: 0
+        }
+    };
+
+    const warns = [];
+    const origWarn = node.warn;
+    node.warn = (...a) => { warns.push(a.join(' ')); };
+    let result;
+    try {
+        result = withMockedNow(NOW, () => runOptimizer(msg));
+    } finally {
+        node.warn = origWarn;
+    }
+    getSchedule(result);
+
+    const arbWarn = warns.find(w => w.includes('Phase 3b-arb'));
+    if (arbWarn) {
+        console.error(`   FAIL: arbitrage fired on normal delta — ${arbWarn}`);
+        return false;
+    }
+    console.log('   PASS: no arbitrage on normal delta (net spread below 16ct hurdle)');
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -987,7 +1165,9 @@ const results = [
     ['preemptive picks morning peak', scenario7_preemptivePicksMorningPeak],
     ['preemptive post-sunrise no tomorrow', scenario8_preemptivePostSunriseNoTomorrow],
     ['saturation cluster round-trip', scenario9_saturationClusterRoundTrip],
-    ['cross-day hold (sell tonight vs tomorrow peak)', scenario10_crossDayHold]
+    ['cross-day hold (sell tonight vs tomorrow peak)', scenario10_crossDayHold],
+    ['arbitrage fires on big delta', scenario11_arbitrageFiresOnBigDelta],
+    ['no arbitrage on normal delta', scenario12_noArbitrageOnNormalDelta]
 ];
 
 let passed = 0;
