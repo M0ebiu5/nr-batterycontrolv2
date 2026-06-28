@@ -61,19 +61,22 @@ function toTimeSeries(arr, field) {
 let currentSoc = lastVal(raw.soc, 'soc');
 if (currentSoc === null) currentSoc = 50; // fallback
 
-// --- BMS-aware SOC guard ---------------------------------------------------
+// --- BMS-aware SOC/charge guard --------------------------------------------
 // currentSoc now comes from the capacity-weighted BMS feed (global.bms, surfaced
 // by the "SOC from global" node) rather than the Victron aggregate, which has read
 // implausibly (e.g. 71.5% while the packs were really ~84%, then jumping +24% in
 // 12 min and grid-charging an almost-full pack). Two safety nets:
 //   1. range + physically-impossible-jump rejection      -> socTrust
-//   2. per-pack full-stop: never grid-charge if ANY single pack is near full
-//      (parallel packs of unequal size/SOH fill at different rates — the small
-//      bat_ost hits 100% long before the weighted average does).
-const PACK_FULL_PCT = 97;
+//   2. per-pack full-stop on CELL VOLTAGE: never grid-charge if ANY pack's max
+//      cell ≥ CELL_FULL_V. The packs' reported SOC% is miscalibrated (the small
+//      135Ah packs read ~99.8% at only ~3.40 V/cell — mid-plateau — while the
+//      310Ah bat_big still has real room), so cell voltage, not SOC%, is the true
+//      fullness signal for these LFP packs. Each pack's BMS keeps its own hardware
+//      overvoltage cutoff as the hard backstop.
+const CELL_FULL_V = 3.50;       // V/cell ceiling that blocks grid-charge
 const _nowMs = Date.now();
-let maxPackSoc = lastVal(raw.soc, 'maxPackSoc');
-if (typeof maxPackSoc !== 'number' || !isFinite(maxPackSoc)) maxPackSoc = null;
+let maxCellV = lastVal(raw.soc, 'maxCellV');
+if (typeof maxCellV !== 'number' || !isFinite(maxCellV)) maxCellV = null;
 
 let socTrust = true;
 if (!(typeof currentSoc === 'number' && isFinite(currentSoc) && currentSoc >= 0 && currentSoc <= 100)) {
@@ -88,9 +91,9 @@ if (socTrust && typeof _sg.soc === 'number' && typeof _sg.time === 'number') {
     if (Math.abs(currentSoc - _sg.soc) > _maxJump) socTrust = false; // implausible jump → distrust
 }
 global.set('socGuard', { soc: currentSoc, time: _nowMs });
-// Suppress grid-charge of the LIVE slot when the reading can't be trusted or any
-// pack is full. (Applied at i===0 only; future slots re-evaluate next tick.)
-const gridChargeBlocked = !socTrust || (maxPackSoc !== null && maxPackSoc >= PACK_FULL_PCT);
+// Suppress grid-charge of the LIVE slot when the reading can't be trusted or a pack
+// is at the cell-voltage ceiling. (Applied at i===0 only; future slots re-evaluate.)
+const gridChargeBlocked = !socTrust || (maxCellV !== null && maxCellV >= CELL_FULL_V);
 
 // Current AC load
 let currentLoad = lastVal(raw.acload, 'acload');
@@ -1764,7 +1767,7 @@ for (let i = 0; i < schedule.length; i++) {
             state = 3; setPoint = -AVG_LOAD_W;
             reason = !socTrust
                 ? `Skip planned charge — SOC reading untrusted, compensate`
-                : `Skip planned charge — pack ${maxPackSoc.toFixed(0)}% ≥ ${PACK_FULL_PCT}% (full), compensate`;
+                : `Skip planned charge — cell ${maxCellV.toFixed(3)}V ≥ ${CELL_FULL_V}V (full), compensate`;
         } else {
             state = 3; setPoint = -AVG_LOAD_W;
             reason = `Skip planned charge, SOC ${soc.toFixed(0)}% >= ${MAX_GRID_CHARGE_SOC_PCT}% cap (PV overfilled), compensate`;
@@ -1834,7 +1837,7 @@ for (let i = 0; i < schedule.length; i++) {
             state = 3; setPoint = -AVG_LOAD_W;
             reason = !socTrust
                 ? `Compensate — SOC reading untrusted, no grid-charge (SOC ${soc.toFixed(0)}%)`
-                : `Compensate — pack ${maxPackSoc.toFixed(0)}% full, no grid-charge (SOC ${soc.toFixed(0)}%)`;
+                : `Compensate — cell ${maxCellV.toFixed(3)}V full, no grid-charge (SOC ${soc.toFixed(0)}%)`;
         } else {
             // Not enough SOC for future load and price <= 0 — charge now
             state = 1; setPoint = MAX_CHARGE_W;
