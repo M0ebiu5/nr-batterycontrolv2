@@ -61,6 +61,37 @@ function toTimeSeries(arr, field) {
 let currentSoc = lastVal(raw.soc, 'soc');
 if (currentSoc === null) currentSoc = 50; // fallback
 
+// --- BMS-aware SOC guard ---------------------------------------------------
+// currentSoc now comes from the capacity-weighted BMS feed (global.bms, surfaced
+// by the "SOC from global" node) rather than the Victron aggregate, which has read
+// implausibly (e.g. 71.5% while the packs were really ~84%, then jumping +24% in
+// 12 min and grid-charging an almost-full pack). Two safety nets:
+//   1. range + physically-impossible-jump rejection      -> socTrust
+//   2. per-pack full-stop: never grid-charge if ANY single pack is near full
+//      (parallel packs of unequal size/SOH fill at different rates — the small
+//      bat_ost hits 100% long before the weighted average does).
+const PACK_FULL_PCT = 97;
+const _nowMs = Date.now();
+let maxPackSoc = lastVal(raw.soc, 'maxPackSoc');
+if (typeof maxPackSoc !== 'number' || !isFinite(maxPackSoc)) maxPackSoc = null;
+
+let socTrust = true;
+if (!(typeof currentSoc === 'number' && isFinite(currentSoc) && currentSoc >= 0 && currentSoc <= 100)) {
+    socTrust = false;
+    const _prev = (global.get('socGuard') || {}).soc;
+    currentSoc = (typeof _prev === 'number') ? _prev : 50;
+}
+const _sg = global.get('socGuard') || {};
+if (socTrust && typeof _sg.soc === 'number' && typeof _sg.time === 'number') {
+    const _dtH = Math.max(0.001, (_nowMs - _sg.time) / 3600000);
+    const _maxJump = (MAX_CHARGE_W / (BATTERY_CAPACITY_KWH * 1000)) * 100 * _dtH * 1.3 + 2;
+    if (Math.abs(currentSoc - _sg.soc) > _maxJump) socTrust = false; // implausible jump → distrust
+}
+global.set('socGuard', { soc: currentSoc, time: _nowMs });
+// Suppress grid-charge of the LIVE slot when the reading can't be trusted or any
+// pack is full. (Applied at i===0 only; future slots re-evaluate next tick.)
+const gridChargeBlocked = !socTrust || (maxPackSoc !== null && maxPackSoc >= PACK_FULL_PCT);
+
 // Current AC load
 let currentLoad = lastVal(raw.acload, 'acload');
 if (currentLoad === null) currentLoad = AVG_LOAD_W;
@@ -1726,9 +1757,14 @@ for (let i = 0; i < schedule.length; i++) {
         // while the planner's clamped sim assumed ~cap, so the pick would grid-charge an
         // almost-full battery at a positive price. Profit charges (ep<0, paid to import)
         // still fill.
-        if (soc < MAX_GRID_CHARGE_SOC_PCT || ep < 0) {
+        if ((soc < MAX_GRID_CHARGE_SOC_PCT || ep < 0) && !(i === 0 && gridChargeBlocked)) {
             state = 1; setPoint = MAX_CHARGE_W;
             reason = `Planned charge at ${ep.toFixed(1)}ct (cheapest available)`;
+        } else if (i === 0 && gridChargeBlocked) {
+            state = 3; setPoint = -AVG_LOAD_W;
+            reason = !socTrust
+                ? `Skip planned charge — SOC reading untrusted, compensate`
+                : `Skip planned charge — pack ${maxPackSoc.toFixed(0)}% ≥ ${PACK_FULL_PCT}% (full), compensate`;
         } else {
             state = 3; setPoint = -AVG_LOAD_W;
             reason = `Skip planned charge, SOC ${soc.toFixed(0)}% >= ${MAX_GRID_CHARGE_SOC_PCT}% cap (PV overfilled), compensate`;
@@ -1794,6 +1830,11 @@ for (let i = 0; i < schedule.length; i++) {
             // Price is positive — just compensate, don't pay to charge
             state = 3; setPoint = -AVG_LOAD_W;
             reason = `Compensate (price ${ep.toFixed(1)}ct > 0, SOC ${soc.toFixed(0)}%)`;
+        } else if (i === 0 && gridChargeBlocked) {
+            state = 3; setPoint = -AVG_LOAD_W;
+            reason = !socTrust
+                ? `Compensate — SOC reading untrusted, no grid-charge (SOC ${soc.toFixed(0)}%)`
+                : `Compensate — pack ${maxPackSoc.toFixed(0)}% full, no grid-charge (SOC ${soc.toFixed(0)}%)`;
         } else {
             // Not enough SOC for future load and price <= 0 — charge now
             state = 1; setPoint = MAX_CHARGE_W;
