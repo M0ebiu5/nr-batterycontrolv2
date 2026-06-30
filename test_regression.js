@@ -1154,6 +1154,88 @@ function scenario12_noArbitrageOnNormalDelta() {
     return true;
 }
 
+// =========================================================
+// SCENARIO 13: Sun-poor tomorrow → hold stored energy, do
+// not feed in below full. Today is sunny (surplus + a 40ct
+// evening peak that clears the round-trip hurdle vs an 8ct
+// rebuy), but tomorrow has ZERO PV. The user rule must block
+// every stored-energy feed-in: no state=4 slot may sit below
+// full (SOC<99 / cell<full), and the override must actually
+// fire (hold reason present).
+// =========================================================
+function scenario13_holdWhenTomorrowSunPoor() {
+    console.log('\n=== SCENARIO 13: Sun-poor tomorrow → hold, no feed-in below full ===');
+
+    const NOW = Date.UTC(2026, 5, 20, 7, 0); // 09:00 Berlin, June 20
+    const startMs = NOW;
+    const slots = 140; // ~35h → includes tomorrow's full daylight
+
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW)) / 86400000);
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const h = berlinHour(t), day = dayOffset(t);
+        if (day === 0) {
+            if (h >= 19 && h < 21) return 40;   // today's evening peak (clears hurdle)
+            if (h >= 10 && h < 15) return 5;    // cheap midday
+            return 12;
+        }
+        if (h >= 9 && h < 16) return 8;         // tomorrow: cheap daytime (rebuy)
+        return 14;
+    });
+
+    // Solar: today sunny (daytime 55 min), tomorrow+ ZERO → sun-poor tomorrow.
+    const solar = [];
+    for (let h = 0; h < 40; h++) {
+        const t = startMs + h * 3600000;
+        const hod = berlinHour(t), day = dayOffset(t);
+        solar.push({ time: t, sunshineDurationInMinutes: (day === 0 && hod >= 7 && hod <= 18) ? 55 : 0 });
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 90 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 3000 }],   // sunny today
+            prices,
+            solar,
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 5, 20, 2, 30)).toISOString(),  // 04:30 Berlin
+            sunSet: new Date(Date.UTC(2026, 5, 20, 15, 45)).toISOString(),  // 17:45 Berlin
+            solarradiation: 700,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+
+    // A "bad" feed-in = selling with no live PV surplus → that's stored energy.
+    // Genuine overflow (pv > load on a full battery) is still allowed.
+    const storedFeedIn = schedule.filter(s => s.state === 4 && (s.pvPower || 0) <= s.loadEst);
+    const holds = schedule.filter(s => (s.reason || '').includes('sun-poor'));
+    const peak = schedule.filter(s => s.marketPrice >= 40);
+    console.log(`  stored-energy feed-in slots: ${storedFeedIn.length}, hold-for-sun-poor slots: ${holds.length}`);
+    peak.slice(0, 3).forEach(s => console.log('   peak', fmtSlot(s)));
+
+    if (storedFeedIn.length > 0) {
+        console.error(`  FAIL: ${storedFeedIn.length} stored-energy feed-in slots on a sun-poor-tomorrow day`);
+        storedFeedIn.slice(0, 4).forEach(s => console.error('   ', fmtSlot(s)));
+        return false;
+    }
+    if (holds.length === 0) {
+        console.error('  FAIL: hold-for-sun-poor override never fired (expected it to block a feed-in)');
+        return false;
+    }
+    console.log(`  PASS: no stored-energy feed-in; override held ${holds.length} slot(s) for the sunless day`);
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -1167,7 +1249,8 @@ const results = [
     ['saturation cluster round-trip', scenario9_saturationClusterRoundTrip],
     ['cross-day hold (sell tonight vs tomorrow peak)', scenario10_crossDayHold],
     ['arbitrage fires on big delta', scenario11_arbitrageFiresOnBigDelta],
-    ['no arbitrage on normal delta', scenario12_noArbitrageOnNormalDelta]
+    ['no arbitrage on normal delta', scenario12_noArbitrageOnNormalDelta],
+    ['hold when tomorrow sun-poor', scenario13_holdWhenTomorrowSunPoor]
 ];
 
 let passed = 0;

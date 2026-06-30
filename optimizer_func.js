@@ -769,6 +769,27 @@ schedule = schedule.filter(s => s.time >= now - 900000);
 const maxChargeEnergy = MAX_CHARGE_W * INTERVAL_HOURS / 1000; // 0.875 kWh per slot
 const maxDischargeEnergy = MAX_DISCHARGE_W * INTERVAL_HOURS / 1000;
 
+// --- Detect a sun-poor next day (user rule: hold stored energy, don't feed in) ---
+// On a day whose NEXT daylight period brings little/no usable solar, the battery
+// can't refill from PV — so selling stored energy today only to grid-charge it back
+// tomorrow is a loss. Rule: when tomorrow is sun-poor, do NOT feed in unless the
+// battery is already full; sell only PV overflow that physically can't be stored.
+const DARK_DAY_SURPLUS_KWH = 5;   // tomorrow PV-minus-load below this ⇒ "no sun tomorrow"
+let tomorrowSunPoor = false;
+(function computeTomorrowSunPoor() {
+    if (schedule.length < 8) return;
+    let i = 0;
+    while (i < schedule.length && isDaylight(schedule[i].time)) i++;   // skip today's remaining daylight
+    while (i < schedule.length && !isDaylight(schedule[i].time)) i++;  // skip the coming night
+    let surplusKwh = 0, count = 0;
+    for (; i < schedule.length && isDaylight(schedule[i].time); i++) {
+        surplusKwh += Math.max(0, (schedule[i].pvPower || 0) - schedule[i].loadEst) * INTERVAL_HOURS / 1000;
+        count++;
+    }
+    if (count < 8) return;   // not enough of tomorrow's daylight in the horizon to judge
+    tomorrowSunPoor = surplusKwh < DARK_DAY_SURPLUS_KWH;
+})();
+
 // ================================================================
 // PHASE 2: Simulate SOC with PV + load only (no grid interaction)
 // Identify where deficits and surpluses occur
@@ -1843,6 +1864,20 @@ for (let i = 0; i < schedule.length; i++) {
             state = 1; setPoint = MAX_CHARGE_W;
             reason = `Charge at ${ep.toFixed(1)}ct, SOC ${soc.toFixed(0)}% < ${socNeeded.toFixed(0)}% needed`;
         }
+    }
+
+    // --- Hold-for-sun-poor-tomorrow override (user rule) ---------------------
+    // On a sun-poor-tomorrow day, never feed STORED energy to the grid. Feed-in is
+    // allowed ONLY as genuine overflow: there is live PV surplus (pv > load) AND the
+    // battery is already full (SOC >= 99 or cell at the ceiling) — i.e. PV that
+    // physically can't be stored. Everything else (selling at the evening peak, or
+    // dumping surplus while the battery still has room) is converted to compensate,
+    // so the surplus tops the battery toward 100% and stored energy is held.
+    const _pvOverflow = (pvW - loadW) > 0
+        && (soc >= 99 || (maxCellV !== null && maxCellV >= CELL_FULL_V));
+    if (state === 4 && tomorrowSunPoor && !_pvOverflow) {
+        state = 3; setPoint = -AVG_LOAD_W;
+        reason = `Hold for sun-poor tomorrow — no feed-in below full (was sell @${mp.toFixed(1)}ct, SOC ${soc.toFixed(0)}%)`;
     }
 
     // === Update SOC prediction ===
