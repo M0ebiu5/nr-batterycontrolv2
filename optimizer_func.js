@@ -12,6 +12,7 @@ const MAX_CHARGE_W = 3500;
 const MAX_DISCHARGE_W = 3500;
 const AVG_LOAD_W = 700;
 const MIN_SOC_PCT = 5;
+const CHARGE_EFFICIENCY = 0.94; // one-way charge efficiency for the predictedSoc projection only. Energy sent to the pack (grid charge or PV surplus) lands as SOC at ~94% (inverter AC→DC conversion + minor coulombic loss). Empirically calibrated 2026-07-04: predicted SOC ran ~+3–4% above true capacity-weighted BMS SOC during steep daytime charging (morning gain +45.4 predicted vs +42.5 true BMS → 0.936 ratio); overnight discharge already matched within 0.1%, so the factor is applied to charging deltas only. Planning sims are left at 100% (unchanged) — this only tightens the reported projection.
 const INTERVAL_HOURS = 0.25; // 15 minutes
 const PV_PEAK_W = 5000;
 const BASE_GRID_FEE = 13; // ct/kWh
@@ -1885,11 +1886,14 @@ for (let i = 0; i < schedule.length; i++) {
 
     if (state === 1) {
         // Battery absorbs at most MAX_CHARGE_W total (grid + PV combined).
-        socDelta += kwhToSoc(maxChargeEnergy);
+        // Charging energy lands as SOC at CHARGE_EFFICIENCY (see constant).
+        socDelta += kwhToSoc(maxChargeEnergy * CHARGE_EFFICIENCY);
     } else if (state === 3) {
-        // Compensate: PV covers load first, surplus charges battery, deficit drains battery
+        // Compensate: PV covers load first, surplus charges battery, deficit drains battery.
+        // Surplus (charge) is de-rated by CHARGE_EFFICIENCY; deficit (discharge) is not.
         const netPvW = pvW - loadW;
-        socDelta += kwhToSoc(netPvW * INTERVAL_HOURS / 1000);
+        const eff = netPvW > 0 ? CHARGE_EFFICIENCY : 1;
+        socDelta += kwhToSoc(netPvW * INTERVAL_HOURS / 1000 * eff);
     } else if (state === 4) {
         // Max discharge: battery feeds grid at max rate + covers load, PV offsets some
         const drainW = MAX_DISCHARGE_W + loadW - pvW;
@@ -1904,7 +1908,7 @@ for (let i = 0; i < schedule.length; i++) {
         && !(targetSocForSunrise !== null && pvW < loadW)) {
         state = 1; setPoint = MAX_CHARGE_W;
         reason = `SOC safety override - must charge`;
-        soc = MIN_SOC_PCT + kwhToSoc(maxChargeEnergy);
+        soc = MIN_SOC_PCT + kwhToSoc(maxChargeEnergy * CHARGE_EFFICIENCY);
     }
 
     slot.state = state;
