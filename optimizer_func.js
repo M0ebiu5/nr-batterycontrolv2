@@ -1262,16 +1262,33 @@ let replacementPrice = Infinity;
     // ~1500 W actual), which inflated the budget enough for the mp-DESC pass to
     // spend past the 18.50ct peak all the way down to 15.81ct — and emptied the
     // pack before that 18.50ct slot arrived. Clamp each quantity to its rolling
-    // minimum over the last OVERFLOW_DAMP_RUNS runs: decreases still apply
+    // minimum over the last OVERFLOW_DAMP_SLOTS slots: decreases still apply
     // immediately, increases must persist ~1h before they can unlock feed-in.
-    const OVERFLOW_DAMP_RUNS = 4;
+    // History is bucketed by 15-min SLOT, not by run: the optimizer is normally
+    // driven by cron-plus on the slot boundary, but an off-slot re-trigger (an
+    // editor inject fired one at 09:31:21 on 2026-07-28) would otherwise consume
+    // a history entry and shrink the window in wall-clock terms. Re-runs within
+    // the same slot replace that slot's entry instead of pushing a new one, so
+    // the window stays time-based regardless of trigger frequency.
+    const OVERFLOW_DAMP_SLOTS = 4;
     const OVERFLOW_DAMP_MAX_AGE_MS = 90 * 60 * 1000;
     const _ovfHist = global.get('overflowHist') || {};
     const dampOverflow = (key, value) => {
         if (!(typeof value === 'number' && isFinite(value))) return value;
-        const hist = (_ovfHist[key] || []).filter(e => (_nowMs - e.t) <= OVERFLOW_DAMP_MAX_AGE_MS);
-        hist.push({ t: _nowMs, v: value });
-        while (hist.length > OVERFLOW_DAMP_RUNS) hist.shift();
+        const slot = Math.floor(_nowMs / (15 * 60 * 1000));
+        // A re-run within the same slot keeps that slot's MINIMUM rather than
+        // overwriting it — otherwise a re-trigger reporting a higher value would
+        // discard the damping for the slot it lands in.
+        const prev = (_ovfHist[key] || []).find(e => e.slot === slot);
+        const slotVal = (prev && typeof prev.v === 'number' && isFinite(prev.v))
+            ? Math.min(prev.v, value) : value;
+        // Entries written before slot-bucketing have no .slot and never match a
+        // numeric slot, so they simply age out of the window.
+        const hist = (_ovfHist[key] || [])
+            .filter(e => (_nowMs - e.t) <= OVERFLOW_DAMP_MAX_AGE_MS && e.slot !== slot);
+        hist.push({ t: _nowMs, slot, v: slotVal });
+        hist.sort((a, b) => a.t - b.t);
+        while (hist.length > OVERFLOW_DAMP_SLOTS) hist.shift();
         _ovfHist[key] = hist;
         global.set('overflowHist', _ovfHist);
         return Math.min(...hist.map(e => e.v));
