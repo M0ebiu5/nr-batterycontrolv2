@@ -20,6 +20,7 @@ const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
 const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
 const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
+const CROSSDAY_HOLD_MAX_AGE_MS = 12 * 3600 * 1000; // how long a cross-day hold floor may be carried once horizonIsRefill flips false (see the carry branch in Phase 3d). Bounded so a floor computed from a stale horizon can't suppress feed-in indefinitely; the peak it was derived from must also still lie in the future.
 // Phase 3b-arb (arbitrage grid-charge): on exceptional-delta days, grid-charge cheap slots SPECIFICALLY to resell at a high feed-in peak before the next free PV refill. This deliberately opens the grid→feed-in path that the other phases block — guarded by a high NET hurdle so it only fires when the round-trip is genuinely profitable. Charged slots are tagged _plan='charge', so all existing charge handling (SOC sims, state=1 emit, Phase 3d feed-in budget + round-trip checks) sells the resulting surplus at the peak automatically.
 const ARB_MIN_NET_CT = 16;      // required NET profit per kWh after round-trip loss + cycle wear: peakMp*ARB_RT_EFF − chargeEff − ARB_CYCLE_WEAR_CT ≥ this
 const ARB_RT_EFF = 0.9;         // inverter+round-trip efficiency applied to sell revenue (~10% loss)
@@ -106,6 +107,35 @@ let currentPower = lastVal(raw.power, 'power');
 // Current actual PV power from inverter
 let currentPvPower = lastVal(raw.pv_now, 'pv_now');
 if (currentPvPower === null) currentPvPower = 0;
+
+// --- Feed-in delivery guard -------------------------------------------------
+// The BMS SOC the optimizer trusts can read well above what the packs will
+// actually deliver (2026-07-28: BMS 21.1% vs Victron 6.5%, and a -5000 W feed-in
+// command produced -526 W of battery power). A commanded feed-in that
+// under-delivers is the only reliable signal that the stated SOC isn't real, so
+// treat it the way socTrust already gates grid-charge: block feed-in on the LIVE
+// slot until the block ages out or SOC recovers materially.
+const FEEDIN_DELIVER_MIN_FRAC = 0.4;      // delivered/commanded below this = under-delivery
+const FEEDIN_BLOCK_MS = 60 * 60 * 1000;   // hold the block this long...
+const FEEDIN_BLOCK_SOC_RECOVER = 5;       // ...or until SOC climbs this many points
+let feedinGuard = global.get('feedinGuard') || {};
+const _prevExpectW = (typeof feedinGuard.expectW === 'number') ? feedinGuard.expectW : 0;
+if (_prevExpectW > 0 && typeof feedinGuard.commandedAt === 'number'
+    && (_nowMs - feedinGuard.commandedAt) < 20 * 60 * 1000
+    && typeof currentPower === 'number' && isFinite(currentPower)) {
+    // ess `power` is battery power: positive = charging, negative = discharging.
+    const deliveredW = Math.max(0, -currentPower);
+    if (deliveredW < _prevExpectW * FEEDIN_DELIVER_MIN_FRAC) {
+        feedinGuard = { blockedAt: _nowMs, blockedSoc: currentSoc };
+        node.warn(`Feed-in under-delivery: ${Math.round(deliveredW)}W of ${Math.round(_prevExpectW)}W commanded → blocking feed-in (SOC ${currentSoc.toFixed(0)}%)`);
+    } else {
+        feedinGuard = {}; // delivered as commanded → clear any stale block
+    }
+    global.set('feedinGuard', feedinGuard);
+}
+const feedinDeliveryBlocked = typeof feedinGuard.blockedAt === 'number'
+    && (_nowMs - feedinGuard.blockedAt) < FEEDIN_BLOCK_MS
+    && currentSoc < (feedinGuard.blockedSoc || 0) + FEEDIN_BLOCK_SOC_RECOVER;
 
 // Price forecast
 const prices = toTimeSeries(raw.prices, 'marketprice');
@@ -767,6 +797,12 @@ let targetSocForSunrise = null;
 // Remove past slots, only keep current and future
 schedule = schedule.filter(s => s.time >= now - 900000);
 
+if (schedule.length === 0) {
+    node.warn('No current/future price slots (price data is stale — all slots in the past)');
+    msg.payload = { error: 'No current/future price data available' };
+    return msg;
+}
+
 const maxChargeEnergy = MAX_CHARGE_W * INTERVAL_HOURS / 1000; // 0.875 kWh per slot
 const maxDischargeEnergy = MAX_DISCHARGE_W * INTERVAL_HOURS / 1000;
 
@@ -1219,6 +1255,30 @@ let replacementPrice = Infinity;
             }
         }
     }
+    // --- PV-overflow damping (single-spike guard) ---------------------------
+    // Every "overflow" quantity below is derived from the PV forecast, and the
+    // feed-in budget is derived from those. On 2026-07-28 the forecast spiked
+    // (surplus 14.5 → 19.1 → 29.0 kWh in 45 min; midday forecast 5000 W against
+    // ~1500 W actual), which inflated the budget enough for the mp-DESC pass to
+    // spend past the 18.50ct peak all the way down to 15.81ct — and emptied the
+    // pack before that 18.50ct slot arrived. Clamp each quantity to its rolling
+    // minimum over the last OVERFLOW_DAMP_RUNS runs: decreases still apply
+    // immediately, increases must persist ~1h before they can unlock feed-in.
+    const OVERFLOW_DAMP_RUNS = 4;
+    const OVERFLOW_DAMP_MAX_AGE_MS = 90 * 60 * 1000;
+    const _ovfHist = global.get('overflowHist') || {};
+    const dampOverflow = (key, value) => {
+        if (!(typeof value === 'number' && isFinite(value))) return value;
+        const hist = (_ovfHist[key] || []).filter(e => (_nowMs - e.t) <= OVERFLOW_DAMP_MAX_AGE_MS);
+        hist.push({ t: _nowMs, v: value });
+        while (hist.length > OVERFLOW_DAMP_RUNS) hist.shift();
+        _ovfHist[key] = hist;
+        global.set('overflowHist', _ovfHist);
+        return Math.min(...hist.map(e => e.v));
+    };
+    overflowSoc = dampOverflow('overflowSoc', overflowSoc);
+    postHorizonOverflow = dampOverflow('postHorizonOverflow', postHorizonOverflow);
+
     let feedinBudgetSoc;
     if (horizonIsRefill && !freeRefillAhead) {
         feedinBudgetSoc = overflowSoc + postHorizonOverflow;
@@ -1305,6 +1365,7 @@ let replacementPrice = Infinity;
             if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
         }
     }
+    pvOnlyOverflow = dampOverflow('pvOnlyOverflow', pvOnlyOverflow);
     // pvOnlyOverflow > 0 was too loose: 0.6% of phantom overflow (~0.18 kWh) on a
     // bad-PV day (74 sun-min) was enough to trigger pvOpportunityPrice (~11 ct) as
     // replacement, letting a 22.39 ct evening feed-in pass against a 14ct real grid
@@ -1339,6 +1400,7 @@ let replacementPrice = Infinity;
             if (walkSoc < MIN_SOC_PCT) walkSoc = MIN_SOC_PCT;
         }
     }
+    postSchedPvOverflow = dampOverflow('postSchedPvOverflow', postSchedPvOverflow);
     const postSchedPvWillCurtail = postSchedPvOverflow >= PV_CURTAIL_MIN_SOC;
 
     // Position guard: post-schedule PV only refills energy we feed-in AFTER
@@ -1404,17 +1466,34 @@ let replacementPrice = Infinity;
     // still sold tonight (see the exemption in the loop): that energy would be
     // lost to curtailment if held, so selling it at any price beats wasting it.
     let futurePeakHoldPrice = -Infinity;
+    let futurePeakMp = -Infinity;
+    let futurePeakTime = null;
     if (horizonIsRefill) {
-        let futurePeakMp = -Infinity;
         for (let i = horizonIdx; i < schedule.length; i++) {
             const s = schedule[i];
             // Only stored-energy slots (pv<load): a high price during a PV
             // surplus is served by PV, not the battery — no reason to hold for it.
-            if (s.pvPower < s.loadEst && s.marketPrice > futurePeakMp) futurePeakMp = s.marketPrice;
+            if (s.pvPower < s.loadEst && s.marketPrice > futurePeakMp) {
+                futurePeakMp = s.marketPrice;
+                futurePeakTime = s.time;
+            }
         }
-        if (isFinite(futurePeakMp)) {
-            futurePeakHoldPrice = futurePeakMp - CROSSDAY_HOLD_SLACK_CT;
-            node.warn(`Cross-day hold: future peak ${futurePeakMp.toFixed(1)}ct beyond horizon → hold tonight stored-energy feed-in below ${futurePeakHoldPrice.toFixed(1)}ct (curtailment-bound ${pvOnlyOverflow.toFixed(1)}% still sells)`);
+    }
+    if (isFinite(futurePeakMp)) {
+        futurePeakHoldPrice = futurePeakMp - CROSSDAY_HOLD_SLACK_CT;
+        global.set('crossDayHold', { mp: futurePeakMp, peakTime: futurePeakTime, time: _nowMs });
+        node.warn(`Cross-day hold: future peak ${futurePeakMp.toFixed(1)}ct beyond horizon → hold tonight stored-energy feed-in below ${futurePeakHoldPrice.toFixed(1)}ct (curtailment-bound ${pvOnlyOverflow.toFixed(1)}% still sells)`);
+    } else {
+        // horizonIsRefill flips false once the refill point passes (2026-07-28
+        // ~06:00), which silently dropped the 20.9ct floor that had protected the
+        // stored energy all night and let the morning sell at 15.8–16.8ct. Carry
+        // the last floor while the peak it came from is still ahead of us; the
+        // next run with a real refill horizon recomputes it from scratch.
+        const _cdh = global.get('crossDayHold');
+        if (_cdh && typeof _cdh.mp === 'number' && typeof _cdh.peakTime === 'number'
+            && _cdh.peakTime > now && (_nowMs - _cdh.time) <= CROSSDAY_HOLD_MAX_AGE_MS) {
+            futurePeakHoldPrice = _cdh.mp - CROSSDAY_HOLD_SLACK_CT;
+            node.warn(`Cross-day hold (carried): peak ${_cdh.mp.toFixed(1)}ct still ahead → hold stored-energy feed-in below ${futurePeakHoldPrice.toFixed(1)}ct (curtailment-bound ${pvOnlyOverflow.toFixed(1)}% still sells)`);
         }
     }
 
@@ -1881,6 +1960,15 @@ for (let i = 0; i < schedule.length; i++) {
         reason = `Hold for sun-poor tomorrow — no feed-in below full (was sell @${mp.toFixed(1)}ct, SOC ${soc.toFixed(0)}%)`;
     }
 
+    // --- Feed-in delivery guard ---------------------------------------------
+    // A previous feed-in command the pack couldn't follow means the trusted (BMS)
+    // SOC overstates deliverable energy. Applied at i===0 only; future slots
+    // re-evaluate once SOC recovers or the block ages out.
+    if (i === 0 && state === 4 && feedinDeliveryBlocked) {
+        state = 3; setPoint = -AVG_LOAD_W;
+        reason = `Feed-in blocked: last command under-delivered (SOC ${soc.toFixed(0)}% not deliverable)`;
+    }
+
     // === Update SOC prediction ===
     let socDelta = 0;
 
@@ -1964,6 +2052,15 @@ const msg3 = {
         slots: output
     }
 };
+
+// Record what we just commanded so the next run can check whether the pack
+// actually delivered it (see the feed-in delivery guard near the top).
+if (currentSlot && currentSlot.state === 4) {
+    global.set('feedinGuard', {
+        commandedAt: Date.now(),
+        expectW: Math.max(0, MAX_DISCHARGE_W + (currentSlot.loadEst || 0) - (currentSlot.pvPower || 0))
+    });
+}
 
 // Persist current schedule into global.pp.prediction (file store) so other
 // flows/nodes can read the optimizer's output without subscribing to msgs.
