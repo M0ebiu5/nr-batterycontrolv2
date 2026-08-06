@@ -10,8 +10,11 @@ const path = require('path');
 const SRC = fs.readFileSync(path.join(__dirname, 'optimizer_func.js'), 'utf8');
 
 // --- Mock node-red node interface ---
+// warnLog collects every node.warn line so scenarios can assert on the
+// diagnostics the optimizer emits (not just on the resulting schedule).
+const warnLog = [];
 const node = {
-    warn: (...a) => { if (process.env.OPT_DEBUG) console.log('  [node.warn]', ...a); },
+    warn: (...a) => { warnLog.push(a.map(String).join(' ')); if (process.env.OPT_DEBUG) console.log('  [node.warn]', ...a); },
     error: (...a) => console.error('  [node.error]', ...a),
     log: () => {},
     status: () => {}
@@ -29,6 +32,7 @@ function withMockedNow(ms, fn) {
 function runOptimizer(msg) {
     // The function-node body uses `msg` and `node`, returns `msg` (or array).
     // We wrap as IIFE-style function.
+    warnLog.length = 0;
     const fn = new Function('msg', 'node', 'flow', 'global', SRC);
     const flow = { get: () => null, set: () => {} };
     const global = {
@@ -1236,6 +1240,112 @@ function scenario13_holdWhenTomorrowSunPoor() {
     return true;
 }
 
+// =========================================================
+// SCENARIO 14: User report (2026-08-06) — SOC nearly full in
+// the morning at a good price, strong PV ahead. The projection
+// saturates around midday, so the surplus that arrives after
+// saturation gets dumped by Phase 4's runtime "battery full"
+// branch at whatever the midday price happens to be (~9ct).
+// Phase 3d used to spend the whole overflow budget purely by
+// price, so the evening peak (25ct) outbid the morning and the
+// morning slots were left idle — the same kWh then left the
+// house hours later at the cheap midday price.
+// The pre-saturation pass must claim the morning slots: draining
+// before saturation creates headroom the PV refills for free.
+// =========================================================
+function scenario14_preSaturationMorningFeedIn() {
+    console.log('\n=== SCENARIO 14: Pre-saturation morning feed-in (headroom before curtailment) ===');
+
+    // NOW = 2026-08-06 08:00 Berlin (UTC 06:00). Today-only prices, as is
+    // reality before ~13:00 when tomorrow's prices publish.
+    const NOW = Date.UTC(2026, 7, 6, 6, 0);
+    const startMs = NOW;
+    const slots = 64; // 08:00 → 23:45 today
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
+        if (hour < 10) return 18;      // good morning window (pre-saturation)
+        if (hour < 19) return 9;       // cheap through the whole PV day — the
+                                       // price the runtime dump would fetch
+        return 25;                     // post-sunset peak: outbids the morning
+                                       // under a purely price-ranked pass
+    });
+
+    // Strong sun today AND tomorrow: today's PV saturates the battery around
+    // midday, tomorrow's keeps the cross-day/sun-poor holds out of the way.
+    const solar = [];
+    for (let h = 0; h < 40; h++) {
+        const t = startMs + h * 3600000;
+        const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
+        solar.push({ time: t, sunshineDurationInMinutes: hour >= 7 && hour <= 19 ? 20 : 0 });
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 90 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 1500 }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 7, 6, 3, 30)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 7, 6, 18, 45)).toISOString(),
+            solarradiation: 600,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+    const presatWarn = warnLog.find(w => w.includes('Phase 3d pre-saturation'));
+
+    const isToday = s => typeof s.time === 'string' && s.time.includes('06.08.');
+    const hourOf = s => parseInt(String(s.time).slice(-5, -3), 10);
+    const morning = schedule.filter(s => isToday(s) && hourOf(s) < 10);
+    const maxSoc = Math.max(...schedule.map(s => s.predictedSoc));
+
+    for (const s of morning) console.log(`  ${fmtSlot(s)}`);
+    if (presatWarn) console.log(`  [warn] ${presatWarn}`);
+
+    // Sanity: the day must still be PV-rich enough to fill the battery. (We
+    // can't assert on ≥99% slots in the *planned* schedule — a working
+    // pre-saturation pass drains exactly enough to keep SOC under the
+    // curtailment line, which is the whole point.)
+    if (maxSoc < 95) {
+        console.error(`  setup drift: peak projected SOC only ${maxSoc.toFixed(1)}% — PV assumptions changed, no saturation to relieve`);
+        return false;
+    }
+
+    const morningFeedIn = morning.filter(s => s.state === 4);
+    const socStart = morning[0].predictedSoc;
+    const socEnd = morning[morning.length - 1].predictedSoc;
+
+    // Before the fix the greedy pass spent the budget on the 25ct evening and
+    // left the morning mostly idle: SOC climbed 90.9% -> 93.8% and only the
+    // reactive "battery full" branch sold anything.
+    if (morningFeedIn.length < morning.length - 2) {
+        console.error(`  FAIL: only ${morningFeedIn.length}/${morning.length} morning slots feed in at 18ct; ` +
+            `the rest of the overflow will dump at the 9ct midday price`);
+        return false;
+    }
+    if (socEnd >= socStart) {
+        console.error(`  FAIL: morning SOC rose ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}% — ` +
+            `no headroom created ahead of saturation`);
+        return false;
+    }
+    if (!presatWarn) {
+        console.error('  FAIL: morning feed-in did not come from the pre-saturation pass');
+        return false;
+    }
+    console.log(`  PASS: pre-saturation pass claimed ${morningFeedIn.length}/${morning.length} morning slots at 18ct; ` +
+        `SOC drawn ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}% ahead of saturation (peak ${maxSoc.toFixed(1)}%)`);
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -1250,7 +1360,8 @@ const results = [
     ['cross-day hold (sell tonight vs tomorrow peak)', scenario10_crossDayHold],
     ['arbitrage fires on big delta', scenario11_arbitrageFiresOnBigDelta],
     ['no arbitrage on normal delta', scenario12_noArbitrageOnNormalDelta],
-    ['hold when tomorrow sun-poor', scenario13_holdWhenTomorrowSunPoor]
+    ['hold when tomorrow sun-poor', scenario13_holdWhenTomorrowSunPoor],
+    ['pre-saturation morning feed-in', scenario14_preSaturationMorningFeedIn]
 ];
 
 let passed = 0;

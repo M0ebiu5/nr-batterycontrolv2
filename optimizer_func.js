@@ -18,6 +18,7 @@ const PV_PEAK_W = 5000;
 const BASE_GRID_FEE = 13; // ct/kWh
 const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear + inverter losses exceed sub-ct revenue)
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
+const PRESAT_MIN_GAIN_CT = 3; // Phase 3d pass 1: a pre-saturation drain must beat the price the same energy would fetch when Phase 4's runtime branch dumps it during saturation. Guards the pre-drain against becoming a low-price midday sale (see the "never pre-drain at low midday prices to make room for PV" rule): the hurdle is the realistic alternative price, not zero. 3 ct ≈ the observed 10–15 ct dump band vs 17–20 ct pre-saturation prices, so it fires on genuine spreads and stays quiet on near-ties.
 const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
 const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
 const CROSSDAY_HOLD_MAX_AGE_MS = 12 * 3600 * 1000; // how long a cross-day hold floor may be carried once horizonIsRefill flips false (see the carry branch in Phase 3d). Bounded so a floor computed from a stale horizon can't suppress feed-in indefinitely; the peak it was derived from must also still lie in the future.
@@ -1164,6 +1165,14 @@ let horizonIdx = schedule.length;
 // replaced at a higher cost).
 let replacementPrice = Infinity;
 
+// First schedule index at which the no-feed-in projection saturates (SOC would
+// exceed the runtime curtailment trigger). Hoisted so the Phase 3d budget loop
+// can tell PRE-saturation slots (draining there creates headroom that PV then
+// refills — real curtailment relief) from POST-saturation ones (draining there
+// sells stored energy but does nothing to stop the earlier curtailment).
+// -1 = no saturation projected.
+let satStartIdx = -1;
+
 // Project SOC to the horizon WITHOUT any feed-in plans. Track overflow
 // (curtailed PV above 100%) separately so the "battery will actually be
 // full" case still contributes a feed-in budget.
@@ -1188,6 +1197,7 @@ let replacementPrice = Infinity;
         // firing — using cap=100 here under-budgets by ~1% and leaves a stray
         // curtailment slot at the edge.
         if (projSoc > 99) {
+            if (satStartIdx < 0) satStartIdx = i;
             overflowSoc += projSoc - 99;
             projSoc = 99;
         }
@@ -1515,10 +1525,27 @@ let replacementPrice = Infinity;
     }
 
     let usedBudget = 0;
-    for (const { s, idx } of candidates) {
+
+    // Price the runtime would achieve if we plan nothing and let Phase 4's
+    // "battery full" branch dump into whatever slot happens to be current:
+    // the mean marketPrice across the projected saturation run (consecutive
+    // PV-surplus slots from satStartIdx). This is the price a pre-saturation
+    // drain has to beat.
+    let satDumpPrice = Infinity;
+    if (satStartIdx >= 0) {
+        const satRun = [];
+        for (let i = satStartIdx; i < horizonIdx; i++) {
+            const s = schedule[i];
+            if (s.pvPower <= s.loadEst) break;
+            if (typeof s.marketPrice === 'number') satRun.push(s.marketPrice);
+        }
+        if (satRun.length) satDumpPrice = satRun.reduce((a, b) => a + b, 0) / satRun.length;
+    }
+
+    const planSlot = (s, idx, budgetCap) => {
         const relief = feedinReliefSoc(s);
-        if (relief <= 0) continue;
-        if (usedBudget >= feedinBudgetSoc) break;
+        if (relief <= 0) return false;
+        if (usedBudget >= budgetCap) return 'full';
         const isLate = idx > lastPlannedChargeIdx;
         const slotReplacementPrice = isLate ? replacementPriceLate : replacementPriceEarly;
         const slotEligibleOverflow = isLate ? eligibleOverflowLate : pvOnlyOverflow;
@@ -1540,10 +1567,50 @@ let replacementPrice = Infinity;
         // budget (post-schedule overflow is speculative and days past the peak).
         const genuineOverflowExempt = (usedBudget + relief <= pvOnlyOverflow)
             && (isLate || s.pvPower > s.loadEst);
-        if (!genuineOverflowExempt && s.marketPrice < futurePeakHoldPrice) continue;
-        if (!isOverflowOnly && (blindToTomorrow || s.marketPrice <= slotReplacementPrice + FEEDIN_ROUNDTRIP_MARGIN_CT)) continue;
+        if (!genuineOverflowExempt && s.marketPrice < futurePeakHoldPrice) return false;
+        if (!isOverflowOnly && (blindToTomorrow || s.marketPrice <= slotReplacementPrice + FEEDIN_ROUNDTRIP_MARGIN_CT)) return false;
         s._plan = 'feedin_surplus';
         usedBudget += relief;
+        return true;
+    };
+
+    // --- Pass 1: pre-saturation headroom ------------------------------------
+    // The mp-DESC pass below spends the overflow budget on the highest-priced
+    // slots in the horizon regardless of WHEN they fall. On a strong-PV day the
+    // evening peak outbids every daytime slot, so the whole budget lands after
+    // the battery has already sat at 100% for hours — and the PV that overflowed
+    // in between was either curtailed outright or dumped by Phase 4's runtime
+    // branch at whatever the midday price happened to be (10–15 ct in the
+    // 2026-07-07..08-05 sample, against 17–20 ct pre-saturation prices on the
+    // same days). Selling at 20:00 cannot relieve a 14:00 curtailment: only a
+    // drain BEFORE saturation creates headroom that the PV then refills.
+    //
+    // So reserve the in-horizon overflow for pre-saturation slots first, ranked
+    // by price among those. Gated on beating the projected dump price by
+    // PRESAT_MIN_GAIN_CT so this can never degrade into the low-price midday
+    // pre-drain that trades evening-peak SOC for cheap daytime revenue — the
+    // hurdle is the price the energy would otherwise fetch, not zero.
+    if (satStartIdx >= 0 && isFinite(satDumpPrice)) {
+        const presatCap = Math.min(feedinBudgetSoc, Math.max(0, overflowSoc));
+        const presat = candidates.filter(({ idx, s }) =>
+            idx < satStartIdx && s.marketPrice >= satDumpPrice + PRESAT_MIN_GAIN_CT);
+        let picked = 0;
+        for (const { s, idx } of presat) {
+            const r = planSlot(s, idx, presatCap);
+            if (r === 'full') break;
+            if (r) picked++;
+        }
+        if (picked > 0) {
+            node.warn(`Phase 3d pre-saturation: ${picked} slot(s) before idx=${satStartIdx} `
+                + `(dump would fetch ${satDumpPrice.toFixed(1)}ct, hurdle ${(satDumpPrice + PRESAT_MIN_GAIN_CT).toFixed(1)}ct, `
+                + `cap ${presatCap.toFixed(1)}%)`);
+        }
+    }
+
+    // --- Pass 2: original global mp-DESC allocation --------------------------
+    for (const { s, idx } of candidates) {
+        if (s._plan) continue;
+        if (planSlot(s, idx, feedinBudgetSoc) === 'full') break;
     }
     // Rationale for `break` (not `continue`): candidates are sorted by
     // marketPrice DESC. If the current slot doesn't fit, falling through to
