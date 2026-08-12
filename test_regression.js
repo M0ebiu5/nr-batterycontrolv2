@@ -29,18 +29,23 @@ function withMockedNow(ms, fn) {
 }
 
 // --- Wrap optimizer body so we can call it as a function ---
-function runOptimizer(msg) {
+// `globalStore` seeds global context and captures writes, so scenarios can assert
+// on state the optimizer carries between runs (e.g. `feedinGuard`). Omit it and
+// global reads return null, as before.
+function runOptimizer(msg, globalStore) {
     // The function-node body uses `msg` and `node`, returns `msg` (or array).
     // We wrap as IIFE-style function.
     warnLog.length = 0;
+    const store = globalStore || {};
     const fn = new Function('msg', 'node', 'flow', 'global', SRC);
     const flow = { get: () => null, set: () => {} };
     const global = {
         get: (key) => {
+            if (key in store) return store[key];
             if (key === 'weather7days') return { sun7: [{ value: 0.5 }] };
             return null;
         },
-        set: () => {}
+        set: (key, value) => { store[key] = value; }
     };
     return fn(msg, node, flow, global);
 }
@@ -1346,6 +1351,68 @@ function scenario14_preSaturationMorningFeedIn() {
     return true;
 }
 
+function scenario15_feedinGuardIgnoresStaleSample() {
+    console.log('\n=== SCENARIO 15: Feed-in guard must not judge a command by a pre-command sample ===');
+    // 2026-08-11: the guard blocked feed-in five times in one evening, each block
+    // costing the best-priced slot of the following hour (19:45 @ 25.42 ct, the
+    // day's peak, among them). Every "delivered" figure it logged came from an
+    // ess.Power row recorded BEFORE the command it was judging — 659 W was the
+    // 19:54:38 sample, judging the 20:00 feed-in. Power is logged irregularly
+    // (18-30 min gaps), so LAST(Power) is routinely a pre-command idle reading.
+    const NOW = Date.UTC(2026, 7, 11, 18, 15);        // 20:15 Berlin, the run that blocked
+    const commandedAt = NOW - 15 * 60 * 1000;          // the 20:00 feed-in command
+    const startMs = NOW - 6 * 3600 * 1000;
+
+    // sampleOffsetMin is measured from commandedAt: negative = sample predates the command.
+    function guardBlocks(sampleOffsetMin, powerW) {
+        const msg = {
+            payload: {
+                soc: [{ time: NOW, soc: 81 }],
+                acload: [{ time: NOW, acload: 700 }],
+                power: [{ time: commandedAt + sampleOffsetMin * 60 * 1000, power: powerW }],
+                pv_now: [{ time: NOW, pv_now: 0 }],
+                prices: buildPriceArray(startMs, 96, () => 20),
+                solar: buildSolarForecast(startMs, 36),
+                load_history: buildLoadHistory(NOW),
+                pv_history: buildPvHistory(NOW)
+            },
+            weather: {
+                sunRise: new Date(Date.UTC(2026, 7, 11, 3, 30)).toISOString(),
+                sunSet: new Date(Date.UTC(2026, 7, 11, 18, 45)).toISOString(),
+                solarradiation: 0,
+                rainrate: 0
+            }
+        };
+        const store = { feedinGuard: { commandedAt, expectW: 4200 } };
+        withMockedNow(NOW, () => runOptimizer(msg, store));
+        const blocked = !!(store.feedinGuard && store.feedinGuard.blockedAt);
+        const warned = warnLog.some(w => w.includes('under-delivery'));
+        return { blocked, warned };
+    }
+
+    const cases = [
+        // [label, sampleOffsetMin, powerW, expectBlock]
+        ['stale pre-command sample (the 11.08. false positive)', -5.4, -659, false],
+        ['sample inside the inverter ramp window',                 0.5, -659, false],
+        ['fresh sample, pack genuinely under-delivering',            8, -659, true],
+        ['fresh sample, pack followed the command',                  8, -4100, false]
+    ];
+
+    let ok = true;
+    for (const [label, offset, powerW, expectBlock] of cases) {
+        const { blocked, warned } = guardBlocks(offset, powerW);
+        const pass = blocked === expectBlock && warned === expectBlock;
+        if (!pass) ok = false;
+        console.log(`  ${pass ? 'ok  ' : 'FAIL'} ${label}: sample ${offset >= 0 ? '+' : ''}${offset}min, ` +
+            `${powerW}W -> blocked=${blocked} (expected ${expectBlock})`);
+    }
+
+    console.log(ok
+        ? '  PASS: guard only judges samples taken after the command it is checking'
+        : '  FAIL: guard verdict wrong for at least one sample timing');
+    return ok;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -1361,7 +1428,8 @@ const results = [
     ['arbitrage fires on big delta', scenario11_arbitrageFiresOnBigDelta],
     ['no arbitrage on normal delta', scenario12_noArbitrageOnNormalDelta],
     ['hold when tomorrow sun-poor', scenario13_holdWhenTomorrowSunPoor],
-    ['pre-saturation morning feed-in', scenario14_preSaturationMorningFeedIn]
+    ['pre-saturation morning feed-in', scenario14_preSaturationMorningFeedIn],
+    ['feed-in guard ignores stale sample', scenario15_feedinGuardIgnoresStaleSample]
 ];
 
 let passed = 0;

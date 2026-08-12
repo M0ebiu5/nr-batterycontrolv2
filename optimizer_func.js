@@ -52,6 +52,23 @@ function lastVal(arr, field) {
     return null;
 }
 
+// Timestamp (ms) of the row lastVal() would return for `field`, or null.
+// Needed wherever a reading is only meaningful relative to when it was taken —
+// see the feed-in delivery guard, which must not judge a command by a sample
+// recorded before that command was issued.
+function lastTime(arr, field) {
+    if (!arr || !arr.length) return null;
+    for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i][field] !== null && arr[i][field] !== undefined) {
+            const t = arr[i].time;
+            if (t === null || t === undefined) return null;
+            const ms = typeof t === 'number' ? t : new Date(t).getTime();
+            return isFinite(ms) ? ms : null;
+        }
+    }
+    return null;
+}
+
 function toTimeSeries(arr, field) {
     if (!arr || !arr.length) return [];
     return arr.filter(r => r[field] !== null && r[field] !== undefined).map(r => ({
@@ -119,16 +136,33 @@ if (currentPvPower === null) currentPvPower = 0;
 const FEEDIN_DELIVER_MIN_FRAC = 0.4;      // delivered/commanded below this = under-delivery
 const FEEDIN_BLOCK_MS = 60 * 60 * 1000;   // hold the block this long...
 const FEEDIN_BLOCK_SOC_RECOVER = 5;       // ...or until SOC climbs this many points
+const FEEDIN_SAMPLE_MIN_AGE_MS = 60 * 1000; // sample must be this far past the command (inverter ramp)
 let feedinGuard = global.get('feedinGuard') || {};
 const _prevExpectW = (typeof feedinGuard.expectW === 'number') ? feedinGuard.expectW : 0;
+// Only a battery-power sample taken AFTER the command (plus ramp time) says
+// anything about whether that command was followed. `ess.Power` is logged
+// irregularly — gaps of 18–30 min are normal and no sample landed inside any
+// feed-in slot on 2026-08-11 — so LAST(Power) is routinely a pre-command idle
+// reading (~300–900 W of plain load compensation). Judged against a ~4 kW
+// feed-in command that always looks like under-delivery: five false blocks that
+// evening, each suppressing feed-in for the following hour and so skipping the
+// best-priced slot in it (19:45 @ 25.42 ct, the day's peak, among them). With no
+// fresh sample the guard now abstains — it neither blocks nor clears, and a
+// later run inside the 20-min window can still judge the same command.
+const _powerSampleMs = lastTime(raw.power, 'power');
+const _powerSampleFresh = typeof feedinGuard.commandedAt === 'number'
+    && _powerSampleMs !== null
+    && _powerSampleMs >= feedinGuard.commandedAt + FEEDIN_SAMPLE_MIN_AGE_MS;
 if (_prevExpectW > 0 && typeof feedinGuard.commandedAt === 'number'
     && (_nowMs - feedinGuard.commandedAt) < 20 * 60 * 1000
+    && _powerSampleFresh
     && typeof currentPower === 'number' && isFinite(currentPower)) {
     // ess `power` is battery power: positive = charging, negative = discharging.
     const deliveredW = Math.max(0, -currentPower);
+    const _sampleAgeMin = (_powerSampleMs - feedinGuard.commandedAt) / 60000;
     if (deliveredW < _prevExpectW * FEEDIN_DELIVER_MIN_FRAC) {
         feedinGuard = { blockedAt: _nowMs, blockedSoc: currentSoc };
-        node.warn(`Feed-in under-delivery: ${Math.round(deliveredW)}W of ${Math.round(_prevExpectW)}W commanded → blocking feed-in (SOC ${currentSoc.toFixed(0)}%)`);
+        node.warn(`Feed-in under-delivery: ${Math.round(deliveredW)}W of ${Math.round(_prevExpectW)}W commanded (sample +${_sampleAgeMin.toFixed(1)}min) → blocking feed-in (SOC ${currentSoc.toFixed(0)}%)`);
     } else {
         feedinGuard = {}; // delivered as commanded → clear any stale block
     }
