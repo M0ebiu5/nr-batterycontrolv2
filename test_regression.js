@@ -1413,6 +1413,75 @@ function scenario15_feedinGuardIgnoresStaleSample() {
     return ok;
 }
 
+
+// SCENARIO 16: SOC staleness guard.
+// 2026-08-16 22:57 the Cerbo GX dropped off the LAN. global.ess.Soc kept being
+// re-written with its last value, so the optimizer saw a present, in-range 90.5%
+// all night while the packs were really near 53%, and planned against a phantom.
+// A SOC that has not moved at all for two hours must stop the optimizer acting
+// on its own plan - except at the rails, where a flat SOC is a real state.
+function scenario16_socStalenessGuard() {
+    console.log('\n=== SCENARIO 16: SOC staleness guard (frozen telemetry) ===');
+    const NOW = Date.UTC(2026, 7, 17, 1, 0);          // 03:00 Berlin, deep in the night trough
+    const startMs = NOW - 3600 * 1000;
+
+    function run(soc, flatMin) {
+        const msg = {
+            payload: {
+                soc: [{ time: NOW, soc: soc }],
+                acload: [{ time: NOW, acload: 700 }],
+                power: [{ time: NOW, power: -700 }],
+                pv_now: [{ time: NOW, pv_now: 0 }],
+                // Deep negative price now: without the guard the optimizer grid-charges.
+                prices: buildPriceArray(startMs, 96, (t, i) => (i < 8 ? -30 : 20)),
+                solar: buildSolarForecast(startMs, 36),
+                load_history: buildLoadHistory(NOW),
+                pv_history: buildPvHistory(NOW)
+            },
+            weather: {
+                sunRise: new Date(Date.UTC(2026, 7, 17, 4, 0)).toISOString(),
+                sunSet: new Date(Date.UTC(2026, 7, 17, 18, 30)).toISOString(),
+                solarradiation: 0,
+                rainrate: 0
+            }
+        };
+        const store = { socFresh: { soc: soc, changedAt: NOW - flatMin * 60 * 1000 } };
+        const out = withMockedNow(NOW, () => runOptimizer(msg, store));
+        return {
+            state: out[2].payload.state,
+            planned: out[0].currentAction ? out[0].currentAction.state : null,
+            stale: out[0].summary.socStale,
+            warned: warnLog.some(w => w.includes('SOC stale'))
+        };
+    }
+
+    const cases = [
+        // [label, soc, flatMin, expectStale]
+        ['frozen mid-range SOC (the 16.08. outage)', 90.5, 400, true],
+        ['same SOC, only 60 min flat',               90.5,  60, false],
+        ['flat at the top rail (full pack)',         99.5, 400, false],
+        ['flat on the floor',                         5.5, 400, false]
+    ];
+
+    let ok = true;
+    for (const [label, soc, flatMin, expectStale] of cases) {
+        const r = run(soc, flatMin);
+        let pass = r.stale === expectStale && r.warned === expectStale;
+        // Stale runs must hold state 3 whatever the plan wanted; fresh runs must
+        // pass the plan's own decision through untouched.
+        if (expectStale) pass = pass && r.state === 3;
+        else pass = pass && r.state === r.planned;
+        if (!pass) ok = false;
+        console.log(`  ${pass ? 'ok  ' : 'FAIL'} ${label}: soc=${soc}% flat ${flatMin}min -> ` +
+            `stale=${r.stale} state=${r.state} (plan wanted ${r.planned})`);
+    }
+
+    console.log(ok
+        ? '  PASS: frozen SOC holds state 3; fresh and at-rail readings pass through'
+        : '  FAIL: staleness guard verdict wrong for at least one case');
+    return ok;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -1429,7 +1498,8 @@ const results = [
     ['no arbitrage on normal delta', scenario12_noArbitrageOnNormalDelta],
     ['hold when tomorrow sun-poor', scenario13_holdWhenTomorrowSunPoor],
     ['pre-saturation morning feed-in', scenario14_preSaturationMorningFeedIn],
-    ['feed-in guard ignores stale sample', scenario15_feedinGuardIgnoresStaleSample]
+    ['feed-in guard ignores stale sample', scenario15_feedinGuardIgnoresStaleSample],
+    ['SOC staleness guard',           scenario16_socStalenessGuard]
 ];
 
 let passed = 0;

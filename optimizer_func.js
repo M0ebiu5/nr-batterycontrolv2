@@ -111,6 +111,43 @@ if (socTrust && typeof _sg.soc === 'number' && typeof _sg.time === 'number') {
     if (Math.abs(currentSoc - _sg.soc) > _maxJump) socTrust = false; // implausible jump → distrust
 }
 global.set('socGuard', { soc: currentSoc, time: _nowMs });
+
+// --- SOC staleness guard ----------------------------------------------------
+// A stale SOC never looks absent. `query_soc` already falls back from global.bms
+// to global.ess once the BMS feed is more than 30 min old, but global.ess carries
+// no timestamp of its own and the collector behind it keeps re-writing its last
+// known value, so the reading stays present, in range, and wrong. On 2026-08-16
+// the Cerbo dropped off the LAN at 22:57 and global.ess.Soc sat pinned at 90.5%
+// for the rest of the night while the packs were really near 53% - every plan
+// that night was fiction.
+//
+// All we have to go on is that the number stops moving. Away from the rails the
+// pack is always either covering load or taking charge, so a completely flat SOC
+// for two hours is not a real operating point; at ~100% or down on the floor it
+// is, and those are exempt.
+const SOC_STALE_MIN = 120;
+const _bmsCtx = global.get('bms') || {};
+const _socSource = (typeof _bmsCtx.weightedSoc === 'number'
+    && typeof _bmsCtx.ts === 'number' && _bmsCtx.ts > _nowMs - 1800000) ? 'bms' : 'ess';
+// Kept in the file store: a Node-RED restart is exactly what someone does while
+// troubleshooting an outage, and losing changedAt there would re-arm the whole
+// window and buy the fault another two hours of blind operation.
+const _socFresh = global.get('socFresh', 'file') || {};
+const _socChangedAt = (_socFresh.soc === currentSoc && typeof _socFresh.changedAt === 'number')
+    ? _socFresh.changedAt : _nowMs;
+const _socFlatMin = (_nowMs - _socChangedAt) / 60000;
+const _atSocRail = currentSoc >= 99 || currentSoc <= MIN_SOC_PCT + 1;
+const socStale = _socFlatMin >= SOC_STALE_MIN && !_atSocRail;
+let _socWarnedAt = _socFresh.warnedAt || 0;
+if (socStale) {
+    socTrust = false;   // never grid-charge on a reading we do not believe
+    if (_nowMs - _socWarnedAt > 3600000) {
+        _socWarnedAt = _nowMs;
+        node.warn(`SOC stale: ${currentSoc.toFixed(1)}% (source ${_socSource}) unchanged for `
+            + `${Math.round(_socFlatMin)}min - holding state 3, grid-charge and feed-in blocked`);
+    }
+}
+global.set('socFresh', { soc: currentSoc, changedAt: _socChangedAt, warnedAt: _socWarnedAt }, 'file');
 // Suppress grid-charge of the LIVE slot when the reading can't be trusted or a pack
 // is at the cell-voltage ceiling. (Applied at i===0 only; future slots re-evaluate.)
 const gridChargeBlocked = !socTrust || (maxCellV !== null && maxCellV >= CELL_FULL_V);
@@ -2154,17 +2191,30 @@ msg.summary = {
     currentReason: currentSlot ? currentSlot.reason : 'no data',
     preemptiveDischarge: targetSocForSunrise !== null,
     targetSocSunrise: targetSocForSunrise,
-    preemptiveSlots: preemptiveDischargeSlots.size
+    preemptiveSlots: preemptiveDischargeSlots.size,
+    socSource: _socSource,
+    socFlatMin: Math.round(_socFlatMin),
+    socStale: socStale
 };
 
 
 // msg3: current setpoint for ESS control
 var weather7 = global.get("weather7days", "file")
+
+// A stale SOC makes the whole plan above fiction, so the live slot falls back to
+// state 3 (cover the household load) rather than acting on it. Emitting nothing
+// would leave the Cerbo pinned in whatever state 1 or 4 the last good run had
+// commanded, charging or draining blind - worse than doing nothing.
+const _cmdState = socStale ? 3 : (currentSlot ? currentSlot.state : 3);
+const _cmdReason = socStale
+    ? `SOC stale (${currentSoc.toFixed(1)}% flat ${Math.round(_socFlatMin)}min, source ${_socSource}) - holding at load compensation`
+    : (currentSlot ? currentSlot.reason : 'no data');
+
 const msg3 = {
     topic: 'mac/ess/cmd',
     payload: {
-        state: currentSlot ? currentSlot.state : 3,
-        reason: currentSlot ? currentSlot.reason : 'no data',
+        state: _cmdState,
+        reason: _cmdReason,
         val: currentSlot.marketPrice,
         sun: weather7.sun7[0].value,
         slots: output
@@ -2173,7 +2223,7 @@ const msg3 = {
 
 // Record what we just commanded so the next run can check whether the pack
 // actually delivered it (see the feed-in delivery guard near the top).
-if (currentSlot && currentSlot.state === 4) {
+if (!socStale && currentSlot && currentSlot.state === 4) {
     global.set('feedinGuard', {
         commandedAt: Date.now(),
         expectW: Math.max(0, MAX_DISCHARGE_W + (currentSlot.loadEst || 0) - (currentSlot.pvPower || 0))
@@ -2185,5 +2235,11 @@ if (currentSlot && currentSlot.state === 4) {
 const pp = global.get('pp', 'file') || {};
 pp.prediction = output;
 global.set('pp', pp, 'file');
+
+node.status(socStale
+    ? { fill: 'red', shape: 'ring',
+        text: `SOC STALE ${currentSoc.toFixed(1)}% flat ${Math.round(_socFlatMin)}min (${_socSource}) -> state 3` }
+    : { fill: 'green', shape: 'dot',
+        text: `s${_cmdState} soc=${currentSoc.toFixed(1)}% (${_socSource}) ${currentSlot ? currentSlot.marketPrice.toFixed(1) : '?'}ct` });
 
 return [msg, null, msg3];
