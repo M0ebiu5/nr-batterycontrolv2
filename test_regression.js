@@ -1351,6 +1351,127 @@ function scenario14_preSaturationMorningFeedIn() {
     return true;
 }
 
+// =========================================================
+// SCENARIO 17: User report (2026-08-20) — "yesterday you charged
+// and today you predict many feed in states".
+//
+// Afternoon of the 19th. Tomorrow (20.08) is PV-rich enough to fill
+// the pack to the curtailment line; the day after (21.08) is dead,
+// so the multi-day reserve demands a high end-of-schedule floor.
+// Two things went wrong at once:
+//
+//   a) Phase 3c bought grid slots THIS afternoon to reach that floor,
+//      at 22-28ct effective — although tomorrow's sun fills the pack
+//      for free long before the reserve is ever drawn on. The old
+//      "did this pick raise traj[d]?" gate could not see it: the
+//      trajectory clamps at MAX_GRID_CHARGE_SOC_PCT, so the spill
+//      above 99 never appeared in it.
+//   b) Phase 3d's budget collapsed to "overflow only" — a refill was
+//      ahead but did not count as free (the marketPrice<3 test only
+//      recognises a negative-price glut) — so tonight's 22ct peak was
+//      never picked. The energy stayed in the pack, tomorrow's PV
+//      then had nowhere to go, and it left the house as 11-15ct
+//      curtailment instead.
+//
+// After the fix: no charge is placed behind the saturation wall, and
+// tonight's peak sells because the refill counts as free.
+// =========================================================
+function scenario17_saturatingRefillUnlocksEveningPeak() {
+    console.log('\n=== SCENARIO 17: Saturating PV refill tomorrow -> sell tonight, do not buy ===');
+
+    // NOW = 2026-08-19 14:45 Berlin (UTC 12:45). The schedule reaches
+    // 20.08. 23:45 (~33h), past the 30h threshold, so the multi-day reserve
+    // is live — the state the reported run was actually in (picks=22).
+    const NOW = Date.UTC(2026, 7, 19, 12, 45);
+    const startMs = NOW;
+    const slots = 133; // 14:45 today → 23:45 tomorrow
+
+    const prices = buildPriceArray(startMs, slots, (t) => {
+        const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
+        const isToday = t < Date.UTC(2026, 7, 19, 22, 0); // before 00:00 Berlin
+        if (isToday) return hour < 18 ? 13 : 22;  // cheap afternoon, 22ct evening peak
+        if (hour < 7) return 15;                  // small hours
+        if (hour < 17) return 12;                 // tomorrow's PV day: the dump price
+        return 20;                                // tomorrow evening: cross-day hold
+                                                  // present (floor 17ct), not binding
+    });
+
+    // Sun today and tomorrow; nothing at all the day after, so the 48h reserve
+    // walk sees a genuine PV desert and pushes the end-of-schedule floor up.
+    const solar = [];
+    for (let h = 0; h < 80; h++) {
+        const t = startMs + h * 3600000;
+        const d = new Date(t);
+        const hour = ((d.getUTCHours() + 2) % 24 + 24) % 24;
+        const dayAfter = t >= Date.UTC(2026, 7, 20, 22, 0); // 21.08 Berlin onwards
+        const daylight = hour >= 7 && hour <= 19;
+        solar.push({ time: t, sunshineDurationInMinutes: (daylight && !dayAfter) ? 45 : 0 });
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 55 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 1000 }],
+            pv_now: [{ time: NOW, pv_now: 3000 }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(NOW),
+            pv_history: buildPvHistory(NOW)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 7, 19, 3, 45)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 7, 19, 18, 30)).toISOString(),
+            solarradiation: 600,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+    const phase3cWarn = warnLog.find(w => w.includes('Phase 3c:')) || '';
+    const wallMatch = phase3cWarn.match(/PV saturation wall at idx=(\d+) \(([\d.]+)% spill\), (\d+) candidate/);
+
+    const isTonight = s => typeof s.time === 'string' && s.time.includes('19.08.')
+        && parseInt(String(s.time).slice(-5, -3), 10) >= 18;
+    const tonight = schedule.filter(isTonight);
+    const tonightSold = tonight.filter(s => s.state === 4);
+    const bought = schedule.filter(s => s.state === 1);
+
+    for (const s of tonight.slice(0, 8)) console.log(`  ${fmtSlot(s)}`);
+    if (phase3cWarn) console.log(`  [warn] ${phase3cWarn}`);
+
+    // Sanity: the PV-only walk must actually reach the curtailment line,
+    // otherwise there is no wall and nothing under test. (We cannot assert on
+    // ≥99% slots in the PLANNED schedule — a working fix sells the pack down
+    // so it arrives at saturation exactly full, which is the whole point.)
+    if (!wallMatch) {
+        console.error('  setup drift: no PV saturation wall projected — nothing to test');
+        return false;
+    }
+    const [, wallIdx, spillPct, refused] = wallMatch;
+
+    let ok = true;
+    if (Number(refused) === 0 && bought.length === 0 && tonightSold.length > 0) {
+        // Acceptable only if the reserve never asked for a charge at all;
+        // flag it so a silent setup change can't hollow the test out.
+        console.warn(`  note: wall refused 0 candidates (reserve satisfied without picks)`);
+    }
+    if (bought.length > 0) {
+        console.error(`  FAIL: ${bought.length} grid-charge slot(s) planned although PV spills ${spillPct}% at idx=${wallIdx}`);
+        ok = false;
+    }
+    if (tonightSold.length === 0) {
+        console.error(`  FAIL: tonight's 22ct peak never sold (${tonight.length} evening slots, all held)`);
+        ok = false;
+    }
+    if (ok) {
+        console.log(`  PASS: ${tonightSold.length}/${tonight.length} evening slots sell at 22ct; `
+            + `no grid charge behind the wall (idx=${wallIdx}, ${spillPct}% spill, ${refused} candidate(s) refused)`);
+    }
+    return ok;
+}
+
 function scenario15_feedinGuardIgnoresStaleSample() {
     console.log('\n=== SCENARIO 15: Feed-in guard must not judge a command by a pre-command sample ===');
     // 2026-08-11: the guard blocked feed-in five times in one evening, each block
@@ -1499,7 +1620,8 @@ const results = [
     ['hold when tomorrow sun-poor', scenario13_holdWhenTomorrowSunPoor],
     ['pre-saturation morning feed-in', scenario14_preSaturationMorningFeedIn],
     ['feed-in guard ignores stale sample', scenario15_feedinGuardIgnoresStaleSample],
-    ['SOC staleness guard',           scenario16_socStalenessGuard]
+    ['SOC staleness guard',           scenario16_socStalenessGuard],
+    ['saturating refill unlocks evening peak', scenario17_saturatingRefillUnlocksEveningPeak]
 ];
 
 let passed = 0;

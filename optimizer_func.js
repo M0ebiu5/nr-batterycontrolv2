@@ -19,6 +19,7 @@ const BASE_GRID_FEE = 13; // ct/kWh
 const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear + inverter losses exceed sub-ct revenue)
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
 const PRESAT_MIN_GAIN_CT = 3; // Phase 3d pass 1: a pre-saturation drain must beat the price the same energy would fetch when Phase 4's runtime branch dumps it during saturation. Guards the pre-drain against becoming a low-price midday sale (see the "never pre-drain at low midday prices to make room for PV" rule): the hurdle is the realistic alternative price, not zero. 3 ct ≈ the observed 10–15 ct dump band vs 17–20 ct pre-saturation prices, so it fires on genuine spreads and stays quiet on near-ties.
+const PV_CURTAIL_MIN_SOC = 5;   // a PV-ONLY projection must overflow by at least this much SOC (~1.5 kWh) before the planner accepts "PV will saturate the pack" as real. 0.6% of phantom overflow on a bad-PV day (74 sun-min) once unlocked PV-opportunity pricing and let a 22.39ct evening feed-in pass against a 14ct real grid refill. The same floor now also gates the Phase 3c saturation wall and the Phase 3d free-refill test, so a single forecast wobble cannot rewrite the plan.
 const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
 const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
 const CROSSDAY_HOLD_MAX_AGE_MS = 12 * 3600 * 1000; // how long a cross-day hold floor may be carried once horizonIsRefill flips false (see the carry branch in Phase 3d). Bounded so a floor computed from a stale horizon can't suppress feed-in indefinitely; the peak it was derived from must also still lie in the future.
@@ -427,9 +428,15 @@ function estimatePvPower(timeMs) {
         const basePvNow = todayBaseline[currentH] || 1;
         let scaleFactor = null;
 
-        // Prefer actual PV power from inverter
+        // Prefer actual PV power from inverter. Clamped the same way the
+        // radiation fallback below is: an unbounded ratio let one sample
+        // rescale the WHOLE remaining day. 2026-08-20 under broken cloud the
+        // 07:45 run projected 5000W midday and 11 curtailment feed-ins, the
+        // 08:00 run projected ~1000W and none (actual PAC 1946W -> 722W in
+        // 15 min). pv_now is a 30-min MEDIAN (see the "PV Now" query node), so
+        // brief gaps and spikes no longer move it; the clamp bounds the rest.
         if (currentPvPower > 0 && basePvNow > 0) {
-            scaleFactor = currentPvPower / basePvNow;
+            scaleFactor = Math.max(0.1, Math.min(currentPvPower / basePvNow, 2.5));
         }
         // Fall back to solar radiation ratio (W/m² vs clear-sky ~1000 W/m²)
         if (scaleFactor === null && weather.solarradiation > 0) {
@@ -1038,6 +1045,43 @@ for (const s of schedule) {
     }
 })();
 
+// PV-only saturation walk: SOC with no grid-charge and no feed-in plans at
+// all. Two consumers. Phase 3c reads satIdx as a "charge wall" — energy bought
+// before the pack saturates is displaced by the PV that then spills, so those
+// picks buy at retail what the sun delivers free. Phase 3d reads the overflow
+// to decide whether an in-horizon refill is genuinely free. Clamped at 99 (the
+// runtime curtailment trigger) rather than at MAX_GRID_CHARGE_SOC_PCT, so the
+// walk sees the REAL saturation that the planner's own 90% projection cap hides.
+let pvOnlySatIdx = -1;
+let pvOnlyOverflowRaw = 0;
+let pvOnlyTroughSoc = 0; // SOC that must stay in the pack to reach the saturation
+{
+    let s0 = currentSoc;
+    let trough = currentSoc;
+    for (let i = 0; i < schedule.length; i++) {
+        const s = schedule[i];
+        s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+        if (s0 > 99) {
+            if (pvOnlySatIdx < 0) {
+                pvOnlySatIdx = i;
+                // Depth of the dip between now and the saturation: sell past it
+                // and the house buys the difference back at retail overnight.
+                pvOnlyTroughSoc = Math.max(0, currentSoc - trough);
+            }
+            pvOnlyOverflowRaw += s0 - 99;
+            s0 = 99;
+        }
+        if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
+        if (pvOnlySatIdx < 0 && s0 < trough) trough = s0;
+    }
+}
+
+// Saturation wall: the index at which PV ALONE fills the pack to the
+// curtailment trigger. Only honoured when the projected spill is substantive,
+// so one forecast wobble can neither suppress a genuine charge (Phase 3c) nor
+// unlock a sale against the multi-day reserve (Phase 3d).
+const pvSatWall = pvOnlyOverflowRaw >= PV_CURTAIL_MIN_SOC ? pvOnlySatIdx : -1;
+
 // --- 3c. Plan charging: horizon-wide cheapest-slot selection ---
 // Iteratively simulate the SOC trajectory across the whole schedule.
 // Whenever a slot falls below MIN_SOC+5, pick the cheapest unplanned
@@ -1092,6 +1136,7 @@ for (const s of schedule) {
 
     const MAX_CHARGE_PICKS = schedule.length;
     let picks = 0;
+    let wallBlocked = 0;
     for (let iter = 0; iter < MAX_CHARGE_PICKS; iter++) {
         const traj = simulateSocTrajectory();
 
@@ -1117,6 +1162,18 @@ for (const s of schedule) {
                 // 2 morning charges at ~26ct before a 749 sun-min day). Negative-price
                 // profit charging is unaffected — that is Phase 3f, not 3c.
                 if (targetSocForSunrise !== null) continue;
+                // Don't buy across the saturation wall. A charge placed before
+                // pvSatWall cannot carry SOC past it — PV fills the pack to the
+                // curtailment trigger there and the bought energy is exactly
+                // what spills, so the deficit beyond the wall is no better off
+                // and we paid retail for it. User report 2026-08-20: 8 grid
+                // slots at 22–28ct effective on the 19th, placed to defend an
+                // 80% multi-day-reserve floor, while the 20th's PV saturated
+                // the pack by midday and then dumped at 11–15ct. The existing
+                // "did this pick raise traj[d]?" gate cannot catch this: the
+                // trajectory clamps at MAX_GRID_CHARGE_SOC_PCT (90), so the
+                // spill above 99 never appears in it.
+                if (pvSatWall >= 0 && i < pvSatWall && d >= pvSatWall) { wallBlocked++; continue; }
                 eligible.push({ idx: i, effPrice: s.effectivePrice, prePublish: berlinTime(s.time).hour < 13 });
             }
             // Prefer slots at/after the ~13:00 Berlin price publish. Grid-charging
@@ -1141,7 +1198,7 @@ for (const s of schedule) {
         if (!committed) break;
     }
     const finalTraj = simulateSocTrajectory();
-    node.warn(`Phase 3c: picks=${picks} endTarget=${slotTarget(lastIdx).toFixed(1)}% endTraj=${finalTraj[lastIdx].toFixed(1)}% peakTraj=${Math.max(...finalTraj).toFixed(1)}% (cap ${MAX_GRID_CHARGE_SOC_PCT}%)${_reserveDeferred ? ` [multi-day reserve deferred; overnight bridge ${_postSchedLoadKwh.toFixed(1)}kWh]` : ''}`);
+    node.warn(`Phase 3c: picks=${picks} endTarget=${slotTarget(lastIdx).toFixed(1)}% endTraj=${finalTraj[lastIdx].toFixed(1)}% peakTraj=${Math.max(...finalTraj).toFixed(1)}% (cap ${MAX_GRID_CHARGE_SOC_PCT}%)${_reserveDeferred ? ` [multi-day reserve deferred; overnight bridge ${_postSchedLoadKwh.toFixed(1)}kWh]` : ''}${pvSatWall >= 0 ? ` [PV saturation wall at idx=${pvSatWall} (${pvOnlyOverflowRaw.toFixed(1)}% spill), ${wallBlocked} candidate(s) refused]` : ''}`);
 }
 
 // --- 3d. Feed-in planning: discharge at highest prices when we have excess ---
@@ -1376,12 +1433,42 @@ let satStartIdx = -1;
     };
     overflowSoc = dampOverflow('overflowSoc', overflowSoc);
     postHorizonOverflow = dampOverflow('postHorizonOverflow', postHorizonOverflow);
+    // Damped here rather than further down with the replacement-price block so
+    // the free-refill test below can consult it. Same value, same single
+    // dampOverflow call per run — only the position moved.
+    const pvOnlyOverflow = dampOverflow('pvOnlyOverflow', pvOnlyOverflowRaw);
+    const pvWillCurtail = pvOnlyOverflow >= PV_CURTAIL_MIN_SOC;
+
+    // A refill that SATURATES the pack is free whatever it costs. The
+    // marketPrice<3 test above only recognises the negative-price glut, so on
+    // an ordinary sunny day the budget collapsed to "overflow only" and the
+    // evening peak went unsold — and the next day's PV then had nowhere to go
+    // and was dumped as curtailment at half the price. User report 2026-08-20:
+    // 20–22ct held on the evening of the 19th, dumped at 11.4–14.9ct on the
+    // 20th. SOC carried past a saturation is replaced by PV that would
+    // otherwise spill, so holding it costs the full spread. The end-of-schedule
+    // floor in the branch below still bounds how far past the saturation we may
+    // drain, and every candidate still has to clear the round-trip check and
+    // the cross-day hold — this widens the budget, it does not waive a price test.
+    if (pvWillCurtail) freeRefillAhead = true;
 
     let feedinBudgetSoc;
     if (horizonIsRefill && !freeRefillAhead) {
         feedinBudgetSoc = overflowSoc + postHorizonOverflow;
     } else {
-        const endFloorSoc = kwhToSoc(_postSchedLoadKwh) + MIN_SOC_PCT + 8;
+        // The multi-day reserve is what has to still be in the pack when the
+        // schedule ENDS. When PV alone refills to the curtailment line at
+        // pvSatWall, that reserve is replenished for free at the wall, so
+        // energy sold before it never touches the reserve — only the dip
+        // between now and the wall has to stay behind. Subtracting the full
+        // reserve from a pre-wall projection is what held the 20–22ct evening
+        // peak on 2026-08-19 (reserve floor 83% vs projection 75% => budget 0)
+        // for energy the next midday then spilled at 11–15ct. With no
+        // saturation ahead the reserve stands unchanged — that is the sun-poor
+        // case, where the stored energy really is the only thing we have.
+        const endFloorSoc = pvSatWall >= 0
+            ? MIN_SOC_PCT + 8 + pvOnlyTroughSoc
+            : kwhToSoc(_postSchedLoadKwh) + MIN_SOC_PCT + 8;
         feedinBudgetSoc = Math.max(0, projSoc + overflowSoc - endFloorSoc);
     }
 
@@ -1453,25 +1540,8 @@ let satStartIdx = -1;
     // grid-recharge cost (~minReplacementEffPrice, ~24ct). Result was
     // sell-low/buy-high: morning peaks 15–16ct feed-in then midday grid
     // refill at 22ct effective = ~6ct/kWh round-trip loss.
-    let pvOnlyOverflow = 0;
-    {
-        let s0 = currentSoc;
-        for (let i = 0; i < schedule.length; i++) {
-            const s = schedule[i];
-            s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
-            if (s0 > 99) { pvOnlyOverflow += s0 - 99; s0 = 99; }
-            if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
-        }
-    }
-    pvOnlyOverflow = dampOverflow('pvOnlyOverflow', pvOnlyOverflow);
-    // pvOnlyOverflow > 0 was too loose: 0.6% of phantom overflow (~0.18 kWh) on a
-    // bad-PV day (74 sun-min) was enough to trigger pvOpportunityPrice (~11 ct) as
-    // replacement, letting a 22.39 ct evening feed-in pass against a 14ct real grid
-    // refill cost. The non-overflow portion of feed-in needs grid-refill (~18.69 ct
-    // here), not PV — only treat curtailment as the replacement when PV overflow is
-    // substantive (≥ 5 % SOC ≈ 1.5 kWh).
-    const PV_CURTAIL_MIN_SOC = 5;
-    const pvWillCurtail = pvOnlyOverflow >= PV_CURTAIL_MIN_SOC;
+    // pvOnlyOverflow / pvWillCurtail are computed with the budget branch above
+    // (from the hoisted PV-only walk); PV_CURTAIL_MIN_SOC is a top-level constant.
 
     // Post-schedule PV overflow walk (48h past schedule end). When the next
     // 48h forecast a strong PV refill (e.g. day-after-tomorrow with 600+
@@ -2210,6 +2280,97 @@ const _cmdReason = socStale
     ? `SOC stale (${currentSoc.toFixed(1)}% flat ${Math.round(_socFlatMin)}min, source ${_socSource}) - holding at load compensation`
     : (currentSlot ? currentSlot.reason : 'no data');
 
+// === Device parameters (Cerbo + Symo) ===
+// The published command carries the concrete settings each box is about to
+// receive, each with a one-line reason. cerbo_control and symo_gate consume
+// these instead of re-deriving them, so every threshold lives here only and a
+// subscriber can see what was commanded and why without replaying the planner.
+const IDLE_SETPOINT_W = 30;       // the Cerbo's normal self-consumption grid setpoint
+const MAX_TOTAL_FEEDIN_W = 4900;  // hard cap on COMBINED grid feed-in from every source
+const SYMO_DISABLE_MP_CT = -20;   // below this the grid pays us more than PV output is worth
+
+const _mp = currentSlot && typeof currentSlot.marketPrice === 'number'
+    ? currentSlot.marketPrice : null;
+const _mpTxt = _mp === null ? 'an unknown price' : _mp.toFixed(1) + 'ct';
+const _negPrice = (_mp !== null && _mp < 0);
+
+// Only AcPowerSetPoint can *force* an import or an export; the other four
+// settings are limits that gate what the ESS is allowed to do on its own.
+let _acSetPoint, _maxDischarge, _setPointWhy, _maxDischargeWhy;
+if (_cmdState === 1) {
+    _acSetPoint = MAX_CHARGE_W;
+    _maxDischarge = 0;
+    _setPointWhy = `state 1 at ${_mpTxt}: force ${MAX_CHARGE_W}W import to charge the pack`;
+    _maxDischargeWhy = 'pinned to 0 so the pack cannot discharge back out while we are paying to fill it';
+} else if (_cmdState === 4) {
+    _acSetPoint = -MAX_DISCHARGE_W;
+    _maxDischarge = -1;
+    _setPointWhy = `state 4 at ${_mpTxt}: force ${MAX_DISCHARGE_W}W export, this is a grid setpoint so it caps total feed-in`;
+    _maxDischargeWhy = '-1 = no limit, the setpoint alone decides how hard the pack is pushed';
+} else {
+    _acSetPoint = IDLE_SETPOINT_W;
+    _maxDischarge = -1;
+    _setPointWhy = `state 3 at ${_mpTxt}: self-consumption, grid held near ${IDLE_SETPOINT_W}W so the pack covers the house and nothing is forced either way`;
+    _maxDischargeWhy = '-1 = no limit, the pack is free to cover whatever the house draws';
+}
+
+// Hard rule: never export at a negative market price - we would be paying the
+// grid to take it. PreventFeedback=1 blocks PV feed-in as well as the battery,
+// which is exactly what we want while the price is below zero.
+const _preventFeedback = _negPrice ? 1 : 0;
+
+// The plan above already rewrites feed-in at mp < 0 into state 3, so a negative
+// price with an export setpoint should never get here. If it ever does, do not
+// command an export we are simultaneously blocking.
+if (_negPrice && _acSetPoint < 0) {
+    _acSetPoint = IDLE_SETPOINT_W;
+    _setPointWhy = `export cancelled: ${_mpTxt} is below zero, we would be paying the grid to take it - falling back to self-consumption`;
+}
+// Backstop only: cannot bite while MAX_DISCHARGE_W is 3500, but keeps the
+// combined-feed-in invariant true if that is ever raised.
+if (_acSetPoint < -MAX_TOTAL_FEEDIN_W) {
+    _acSetPoint = -MAX_TOTAL_FEEDIN_W;
+    _setPointWhy = `clamped to the ${MAX_TOTAL_FEEDIN_W}W combined feed-in cap`;
+}
+
+const _cerboParams = {
+    AcPowerSetPoint: { value: _acSetPoint, unit: 'W', why: _setPointWhy },
+    MaxChargePower: {
+        value: MAX_CHARGE_W, unit: 'W',
+        why: 'charger ceiling, matches the inverter/pack rating the planner budgets with'
+    },
+    MaxDischargePower: { value: _maxDischarge, unit: 'W', why: _maxDischargeWhy },
+    MaxFeedInPower: {
+        value: MAX_TOTAL_FEEDIN_W, unit: 'W',
+        why: 'hard cap on combined grid feed-in from battery and PV together; the Symo cannot reach it alone, so it only ever trims the battery share and never curtails PV'
+    },
+    PreventFeedback: {
+        value: _preventFeedback, unit: 'bool',
+        why: _preventFeedback
+            ? `${_mpTxt} is below zero - block all export, battery and PV alike`
+            : (_mp === null
+                ? 'no price to judge on - export left allowed, the plan already fell back to self-consumption'
+                : `${_mpTxt} is at or above zero - export allowed`)
+    }
+};
+
+// Symo: at a deeply negative price the grid pays us per kWh imported, so every
+// watt the inverter makes is a watt we are not being paid for. Between -20 and
+// 0 ct the *effective* import price is still positive once the grid fee is
+// added, so self-consuming PV still beats importing and cutting it costs money.
+const _symoOff = (_mp !== null && _mp < SYMO_DISABLE_MP_CT);
+const _symoParams = {
+    setlimit: {
+        value: _mp === null ? null : (_symoOff ? 0 : 'disable'),
+        unit: _symoOff ? '%' : 'cmd',
+        why: _mp === null
+            ? 'no market price for this slot - no opinion, the Symo is left alone'
+            : (_symoOff
+                ? `${_mpTxt} is below ${SYMO_DISABLE_MP_CT}ct - being paid to import beats producing, so clamp the inverter to 0% and let the pack soak up grid energy instead`
+                : `${_mpTxt} is at or above ${SYMO_DISABLE_MP_CT}ct - self-consuming PV still beats importing, so hand the inverter back its own control (clears WMaxLim_Ena rather than pinning 100%)`)
+    }
+};
+
 const msg3 = {
     topic: 'mac/ess/cmd',
     payload: {
@@ -2217,6 +2378,8 @@ const msg3 = {
         reason: _cmdReason,
         val: currentSlot.marketPrice,
         sun: weather7.sun7[0].value,
+        cerbo: _cerboParams,
+        symo: _symoParams,
         slots: output
     }
 };
