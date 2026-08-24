@@ -1401,14 +1401,28 @@ let satStartIdx = -1;
     // spend past the 18.50ct peak all the way down to 15.81ct — and emptied the
     // pack before that 18.50ct slot arrived. Clamp each quantity to its rolling
     // minimum over the last OVERFLOW_DAMP_SLOTS slots: decreases still apply
-    // immediately, increases must persist ~1h before they can unlock feed-in.
+    // immediately, increases must persist 30 min before they can unlock feed-in.
     // History is bucketed by 15-min SLOT, not by run: the optimizer is normally
     // driven by cron-plus on the slot boundary, but an off-slot re-trigger (an
     // editor inject fired one at 09:31:21 on 2026-07-28) would otherwise consume
     // a history entry and shrink the window in wall-clock terms. Re-runs within
     // the same slot replace that slot's entry instead of pushing a new one, so
     // the window stays time-based regardless of trigger frequency.
-    const OVERFLOW_DAMP_SLOTS = 4;
+    // Window was 4 (~45 min of persistence) until 2026-08-24. That cost the
+    // 08:00 slot that morning: PV-only spill went 0 → 38.0% at 07:45 and stayed
+    // above 21% every run after, but the min still saw the wall-free 07:00-07:30
+    // runs and reported curtailment-bound 0.0%, so the cross-day hold (21.5ct)
+    // blocked everything. The budget unlocked at 08:30 and Phase 3d pass 1 sold
+    // 16.82/18.04ct — while the 08:00 slot it had just walked past was 20.50ct.
+    // At 2 the same 21.3% budget arrives at 08:00 and that slot is the top
+    // pre-wall candidate. A spike still has to survive one further run, so the
+    // single-run forecast wobbles this guard exists for stay suppressed: 06:45
+    // on both 08-23 (11.6%) and 08-24 (9.7%) were length-1 episodes and do not
+    // unlock at 2 either. Replaying the whole 08-20..08-24 log, the only unlock
+    // that 2 admits and 4 refuses is 08-21 15:45 (two runs at 5.3/6.8%, barely
+    // over PV_CURTAIL_MIN_SOC) — a ~1.6 kWh exemption, cheap against a 3.7ct/kWh
+    // miss every strong-PV morning.
+    const OVERFLOW_DAMP_SLOTS = 2;
     const OVERFLOW_DAMP_MAX_AGE_MS = 90 * 60 * 1000;
     const _ovfHist = global.get('overflowHist') || {};
     const dampOverflow = (key, value) => {
