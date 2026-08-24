@@ -1603,6 +1603,202 @@ function scenario16_socStalenessGuard() {
     return ok;
 }
 
+// =========================================================
+// SCENARIO 18: PV-overflow damping window (user report
+// 2026-08-24) — "why do you feed in at 08:30 and not 08:00?
+// the price is better at 08:00". It was: 20.50ct against the
+// 16.82ct we actually sold at. The 08:00 run already saw a real
+// saturation wall (21.3% projected spill), but dampOverflow()
+// clamps every overflow quantity to its rolling MINIMUM over the
+// last OVERFLOW_DAMP_SLOTS slots, and with a 4-slot window the
+// wall-free 07:00-07:30 runs were still inside it. So
+// `pvOnlyOverflow` read 0.0%, nothing qualified as
+// curtailment-bound, the cross-day hold (tomorrow's peak minus
+// slack) blocked the morning outright, and the 20.50ct slot went
+// by unsold — the budget only unlocked at 08:30, by which time
+// the best pre-wall slot was gone.
+//
+// The window is 2, so a wall must survive one further run — no
+// more — before it can unlock feed-in. Three runs against one
+// shared context pin both directions at once:
+//   07:30 wall-free
+//   07:45 FIRST run with spill  -> must NOT unlock (a single-run
+//         forecast wobble is exactly what the damping exists to
+//         swallow; 06:45 on 08-23 and 08-24 were such wobbles)
+//   08:00 SECOND run with spill -> must unlock, and the morning
+//         slots must be the ones that get sold
+// The window is bracketed from both sides: at 1 the 07:45 run
+// unlocks and the wobble guard is gone; at 4 the 08:00 run is
+// still held and the reported miss comes back.
+// =========================================================
+function scenario18_dampingWindowUnlocksOnSecondRun() {
+    console.log('\n=== SCENARIO 18: Overflow damping unlocks on the second spill run, not the first ===');
+
+    // 2026-08-24, the reported morning. Runs at 07:30 / 07:45 / 08:00 Berlin.
+    const NOW_A = Date.UTC(2026, 7, 24, 5, 30);
+    const NOW_B = NOW_A + 15 * 60 * 1000;
+    const NOW_C = NOW_A + 30 * 60 * 1000;
+
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW_A)) / 86400000);
+
+    // 36h of prices, so tomorrow's evening peak sits BEYOND the refill horizon
+    // and arms the cross-day hold — that hold is what made the reported case
+    // turn entirely on the curtailment-bound exemption. Today's own evening is
+    // deliberately left under the hold floor (22ct) so it cannot quietly soak
+    // the budget and mask the morning result.
+    const prices = buildPriceArray(NOW_A, 156, (t) => {
+        const h = berlinHour(t), day = dayOffset(t);
+        if (day === 0) {
+            if (h < 10) return 18;          // the morning window the user asked about
+            if (h < 19) return 9;           // the price a runtime dump would fetch
+            return 15;                      // tonight: below the hold floor
+        }
+        if (h >= 19 && h < 22) return 25;   // tomorrow's peak, beyond the horizon
+        if (h >= 9 && h < 15) return 9;
+        return 12;
+    });
+
+    const buildSolar = (minutesPerHour) => {
+        const out = [];
+        for (let h = 0; h < 40; h++) {
+            const t = NOW_A + h * 3600000;
+            const hour = berlinHour(t);
+            out.push({ time: t, sunshineDurationInMinutes: hour >= 7 && hour <= 19 ? minutesPerHour : 0 });
+        }
+        return out;
+    };
+    // The forecast jump that starts the episode: 07:30 sees nothing worth
+    // saturating for, 07:45 onward sees the day that actually happened.
+    const solarWeak = buildSolar(2);
+    const solarStrong = buildSolar(45);
+
+    const buildMsg = (now, solar, pvNow) => ({
+        payload: {
+            soc: [{ time: now, soc: 88 }],
+            acload: [{ time: now, acload: 700 }],
+            // Feed-in delivering as commanded, so the under-delivery guard
+            // (which would otherwise trip on run C after run B commanded a
+            // feed-in) stays out of the way.
+            power: [{ time: now, power: -3000 }],
+            pv_now: [{ time: now, pv_now: pvNow }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(now),
+            pv_history: buildPvHistory(now)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 7, 24, 3, 50)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 7, 24, 18, 15)).toISOString(),
+            solarradiation: 600,
+            rainrate: 0
+        }
+    });
+
+    // One store across all three runs: `overflowHist` is the state under test,
+    // and it only carries if global context survives between runs.
+    const store = {};
+    const runAt = (now, solar, pvNow) => {
+        const result = withMockedNow(now, () => runOptimizer(buildMsg(now, solar, pvNow), store));
+        return { schedule: getSchedule(result), warns: warnLog.slice() };
+    };
+
+    const runA = runAt(NOW_A, solarWeak, 300);
+    const runB = runAt(NOW_B, solarStrong, 1500);
+    const runC = runAt(NOW_C, solarStrong, 1500);
+
+    const wallOf = r => (r.warns.find(w => w.includes('Phase 3c:')) || '');
+    const spillOf = r => {
+        const m = /PV saturation wall at idx=(-?\d+) \(([\d.]+)% spill\)/.exec(wallOf(r));
+        return m ? parseFloat(m[2]) : 0;
+    };
+    const exemptOf = r => {
+        const m = /curtailment-bound ([\d.]+)% still sells/.exec(r.warns.find(w => w.includes('Cross-day hold')) || '');
+        return m ? parseFloat(m[1]) : null;
+    };
+    const presatOf = r => r.warns.find(w => w.includes('Phase 3d pre-saturation'));
+    const morning = r => r.schedule.filter(s =>
+        typeof s.time === 'string' && s.time.includes('24.08.')
+        && parseInt(String(s.time).slice(-5, -3), 10) < 10);
+    // Only PLANNED feed-in counts. A slot can also reach state 4 through Phase
+    // 4's reactive "battery curtailing 100%" branch — that is the pack already
+    // full and spilling, i.e. the outcome the pre-saturation pass is supposed
+    // to pre-empt, not evidence that the budget unlocked.
+    const planned = r => morning(r).filter(s => s.state === 4 && /Planned feed-in/.test(String(s.reason)));
+    const reactive = r => morning(r).filter(s => s.state === 4 && /curtailing/.test(String(s.reason)));
+
+    for (const [label, r] of [['07:30', runA], ['07:45', runB], ['08:00', runC]]) {
+        const ex = exemptOf(r);
+        console.log(`  ${label} run: spill=${spillOf(r).toFixed(1)}% `
+            + `curtailment-bound=${ex === null ? 'n/a' : ex.toFixed(1) + '%'} `
+            + `morning planned=${planned(r).length} reactive-dump=${reactive(r).length}`
+            + `${presatOf(r) ? ' [' + presatOf(r) + ']' : ''}`);
+    }
+
+    // Setup sanity: the episode only means something if the wall is INVISIBLE
+    // at 07:30 and VISIBLE (raw, undamped) at both 07:45 and 08:00, and if the
+    // cross-day hold is actually armed. Otherwise we are testing PV assumptions
+    // or price ranking, not the damping window.
+    if (spillOf(runA) > 0) {
+        console.error(`  setup drift: the 07:30 run already projects ${spillOf(runA).toFixed(1)}% spill — `
+            + 'the weak forecast is no longer wall-free');
+        return false;
+    }
+    if (spillOf(runB) < 5 || spillOf(runC) < 5) {
+        console.error(`  setup drift: spill ${spillOf(runB).toFixed(1)}% / ${spillOf(runC).toFixed(1)}% at 07:45 / 08:00 — `
+            + 'the strong forecast no longer clears PV_CURTAIL_MIN_SOC');
+        return false;
+    }
+    if (exemptOf(runB) === null || exemptOf(runC) === null) {
+        console.error('  setup drift: cross-day hold not armed — tomorrow\'s peak no longer lies beyond the horizon, '
+            + 'so the morning is not gated on the curtailment-bound exemption');
+        return false;
+    }
+
+    // Direction 1 — the wobble guard. The 07:45 run SEES the wall and still
+    // reports nothing curtailment-bound, because one run of spill is not
+    // evidence: the wall-free 07:30 entry is still in the window and the
+    // rolling min is 0. With the exemption shut, the 18ct morning sits under
+    // the 22ct hold floor and cannot be sold.
+    if (exemptOf(runB) !== 0 || presatOf(runB) || planned(runB).length > 0) {
+        console.error(`  FAIL: the FIRST spill run (07:45) already unlocked feed-in `
+            + `(curtailment-bound ${exemptOf(runB)}%, ${planned(runB).length} planned morning slot(s)) — `
+            + 'a single-run forecast wobble now moves the plan');
+        return false;
+    }
+
+    // Direction 2 — the miss the user reported. Two consecutive runs of spill
+    // is the whole evidence bar; the 08:00 morning must sell at 18ct rather
+    // than wait for a later run and a worse price.
+    if (exemptOf(runC) < 5) {
+        console.error(`  FAIL: the SECOND spill run (08:00) still reports only ${exemptOf(runC).toFixed(1)}% `
+            + 'curtailment-bound — the damping window is wider than 2 slots');
+        return false;
+    }
+    if (planned(runC).length === 0) {
+        console.error('  FAIL: 08:00 unlocked the exemption but planned no morning feed-in; '
+            + `the overflow will reach the pack anyway and dump at the 9ct midday price `
+            + `(${reactive(runC).length} reactive curtailment slot(s) in the morning)`);
+        return false;
+    }
+    // The point of selling BEFORE the wall is headroom: SOC must fall across
+    // the morning, not ride up to the curtailment line and spill.
+    const socStart = morning(runC)[0].predictedSoc;
+    const socEnd = morning(runC)[morning(runC).length - 1].predictedSoc;
+    if (socEnd >= socStart) {
+        console.error(`  FAIL: 08:00 sold ${planned(runC).length} morning slot(s) but SOC still rose `
+            + `${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}% — no headroom created ahead of the wall`);
+        return false;
+    }
+
+    console.log(`  PASS: 07:45 saw ${spillOf(runB).toFixed(1)}% spill and held (curtailment-bound 0.0%, `
+        + `${reactive(runB).length} morning slot(s) left to dump reactively at 100%); `
+        + `08:00 confirmed it (${exemptOf(runC).toFixed(1)}%) and sold ${planned(runC).length} morning slot(s) `
+        + `at 18ct under a 22ct hold floor, SOC ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}%`);
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -1621,7 +1817,8 @@ const results = [
     ['pre-saturation morning feed-in', scenario14_preSaturationMorningFeedIn],
     ['feed-in guard ignores stale sample', scenario15_feedinGuardIgnoresStaleSample],
     ['SOC staleness guard',           scenario16_socStalenessGuard],
-    ['saturating refill unlocks evening peak', scenario17_saturatingRefillUnlocksEveningPeak]
+    ['saturating refill unlocks evening peak', scenario17_saturatingRefillUnlocksEveningPeak],
+    ['damping window unlocks on second spill run', scenario18_dampingWindowUnlocksOnSecondRun]
 ];
 
 let passed = 0;
