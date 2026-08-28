@@ -50,6 +50,8 @@ function runOptimizer(msg, globalStore) {
     return fn(msg, node, flow, global);
 }
 
+const PRESAT_RAW_MAX_REGRET_CT_DOC = (/const PRESAT_RAW_MAX_REGRET_CT = (\d+)/.exec(SRC) || [, '?'])[1];
+
 // --- Scenario builders ---
 
 function buildPriceArray(startMs, slots, priceFn) {
@@ -1799,6 +1801,190 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     return true;
 }
 
+function scenario19_rawSpillExemptionBoundedByRegret() {
+    console.log('\n=== SCENARIO 19: Raw-spill exemption sells a near-floor morning on the first spill run, and only that ===');
+
+    // Same three-run episode as scenario 18 (the wall appears at 07:45), but
+    // the morning price is the variable. The cross-day hold floor is 22ct
+    // throughout (25ct peak beyond the horizon, minus CROSSDAY_HOLD_SLACK_CT).
+    //
+    //   in-band  21ct -> 1ct of regret if the wall is a wobble  -> may sell at 07:45
+    //   far      18ct -> 4ct of regret                          -> must wait for 08:00
+    //
+    // The 18ct case is the 2026-08-27 07:45 wobble to scale: that run projected
+    // 20.8% spill at 17.05ct against a 21.31ct floor, and the 08:00 run projected
+    // no wall at all. Selling it would have cost 4.3ct/kWh against a peak that
+    // was still coming.
+    const NOW_A = Date.UTC(2026, 7, 24, 5, 30);
+    const NOW_B = NOW_A + 15 * 60 * 1000;
+    const NOW_C = NOW_A + 30 * 60 * 1000;
+
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW_A)) / 86400000);
+
+    const buildPrices = (morningCt) => buildPriceArray(NOW_A, 156, (t) => {
+        const h = berlinHour(t), day = dayOffset(t);
+        if (day === 0) {
+            if (h < 10) return morningCt;   // the pre-wall window under test
+            if (h < 19) return 9;           // what a runtime dump would fetch
+            return 15;                      // tonight: well under the hold floor
+        }
+        if (h >= 19 && h < 22) return 25;   // tomorrow's peak, beyond the horizon
+        if (h >= 9 && h < 15) return 9;
+        return 12;
+    });
+
+    const buildSolar = (minutesPerHour) => {
+        const out = [];
+        for (let h = 0; h < 40; h++) {
+            const t = NOW_A + h * 3600000;
+            const hour = berlinHour(t);
+            out.push({ time: t, sunshineDurationInMinutes: hour >= 7 && hour <= 19 ? minutesPerHour : 0 });
+        }
+        return out;
+    };
+    const solarWeak = buildSolar(2);
+    const solarStrong = buildSolar(45);
+
+    const buildMsg = (now, prices, solar, pvNow) => ({
+        payload: {
+            soc: [{ time: now, soc: 88 }],
+            acload: [{ time: now, acload: 700 }],
+            power: [{ time: now, power: -3000 }],
+            pv_now: [{ time: now, pv_now: pvNow }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(now),
+            pv_history: buildPvHistory(now)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 7, 24, 3, 50)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 7, 24, 18, 15)).toISOString(),
+            solarradiation: 600,
+            rainrate: 0
+        }
+    });
+
+    // One episode = one global store, so overflowHist and crossDayHold carry.
+    const runEpisode = (morningCt) => {
+        const prices = buildPrices(morningCt);
+        const store = {};
+        const at = (now, solar, pvNow) => {
+            const result = withMockedNow(now, () => runOptimizer(buildMsg(now, prices, solar, pvNow), store));
+            return { schedule: getSchedule(result), warns: warnLog.slice() };
+        };
+        return {
+            A: at(NOW_A, solarWeak, 300),
+            B: at(NOW_B, solarStrong, 1500),
+            C: at(NOW_C, solarStrong, 1500)
+        };
+    };
+
+    const spillOf = r => {
+        const m = /PV saturation wall at idx=(-?\d+) \(([\d.]+)% spill\)/.exec(r.warns.find(w => w.includes('Phase 3c:')) || '');
+        return m ? parseFloat(m[2]) : 0;
+    };
+    const floorOf = r => {
+        const m = /feed-in below ([\d.]+)ct/.exec(r.warns.find(w => w.includes('Cross-day hold')) || '');
+        return m ? parseFloat(m[1]) : null;
+    };
+    const presatOf = r => r.warns.find(w => w.includes('Phase 3d pre-saturation')) || '';
+    const usedRawPath = r => /raw-spill exemption/.test(presatOf(r));
+    const morning = r => r.schedule.filter(s =>
+        typeof s.time === 'string' && s.time.includes('24.08.')
+        && parseInt(String(s.time).slice(-5, -3), 10) < 10);
+    const planned = r => morning(r).filter(s => s.state === 4 && /Planned feed-in/.test(String(s.reason)));
+    // Tonight is 15ct, far under the 22ct floor and not a PV-surplus slot, so
+    // it may only ever sell out of the DAMPED exemption. It is the tripwire for
+    // the raw budget leaking out of pass 1 into the mp-DESC pass.
+    const tonight = r => r.schedule.filter(s =>
+        typeof s.time === 'string' && s.time.includes('24.08.')
+        && parseInt(String(s.time).slice(-5, -3), 10) >= 19
+        && s.state === 4 && /Planned feed-in/.test(String(s.reason)));
+    const drawn = r => {
+        const m = morning(r);
+        return m.length ? m[0].predictedSoc - m[m.length - 1].predictedSoc : 0;
+    };
+
+    const inBand = runEpisode(21);
+    const farBand = runEpisode(18);
+
+    for (const [label, ep] of [['21ct (in band)', inBand], ['18ct (4ct regret)', farBand]]) {
+        console.log(`  ${label}: floor=${floorOf(ep.B)}ct spill@07:45=${spillOf(ep.B).toFixed(1)}% `
+            + `07:45 planned=${planned(ep.B).length} raw=${usedRawPath(ep.B)} drawn=${drawn(ep.B).toFixed(1)}% | `
+            + `08:00 planned=${planned(ep.C).length} drawn=${drawn(ep.C).toFixed(1)}%`);
+    }
+
+    // Setup sanity: without an armed hold and a wall that is invisible at 07:30
+    // and raw-visible at 07:45, this tests nothing.
+    if (spillOf(inBand.A) > 0 || spillOf(inBand.B) < 5) {
+        console.error(`  setup drift: spill ${spillOf(inBand.A).toFixed(1)}% at 07:30 / `
+            + `${spillOf(inBand.B).toFixed(1)}% at 07:45 — the episode no longer starts with a fresh wall`);
+        return false;
+    }
+    if (floorOf(inBand.B) === null || floorOf(farBand.B) === null) {
+        console.error('  setup drift: cross-day hold not armed, so nothing gates the morning');
+        return false;
+    }
+    if (!(inBand.B.schedule.length && 21 < floorOf(inBand.B) && 21 >= floorOf(inBand.B) - 2)) {
+        console.error(`  setup drift: 21ct is no longer inside the ${PRESAT_RAW_MAX_REGRET_CT_DOC}ct band under the `
+            + `${floorOf(inBand.B)}ct floor`);
+        return false;
+    }
+
+    // Direction 1 — the near-floor morning is taken on the FIRST spill run,
+    // via the raw path, without waiting for damping to confirm the wall.
+    if (planned(inBand.B).length === 0 || !usedRawPath(inBand.B)) {
+        console.error(`  FAIL: 07:45 sold ${planned(inBand.B).length} morning slot(s) at 21ct under a `
+            + `${floorOf(inBand.B)}ct floor and did not use the raw-spill exemption — the first spill run still `
+            + 'waits a slot while the best pre-wall price decays');
+        return false;
+    }
+    // Headroom is relative, not absolute: under a wall this steep the morning PV
+    // outruns any feed-in, so SOC still climbs. The 18ct episode is the same
+    // morning with the sale blocked, so the gap between them IS the headroom the
+    // raw path bought.
+    if (!(drawn(inBand.B) > drawn(farBand.B))) {
+        console.error(`  FAIL: 07:45 planned feed-in but ended the morning at the same SOC as the blocked `
+            + `18ct episode (${drawn(inBand.B).toFixed(1)}% vs ${drawn(farBand.B).toFixed(1)}%) — `
+            + 'no headroom created ahead of the wall');
+        return false;
+    }
+
+    // Direction 2 — the bet stays bounded. The unconfirmed run may only sell a
+    // fraction of what the confirmed run sells.
+    if (!(drawn(inBand.B) < drawn(inBand.C))) {
+        console.error(`  FAIL: 07:45 drew ${drawn(inBand.B).toFixed(1)}% against ${drawn(inBand.C).toFixed(1)}% at 08:00 — `
+            + 'the unconfirmed run is not spending less than the confirmed one');
+        return false;
+    }
+    if (tonight(inBand.B).length > 0) {
+        console.error(`  FAIL: the raw budget reached tonight's 15ct slots (${tonight(inBand.B).length} planned) — `
+            + 'the exemption leaked out of pass 1 into the mp-DESC pass');
+        return false;
+    }
+
+    // Direction 3 — the regret bound. A morning 4ct under the floor is exactly
+    // the 2026-08-27 wobble, and must still wait for confirmation.
+    if (planned(farBand.B).length > 0) {
+        console.error(`  FAIL: 07:45 sold ${planned(farBand.B).length} morning slot(s) at 18ct under a `
+            + `${floorOf(farBand.B)}ct floor — a one-run wobble now costs 4ct/kWh against the peak we are holding for`);
+        return false;
+    }
+    if (planned(farBand.C).length === 0) {
+        console.error('  FAIL: 18ct morning never sold, not even on the confirmed 08:00 run — '
+            + 'the regret bound has swallowed the damped path too');
+        return false;
+    }
+
+    console.log(`  PASS: 21ct (1ct under the ${floorOf(inBand.B)}ct floor) sold ${planned(inBand.B).length} slot(s) at 07:45 `
+        + `on the raw exemption, ${(drawn(inBand.B) - drawn(farBand.B)).toFixed(1)}% more headroom than the blocked episode `
+        + `and ${planned(inBand.C).length} slot(s)/${drawn(inBand.C).toFixed(1)}% once confirmed, tonight untouched; `
+        + `18ct (4ct under) held at 07:45 and sold ${planned(farBand.C).length} slot(s) at 08:00`);
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -1818,7 +2004,8 @@ const results = [
     ['feed-in guard ignores stale sample', scenario15_feedinGuardIgnoresStaleSample],
     ['SOC staleness guard',           scenario16_socStalenessGuard],
     ['saturating refill unlocks evening peak', scenario17_saturatingRefillUnlocksEveningPeak],
-    ['damping window unlocks on second spill run', scenario18_dampingWindowUnlocksOnSecondRun]
+    ['damping window unlocks on second spill run', scenario18_dampingWindowUnlocksOnSecondRun],
+    ['raw-spill exemption bounded by regret',     scenario19_rawSpillExemptionBoundedByRegret]
 ];
 
 let passed = 0;

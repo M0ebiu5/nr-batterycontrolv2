@@ -19,6 +19,8 @@ const BASE_GRID_FEE = 13; // ct/kWh
 const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear + inverter losses exceed sub-ct revenue)
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
 const PRESAT_MIN_GAIN_CT = 3; // Phase 3d pass 1: a pre-saturation drain must beat the price the same energy would fetch when Phase 4's runtime branch dumps it during saturation. Guards the pre-drain against becoming a low-price midday sale (see the "never pre-drain at low midday prices to make room for PV" rule): the hurdle is the realistic alternative price, not zero. 3 ct ≈ the observed 10–15 ct dump band vs 17–20 ct pre-saturation prices, so it fires on genuine spreads and stays quiet on near-ties.
+const PRESAT_RAW_EXEMPT_FRAC = 0.35; // Phase 3d pass 1 only: fraction of the UNDAMPED PV-only spill that may be treated as curtailment-bound on the FIRST run a saturation wall appears, before dampOverflow has confirmed it. The damping window is right for the mp-DESC pass (a 2026-07-28-style forecast spike there empties the pack past the evening peak) but it also costs pass 1 the best pre-wall price on every strong-PV morning, because the wall shows up mid-morning and the good slots decay 2-3 ct while the window fills (2026-08-24: 20.50 -> 18.04 ct). A wall can still evaporate in one slot (2026-08-27 07:45 projected 20.8% spill; the 08:00 run projected none), so this only ever bets a fraction, and only inside the price band set by PRESAT_RAW_MAX_REGRET_CT.
+const PRESAT_RAW_MAX_REGRET_CT = 2; // Phase 3d pass 1 raw-spill exemption: how much per kWh we are willing to lose against the peak the cross-day hold is protecting, if the unconfirmed wall turns out to be a wobble. Only slots priced within this much of the hold floor may use the raw exemption, so the downside of a phantom wall is bounded at (floor - slot mp) <= 2 ct/kWh on <= PRESAT_RAW_EXEMPT_FRAC of the projected spill, against an upside of the full 3-8 ct spread between a pre-wall morning price and the midday dump band. Sized so the 2026-08-27 07:45 wobble (17.05 ct against a 21.31 ct floor, 4.3 ct of regret) is refused while a near-floor morning slot is taken.
 const PV_CURTAIL_MIN_SOC = 5;   // a PV-ONLY projection must overflow by at least this much SOC (~1.5 kWh) before the planner accepts "PV will saturate the pack" as real. 0.6% of phantom overflow on a bad-PV day (74 sun-min) once unlocked PV-opportunity pricing and let a 22.39ct evening feed-in pass against a 14ct real grid refill. The same floor now also gates the Phase 3c saturation wall and the Phase 3d free-refill test, so a single forecast wobble cannot rewrite the plan.
 const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
 const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
@@ -1697,10 +1699,16 @@ let satStartIdx = -1;
         if (satRun.length) satDumpPrice = satRun.reduce((a, b) => a + b, 0) / satRun.length;
     }
 
-    const planSlot = (s, idx, budgetCap) => {
+    // `exemptSoc` overrides the curtailment-bound budget that clears the
+    // cross-day hold. Only Phase 3d pass 1 passes it (see the raw-spill
+    // exemption there); every other caller gets the damped pvOnlyOverflow.
+    const planSlot = (s, idx, budgetCap, exemptSoc) => {
         const relief = feedinReliefSoc(s);
         if (relief <= 0) return false;
         if (usedBudget >= budgetCap) return 'full';
+        const holdExemptSoc = typeof exemptSoc === 'number' && isFinite(exemptSoc)
+            ? Math.max(pvOnlyOverflow, exemptSoc)
+            : pvOnlyOverflow;
         const isLate = idx > lastPlannedChargeIdx;
         const slotReplacementPrice = isLate ? replacementPriceLate : replacementPriceEarly;
         const slotEligibleOverflow = isLate ? eligibleOverflowLate : pvOnlyOverflow;
@@ -1720,7 +1728,7 @@ let satStartIdx = -1;
         // portion (within pvOnlyOverflow — real in-schedule PV curtailment that
         // would be lost if held), NOT the postSched-inclusive isOverflowOnly
         // budget (post-schedule overflow is speculative and days past the peak).
-        const genuineOverflowExempt = (usedBudget + relief <= pvOnlyOverflow)
+        const genuineOverflowExempt = (usedBudget + relief <= holdExemptSoc)
             && (isLate || s.pvPower > s.loadEst);
         if (!genuineOverflowExempt && s.marketPrice < futurePeakHoldPrice) return false;
         if (!isOverflowOnly && (blindToTomorrow || s.marketPrice <= slotReplacementPrice + FEEDIN_ROUNDTRIP_MARGIN_CT)) return false;
@@ -1746,19 +1754,50 @@ let satStartIdx = -1;
     // pre-drain that trades evening-peak SOC for cheap daytime revenue — the
     // hurdle is the price the energy would otherwise fetch, not zero.
     if (satStartIdx >= 0 && isFinite(satDumpPrice)) {
-        const presatCap = Math.min(feedinBudgetSoc, Math.max(0, overflowSoc));
+        // Raw-spill exemption. On the first run a wall appears, dampOverflow
+        // still reports 0, so the ONE gate that stays shut is the cross-day
+        // hold's curtailment-bound exemption — the budget itself, the
+        // round-trip check and the mp-DESC pass are all unaffected by it here.
+        // Open exactly that gate, for pass 1 only, and bound the bet on both
+        // sides: at most PRESAT_RAW_EXEMPT_FRAC of the undamped spill
+        // (quantity), and only for slots within PRESAT_RAW_MAX_REGRET_CT of
+        // the hold floor (price). A slot already at or above the floor never
+        // needed the exemption, so the raw path only ever reaches into a
+        // 2 ct band just underneath it. If the wall was a wobble we gave up
+        // <= 2 ct/kWh on <= 35% of a spill that never happens; if it was real
+        // we kept a morning price instead of a midday dump price.
+        // Requires the hold to actually be armed: with no floor there is
+        // nothing for the exemption to clear, and widening the cap on an
+        // unconfirmed forecast would be the 2026-07-28 spike all over again.
+        const holdArmed = isFinite(futurePeakHoldPrice);
+        const presatRawExempt = (holdArmed && pvOnlyOverflowRaw >= PV_CURTAIL_MIN_SOC)
+            ? Math.max(pvOnlyOverflow, pvOnlyOverflowRaw * PRESAT_RAW_EXEMPT_FRAC)
+            : pvOnlyOverflow;
+        const presatCap = Math.min(feedinBudgetSoc, Math.max(0, overflowSoc, presatRawExempt));
         const presat = candidates.filter(({ idx, s }) =>
             idx < satStartIdx && s.marketPrice >= satDumpPrice + PRESAT_MIN_GAIN_CT);
         let picked = 0;
+        let usedRaw = false;
         for (const { s, idx } of presat) {
-            const r = planSlot(s, idx, presatCap);
+            const inRegretBand = holdArmed
+                && s.marketPrice < futurePeakHoldPrice
+                && s.marketPrice >= futurePeakHoldPrice - PRESAT_RAW_MAX_REGRET_CT;
+            const slotExempt = inRegretBand ? presatRawExempt : pvOnlyOverflow;
+            const r = planSlot(s, idx, presatCap, slotExempt);
             if (r === 'full') break;
-            if (r) picked++;
+            if (r) {
+                picked++;
+                // The slot only needed the raw path if the damped exemption
+                // could not have covered it on its own.
+                if (inRegretBand && usedBudget > pvOnlyOverflow) usedRaw = true;
+            }
         }
         if (picked > 0) {
             node.warn(`Phase 3d pre-saturation: ${picked} slot(s) before idx=${satStartIdx} `
                 + `(dump would fetch ${satDumpPrice.toFixed(1)}ct, hurdle ${(satDumpPrice + PRESAT_MIN_GAIN_CT).toFixed(1)}ct, `
-                + `cap ${presatCap.toFixed(1)}%)`);
+                + `cap ${presatCap.toFixed(1)}%`
+                + `${usedRaw ? `, raw-spill exemption ${presatRawExempt.toFixed(1)}% of ${pvOnlyOverflowRaw.toFixed(1)}% unconfirmed spill, `
+                    + `floor ${futurePeakHoldPrice.toFixed(1)}ct` : ''})`);
         }
     }
 
