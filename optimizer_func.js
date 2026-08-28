@@ -1261,19 +1261,42 @@ function feedinReliefSoc(slot) {
 }
 
 // Find the rolling horizon by walking passive SOC (PV-load only) and
-// looking for a dip-and-recover pattern RELATIVE to the running peak:
-// flag `dipped` once SOC falls ≥5 points below the max seen so far,
-// then close the horizon at the first slot within 3 points of that peak.
+// looking for a dip-and-recover pattern. The DIP is measured against the
+// running peak (SOC must fall ≥5 points below the max seen so far); the
+// RECOVERY is measured off the TROUGH, not back up to that peak — the
+// horizon closes at the first PV-surplus slot where SOC has climbed
+// HORIZON_RECOVER_PCT points above the low.
 // Absolute thresholds (was: <70 / ≥85) missed cases where starting SOC
 // was already high enough that the overnight trough never broke 70 —
 // horizon would stay at schedule end, budget would collapse to 0, and
-// a legitimate evening peak wouldn't be picked for feed-in. Flat or
-// cloudy stretches never satisfy the 5-point dip, so horizon still
-// falls through to schedule end in those cases (end-floor path).
+// a legitimate evening peak wouldn't be picked for feed-in. Anchoring the
+// recovery to the running peak had the same failure in a subtler form: it
+// made the horizon depend on where we happened to START. On 2026-08-28 the
+// pack was still at 87.2% at 18:45, so the peak WAS the starting SOC and
+// the next day's passive refill (trough 63.8% → 83.4%) never came within 3
+// points of it. Horizon fell through to schedule end, tomorrow evening's
+// 21–22ct block entered the feed-in candidate list, and the greedy mp-DESC
+// pass spent the whole budget there — leaving today's 20.35ct evening peak
+// (the day's best) unsold. Three runs later, at 19:15 with start SOC 85.6%,
+// the same forecast DID clear the test: horizon snapped back to tomorrow's
+// refill and those next-day picks were discarded in favour of tonight's
+// 19.46/19.99/19.72ct. Nothing about the refill had changed — only the
+// starting SOC. Off the trough the test is start-SOC independent, so the
+// candidate window stays confined to the current cycle and tonight's peak
+// competes only against tonight.
+// Closing earlier is the conservative direction for the budget below:
+// horizonIsRefill=true with no free refill ahead collapses the budget to
+// overflow-only, and the cross-day hold arms on the slots beyond the
+// horizon. Flat or cloudy stretches still never satisfy the 5-point dip,
+// and a recovery that isn't PV-driven (an overnight load lull) doesn't
+// close the horizon either — both still fall through to schedule end
+// (end-floor path).
+const HORIZON_RECOVER_PCT = 5;
 let horizonIdx = schedule.length;
 {
     let testSoc = currentSoc;
     let peakSoc = currentSoc;
+    let troughSoc = currentSoc;
     let dipped = false;
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
@@ -1281,10 +1304,11 @@ let horizonIdx = schedule.length;
         testSoc = Math.max(MIN_SOC_PCT, Math.min(100, testSoc));
         if (testSoc > peakSoc) peakSoc = testSoc;
         if (peakSoc - testSoc >= 5) dipped = true;
-        if (dipped && peakSoc - testSoc <= 3) {
+        if (dipped && s.pvPower > s.loadEst && testSoc - troughSoc >= HORIZON_RECOVER_PCT) {
             horizonIdx = i + 1; // include the refill slot itself
             break;
         }
+        if (testSoc < troughSoc) troughSoc = testSoc;
     }
 }
 

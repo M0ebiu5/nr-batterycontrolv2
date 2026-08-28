@@ -1985,6 +1985,112 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
     return true;
 }
 
+// =========================================================
+// SCENARIO 20: User report 2026-08-28 — the day's best evening
+// slot (20.35ct at 18:45) idled while 19.46ct at 20:00 sold.
+// The pack was still at 87% when the peak arrived, so the
+// horizon walk's running peak WAS the starting SOC and the next
+// day's refill never came within 3 points of it: the horizon
+// fell through to schedule end, tomorrow evening's 20.5-22.4ct
+// block entered the feed-in candidate list, and the greedy
+// mp-DESC pass spent the budget there. Half an hour later the
+// horizon closed normally and those next-day picks were dropped.
+// Recovery measured off the TROUGH is start-SOC independent, so
+// the candidate window stays inside this cycle and tonight's
+// peak competes only against tonight.
+// =========================================================
+function scenario20_horizonAnchoredToTrough() {
+    console.log('\n=== SCENARIO 20: Evening peak must not be outbid by tomorrow (start-SOC-independent horizon) ===');
+
+    const NOW = Date.UTC(2026, 7, 28, 16, 0); // 2026-08-28 18:00 Berlin
+    const slots = 120;                        // → 2026-08-29 23:45 Berlin
+
+    const berlinHour = (t) => (new Date(t).getUTCHours() + 2) % 24;
+    const berlinMin = (t) => new Date(t).getUTCMinutes();
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); };
+    const dayOffset = (t) => Math.round((bDay(t) - bDay(NOW)) / 86400000);
+
+    const TODAY_PEAK_CT = 20.35;
+    const prices = buildPriceArray(NOW, slots, (t) => {
+        const h = berlinHour(t), m = berlinMin(t), day = dayOffset(t);
+        if (day === 0) {                                  // tonight
+            if (h === 18 && m === 45) return TODAY_PEAK_CT; // the day's best slot
+            if (h === 20 && m === 0) return 19.46;          // what actually sold
+            if (h === 21 && m === 0) return 19.99;
+            if (h === 23 && m === 0) return 19.72;
+            return 18.0;                                    // rest of tonight, under the hold floor
+        }
+        if (h < 7) return 13;
+        if (h >= 7 && h < 17) return 1.5;                 // tomorrow's cheap PV midday
+        if (h >= 17 && h < 19) return 20.5;               // tomorrow evening block …
+        if (h === 19 && m === 45) return 22.4;            // … topped by the cross-day peak
+        if (h >= 19 && h < 23) return 21.5;
+        return 18;
+    });
+
+    // PV baseline tuned to the reported day: tomorrow lifts the pack ~20 points
+    // off the overnight trough but never back to today's 88% — exactly the case
+    // the peak-anchored test could not close.
+    const pvHistory = [];
+    for (let day = 1; day <= 10; day++) {
+        const past = new Date(NOW - day * 86400000);
+        const dayMidnightUtc = Date.UTC(past.getUTCFullYear(), past.getUTCMonth(), past.getUTCDate(), -2, 0);
+        for (let h = 0; h < 24; h++) {
+            const pv = (h >= 7 && h <= 18) ? Math.max(0, 1500 * Math.sin(Math.PI * (h - 7) / 11)) : 0;
+            pvHistory.push({ time: dayMidnightUtc + h * 3600000, avg_pv: pv > 100 ? pv : null, max_pv: pv > 100 ? pv * 1.2 : null });
+        }
+    }
+
+    const msg = {
+        payload: {
+            soc: [{ time: NOW, soc: 88.5 }],
+            acload: [{ time: NOW, acload: 700 }],
+            power: [{ time: NOW, power: 0 }],
+            pv_now: [{ time: NOW, pv_now: 200 }],
+            prices,
+            solar: buildSolarForecast(NOW, 30),
+            load_history: buildLoadHistory(NOW),
+            pv_history: pvHistory
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 7, 28, 4, 15)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 7, 28, 18, 15)).toISOString(),
+            solarradiation: 80,
+            rainrate: 0
+        }
+    };
+
+    const result = withMockedNow(NOW, () => runOptimizer(msg));
+    const schedule = getSchedule(result);
+
+    const parseT = (s) => {
+        const m = String(s.time).match(/(\d{2})\.(\d{2})\.,?\s+(\d{2}):(\d{2})/);
+        return m ? { dd: +m[1], mm: +m[2], hh: +m[3], mi: +m[4] } : null;
+    };
+    const isToday = (s) => { const p = parseT(s); return p && p.dd === 28 && p.mm === 8; };
+
+    const peakSlot = schedule.find(s => isToday(s) && Math.abs(s.marketPrice - TODAY_PEAK_CT) < 0.01);
+    const tonight = schedule.filter(s => isToday(s) && parseT(s).hh >= 18);
+    const sold = tonight.filter(s => s.state === 4);
+    const soldBelowFloor = sold.filter(s => s.marketPrice < 19.4);
+
+    console.log(`  tonight sold ${sold.length} slot(s) at ${sold.map(s => s.marketPrice.toFixed(2)).join('/') || '—'}ct`);
+    if (peakSlot) console.log(`  ${TODAY_PEAK_CT}ct peak: ${fmtSlot(peakSlot)}`);
+
+    if (!peakSlot) { console.error('  setup error: 20.35ct slot not in schedule'); return false; }
+    if (peakSlot.state !== 4) {
+        console.error(`  FAIL: the day's best slot (${TODAY_PEAK_CT}ct) idled at state ${peakSlot.state} while ${sold.length} cheaper slot(s) sold`);
+        return false;
+    }
+    if (soldBelowFloor.length) {
+        console.error(`  FAIL: ${soldBelowFloor.length} slot(s) sold below the cross-day hold floor`);
+        soldBelowFloor.slice(0, 5).forEach(s => console.error('   ', fmtSlot(s)));
+        return false;
+    }
+    console.log(`  PASS: the ${TODAY_PEAK_CT}ct peak sells; nothing below the 19.4ct cross-day floor does`);
+    return true;
+}
+
 // --- Run all ---
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
@@ -2005,7 +2111,8 @@ const results = [
     ['SOC staleness guard',           scenario16_socStalenessGuard],
     ['saturating refill unlocks evening peak', scenario17_saturatingRefillUnlocksEveningPeak],
     ['damping window unlocks on second spill run', scenario18_dampingWindowUnlocksOnSecondRun],
-    ['raw-spill exemption bounded by regret',     scenario19_rawSpillExemptionBoundedByRegret]
+    ['raw-spill exemption bounded by regret',     scenario19_rawSpillExemptionBoundedByRegret],
+    ['evening peak not outbid by tomorrow',       scenario20_horizonAnchoredToTrough]
 ];
 
 let passed = 0;
