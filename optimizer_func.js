@@ -20,7 +20,7 @@ const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
 const PRESAT_MIN_GAIN_CT = 3; // Phase 3d pass 1: a pre-saturation drain must beat the price the same energy would fetch when Phase 4's runtime branch dumps it during saturation. Guards the pre-drain against becoming a low-price midday sale (see the "never pre-drain at low midday prices to make room for PV" rule): the hurdle is the realistic alternative price, not zero. 3 ct ≈ the observed 10–15 ct dump band vs 17–20 ct pre-saturation prices, so it fires on genuine spreads and stays quiet on near-ties.
 const PRESAT_RAW_EXEMPT_FRAC = 0.35; // Phase 3d pass 1 only: fraction of the UNDAMPED PV-only spill that may be treated as curtailment-bound on the FIRST run a saturation wall appears, before dampOverflow has confirmed it. The damping window is right for the mp-DESC pass (a 2026-07-28-style forecast spike there empties the pack past the evening peak) but it also costs pass 1 the best pre-wall price on every strong-PV morning, because the wall shows up mid-morning and the good slots decay 2-3 ct while the window fills (2026-08-24: 20.50 -> 18.04 ct). A wall can still evaporate in one slot (2026-08-27 07:45 projected 20.8% spill; the 08:00 run projected none), so this only ever bets a fraction, and only inside the price band set by PRESAT_RAW_MAX_REGRET_CT.
-const PRESAT_RAW_MAX_REGRET_CT = 2; // Phase 3d pass 1 raw-spill exemption: how much per kWh we are willing to lose against the peak the cross-day hold is protecting, if the unconfirmed wall turns out to be a wobble. Only slots priced within this much of the hold floor may use the raw exemption, so the downside of a phantom wall is bounded at (floor - slot mp) <= 2 ct/kWh on <= PRESAT_RAW_EXEMPT_FRAC of the projected spill, against an upside of the full 3-8 ct spread between a pre-wall morning price and the midday dump band. Sized so the 2026-08-27 07:45 wobble (17.05 ct against a 21.31 ct floor, 4.3 ct of regret) is refused while a near-floor morning slot is taken.
+const PRESAT_RAW_MAX_REGRET_CT = 4; // Phase 3d pass 1 raw-spill exemption: how much per kWh we are willing to lose against the peak the cross-day hold is protecting, if the unconfirmed wall turns out to wobble. Only slots priced within this much of the hold floor may use the raw exemption, so the downside is bounded at PRESAT_RAW_MAX_REGRET_CT x PRESAT_RAW_EXEMPT_FRAC. Was 2 until 2026-08-29, which turned out to be narrower than the gap this is meant to bridge: on a strong-PV day the evening peak sets a high floor (22.41ct peak -> 19.41ct floor) while the morning peak is 3-5ct lower, so the band never reached the only slots pass 1 could act on. That day the wall appeared at 07:45 with the best remaining slot at 16.41ct (2.99ct under the floor) and the exemption stayed shut; the sale landed one run later at 08:00 and everything after 08:30 priced at 1-5ct, under the dump hurdle. 4 admits that case and still excludes the 2026-08-27 wobble (17.05ct against a 21.31ct floor = 4.26ct of regret, and the wall was gone by the next run), which is the boundary this number is calibrated against.
 const PV_CURTAIL_MIN_SOC = 5;   // a PV-ONLY projection must overflow by at least this much SOC (~1.5 kWh) before the planner accepts "PV will saturate the pack" as real. 0.6% of phantom overflow on a bad-PV day (74 sun-min) once unlocked PV-opportunity pricing and let a 22.39ct evening feed-in pass against a 14ct real grid refill. The same floor now also gates the Phase 3c saturation wall and the Phase 3d free-refill test, so a single forecast wobble cannot rewrite the plan.
 const FEEDIN_ROUNDTRIP_MARGIN_CT = 5; // Phase 3d round-trip margin: non-overflow feed-in mp must beat replacementPrice by this much. Raw mp-vs-effective comparison alone ignores inverter round-trip losses (~10%) and battery cycle wear — the 5 ct margin covers ~10% inverter losses + ~1.5 ct cycle wear at the typical 20 ct sell price (net ~1.5 ct/kWh remaining profit). Raised to 10 on 2026-05-19 when the false pvOpportunityPrice ~11ct was being applied across the board — dropping to 5 against pvOpp made thin spreads net losers. After the early pass was fixed to use strict minReplaceEff (no pvOpp bypass for pre-grid-charge slots), the margin/replacement combination became too strict and missed the legitimate 22.39 ct peak (real spread 5.49 ct vs minReplaceEff 16.90). Returned to 5 on 2026-05-19 (later 5).
 const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight's STORED energy when a materially higher stored-energy feed-in peak lies BEYOND the horizon (e.g. tomorrow evening). Tonight's mp must clear (futurePeak − this slack) to sell; otherwise hold the SOC for the better peak (captured next cycle once the horizon advances). The genuinely curtailment-bound portion (pvOnlyOverflow) is still sold tonight — it would be lost to PV curtailment if held. Slack avoids churn on near-ties and covers PV-forecast uncertainty (re-evaluated every 15 min).
@@ -664,6 +664,35 @@ const priceRange = maxPrice - minPrice;
 
 // Price range is used for feed-in candidate filtering
 
+// --- PV-overflow damping (single-spike guard) -------------------------------
+// Shared by the preemptive drain below and the Phase 3d budget: both derive a
+// drain decision from a PV forecast, and both must survive a single-run spike.
+// Clamp a quantity to its rolling minimum over the last OVERFLOW_DAMP_SLOTS
+// slots — decreases apply immediately, increases must persist 30 min before
+// they can unlock a sale. History is bucketed by 15-min SLOT, not by run, so an
+// off-slot re-trigger can't consume a window entry; a re-run within the same
+// slot keeps that slot's MINIMUM rather than overwriting it. Entries written
+// before slot-bucketing have no .slot, never match a numeric slot, and simply
+// age out. (Window was 4 until 2026-08-24; see the Phase 3d notes for why 2.)
+const OVERFLOW_DAMP_SLOTS = 2;
+const OVERFLOW_DAMP_MAX_AGE_MS = 90 * 60 * 1000;
+const _ovfHist = global.get('overflowHist') || {};
+const dampOverflow = (key, value) => {
+    if (!(typeof value === 'number' && isFinite(value))) return value;
+    const slot = Math.floor(_nowMs / (15 * 60 * 1000));
+    const prev = (_ovfHist[key] || []).find(e => e.slot === slot);
+    const slotVal = (prev && typeof prev.v === 'number' && isFinite(prev.v))
+        ? Math.min(prev.v, value) : value;
+    const hist = (_ovfHist[key] || [])
+        .filter(e => (_nowMs - e.t) <= OVERFLOW_DAMP_MAX_AGE_MS && e.slot !== slot);
+    hist.push({ t: _nowMs, slot, v: slotVal });
+    hist.sort((a, b) => a.t - b.t);
+    while (hist.length > OVERFLOW_DAMP_SLOTS) hist.shift();
+    _ovfHist[key] = hist;
+    global.set('overflowHist', _ovfHist);
+    return Math.min(...hist.map(e => e.v));
+};
+
 // --- Pre-emptive discharge: empty battery before sunny day with negative prices ---
 // After ~13:00 tomorrow's prices are known. If tomorrow has strong solar AND
 // low/negative prices during solar hours, we should discharge tonight at the
@@ -812,6 +841,37 @@ let targetSocForSunrise = null;
         ? Math.min(...replacementSlots.map(s => s.effectivePrice))
         : Infinity;
 
+    // PV-spill replacement — the post-sunrise case.
+    // `sunriseTime` is the first daylight slot at or after now-30min, so once
+    // the glut day is under way it lies BEHIND us and the window above
+    // (s.time > now && s.time < sunriseTime) is unsatisfiable: the list comes
+    // back empty, minReplacementEffPrice is Infinity, every DP reward below
+    // evaluates to -Infinity, and the phase picks nothing. It still logs
+    // ACTIVE with a full drain target, which is how it stayed invisible: 1493
+    // of 3414 logged runs (44%) — every run after sunrise on the glut day —
+    // were structurally incapable of picking a slot. User report 2026-08-29:
+    // pack projected to sit at 100% for over an hour while the 15-17ct morning
+    // went unsold; the preemptive drain wanted 65 points and took nothing.
+    // The premise of this whole phase is that PV will overfill the pack, so
+    // the energy drained here is replaced by PV that would otherwise SPILL —
+    // the replacement cost is the price that spill would fetch, not a grid
+    // rebuy at retail (~26ct, which essentially nothing clears). Same
+    // reasoning as Phase 3d's pvOpportunityPrice / satDumpPrice.
+    // Gated on damped overflow evidence, not the raw projection: a single
+    // forecast spike must not empty the pack before the evening peak
+    // (2026-07-28). Until the overflow persists two runs the strict
+    // grid-rebuy replacement stands, so the first run a wall appears still
+    // picks nothing — the same one-run lag Phase 3d's damping accepts.
+    const spillSlots = eveningSlots.filter(s => isDaylight(s.time) && s.pvPower > s.loadEst);
+    const pvSpillPrice = spillSlots.length
+        ? spillSlots.reduce((a, s) => a + Math.max(0, s.marketPrice), 0) / spillSlots.length
+        : Infinity;
+    const dampedOverflowPct = dampOverflow('preemptiveOverflowPct', overflowPct);
+    const spillConfirmed = dampedOverflowPct >= PV_CURTAIL_MIN_SOC;
+    const replacementCt = spillConfirmed
+        ? Math.min(minReplacementEffPrice, pvSpillPrice)
+        : minReplacementEffPrice;
+
     // DP-based pick: maximize Σ(mp × reliefSoc) over slots passing the
     // chronological gate (pre-soc > target+3, matching Phase 4 line 1233)
     // and the round-trip filter (mp > minReplacementEffPrice).
@@ -836,8 +896,15 @@ let targetSocForSunrise = null;
                 kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000));
             const pickDelta = sortedChrono.map(s =>
                 -kwhToSoc(Math.max(0, MAX_DISCHARGE_W + s.loadEst - s.pvPower) * INTERVAL_HOURS / 1000));
+            // The Infinity replacement above used to be the only thing keeping
+            // this path off cheap slots — `feedin_preemptive` bypasses
+            // planSlot(), so neither the FEEDIN_MIN_MP_CT floor nor Phase 3d's
+            // round-trip margin applies to it (Phase 4 only guards mp < 0).
+            // Now that the replacement can legitimately drop to a ~2ct spill
+            // price, both have to be stated here explicitly.
             const reward = sortedChrono.map((s, i) =>
-                s.marketPrice > 0 && s.marketPrice > minReplacementEffPrice
+                s.marketPrice >= FEEDIN_MIN_MP_CT
+                && s.marketPrice > replacementCt + FEEDIN_ROUNDTRIP_MARGIN_CT
                     ? s.marketPrice * (skipDelta[i] - pickDelta[i])
                     : -Infinity);
 
@@ -872,7 +939,9 @@ let targetSocForSunrise = null;
         }
     }
 
-    node.warn(`Preemptive ACTIVE: target=${targetSocForSunrise.toFixed(1)}%, sunrise=${new Date(sunriseTime).toISOString()}, extraDrain=${extraDrainNeeded.toFixed(1)}%, slots=${preemptiveDischargeSlots.size}, surplus=${totalSurplusKwh.toFixed(1)}kWh, negSlots=${negPriceSlots}, minReplaceEff=${isFinite(minReplacementEffPrice) ? minReplacementEffPrice.toFixed(1) : '∞'}ct`);
+    node.warn(`Preemptive ACTIVE: target=${targetSocForSunrise.toFixed(1)}%, sunrise=${new Date(sunriseTime).toISOString()}, extraDrain=${extraDrainNeeded.toFixed(1)}%, slots=${preemptiveDischargeSlots.size}, surplus=${totalSurplusKwh.toFixed(1)}kWh, negSlots=${negPriceSlots}, minReplaceEff=${isFinite(minReplacementEffPrice) ? minReplacementEffPrice.toFixed(1) : '∞'}ct, `
+    + `replacement=${isFinite(replacementCt) ? replacementCt.toFixed(1) : '∞'}ct`
+    + `${spillConfirmed ? ` (pv-spill ${pvSpillPrice.toFixed(1)}ct, damped overflow ${dampedOverflowPct.toFixed(1)}%)` : ` (spill unconfirmed, damped overflow ${dampedOverflowPct.toFixed(1)}%)`}`);
 })();
 
 // Remove past slots, only keep current and future
@@ -1448,29 +1517,8 @@ let satStartIdx = -1;
     // that 2 admits and 4 refuses is 08-21 15:45 (two runs at 5.3/6.8%, barely
     // over PV_CURTAIL_MIN_SOC) — a ~1.6 kWh exemption, cheap against a 3.7ct/kWh
     // miss every strong-PV morning.
-    const OVERFLOW_DAMP_SLOTS = 2;
-    const OVERFLOW_DAMP_MAX_AGE_MS = 90 * 60 * 1000;
-    const _ovfHist = global.get('overflowHist') || {};
-    const dampOverflow = (key, value) => {
-        if (!(typeof value === 'number' && isFinite(value))) return value;
-        const slot = Math.floor(_nowMs / (15 * 60 * 1000));
-        // A re-run within the same slot keeps that slot's MINIMUM rather than
-        // overwriting it — otherwise a re-trigger reporting a higher value would
-        // discard the damping for the slot it lands in.
-        const prev = (_ovfHist[key] || []).find(e => e.slot === slot);
-        const slotVal = (prev && typeof prev.v === 'number' && isFinite(prev.v))
-            ? Math.min(prev.v, value) : value;
-        // Entries written before slot-bucketing have no .slot and never match a
-        // numeric slot, so they simply age out of the window.
-        const hist = (_ovfHist[key] || [])
-            .filter(e => (_nowMs - e.t) <= OVERFLOW_DAMP_MAX_AGE_MS && e.slot !== slot);
-        hist.push({ t: _nowMs, slot, v: slotVal });
-        hist.sort((a, b) => a.t - b.t);
-        while (hist.length > OVERFLOW_DAMP_SLOTS) hist.shift();
-        _ovfHist[key] = hist;
-        global.set('overflowHist', _ovfHist);
-        return Math.min(...hist.map(e => e.v));
-    };
+    // Helper hoisted above the preemptive phase (it damps its own overflow
+    // evidence with the same window); the constants and history live there.
     overflowSoc = dampOverflow('overflowSoc', overflowSoc);
     postHorizonOverflow = dampOverflow('postHorizonOverflow', postHorizonOverflow);
     // Damped here rather than further down with the replacement-price block so

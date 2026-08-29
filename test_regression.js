@@ -1653,7 +1653,10 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     const prices = buildPriceArray(NOW_A, 156, (t) => {
         const h = berlinHour(t), day = dayOffset(t);
         if (day === 0) {
-            if (h < 10) return 18;          // the morning window the user asked about
+            if (h < 10) return 17;          // the morning window the user asked about — kept more
+                                            // than PRESAT_RAW_MAX_REGRET_CT under the 22ct hold floor,
+                                            // so only the DAMPED path can ever sell it (scenario 19
+                                            // owns the raw exemption's boundary)
             if (h < 19) return 9;           // the price a runtime dump would fetch
             return 15;                      // tonight: below the hold floor
         }
@@ -1761,7 +1764,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     // Direction 1 — the wobble guard. The 07:45 run SEES the wall and still
     // reports nothing curtailment-bound, because one run of spill is not
     // evidence: the wall-free 07:30 entry is still in the window and the
-    // rolling min is 0. With the exemption shut, the 18ct morning sits under
+    // rolling min is 0. With the exemption shut, the 17ct morning sits under
     // the 22ct hold floor and cannot be sold.
     if (exemptOf(runB) !== 0 || presatOf(runB) || planned(runB).length > 0) {
         console.error(`  FAIL: the FIRST spill run (07:45) already unlocked feed-in `
@@ -1771,7 +1774,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     }
 
     // Direction 2 — the miss the user reported. Two consecutive runs of spill
-    // is the whole evidence bar; the 08:00 morning must sell at 18ct rather
+    // is the whole evidence bar; the 08:00 morning must sell at 17ct rather
     // than wait for a later run and a worse price.
     if (exemptOf(runC) < 5) {
         console.error(`  FAIL: the SECOND spill run (08:00) still reports only ${exemptOf(runC).toFixed(1)}% `
@@ -1797,7 +1800,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     console.log(`  PASS: 07:45 saw ${spillOf(runB).toFixed(1)}% spill and held (curtailment-bound 0.0%, `
         + `${reactive(runB).length} morning slot(s) left to dump reactively at 100%); `
         + `08:00 confirmed it (${exemptOf(runC).toFixed(1)}%) and sold ${planned(runC).length} morning slot(s) `
-        + `at 18ct under a 22ct hold floor, SOC ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}%`);
+        + `at 17ct under a 22ct hold floor, SOC ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}%`);
     return true;
 }
 
@@ -1808,13 +1811,18 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
     // the morning price is the variable. The cross-day hold floor is 22ct
     // throughout (25ct peak beyond the horizon, minus CROSSDAY_HOLD_SLACK_CT).
     //
-    //   in-band  21ct -> 1ct of regret if the wall is a wobble  -> may sell at 07:45
-    //   far      18ct -> 4ct of regret                          -> must wait for 08:00
+    //   in-band  21ct   -> 1.0ct of regret if the wall is a wobble -> may sell at 07:45
+    //   in-band  19ct   -> 3.0ct of regret                         -> may sell at 07:45
+    //   far      17.7ct -> 4.3ct of regret                         -> must wait for 08:00
     //
-    // The 18ct case is the 2026-08-27 07:45 wobble to scale: that run projected
+    // The 19ct case is 2026-08-29 to scale: a 22.41ct evening peak set a 19.41ct
+    // floor while the best pre-wall morning slot was 16.41ct, 2.99ct under it, so
+    // a 2ct band could not reach the only slot pass 1 had left.
+    // The 17.7ct case is the 2026-08-27 07:45 wobble to scale: that run projected
     // 20.8% spill at 17.05ct against a 21.31ct floor, and the 08:00 run projected
     // no wall at all. Selling it would have cost 4.3ct/kWh against a peak that
-    // was still coming.
+    // was still coming — 0.3ct outside the band, which is the boundary
+    // PRESAT_RAW_MAX_REGRET_CT is calibrated against.
     const NOW_A = Date.UTC(2026, 7, 24, 5, 30);
     const NOW_B = NOW_A + 15 * 60 * 1000;
     const NOW_C = NOW_A + 30 * 60 * 1000;
@@ -1908,9 +1916,10 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
     };
 
     const inBand = runEpisode(21);
-    const farBand = runEpisode(18);
+    const midBand = runEpisode(19);
+    const farBand = runEpisode(17.7);
 
-    for (const [label, ep] of [['21ct (in band)', inBand], ['18ct (4ct regret)', farBand]]) {
+    for (const [label, ep] of [['21ct (1ct regret)', inBand], ['19ct (3ct regret)', midBand], ['17.7ct (4.3ct regret)', farBand]]) {
         console.log(`  ${label}: floor=${floorOf(ep.B)}ct spill@07:45=${spillOf(ep.B).toFixed(1)}% `
             + `07:45 planned=${planned(ep.B).length} raw=${usedRawPath(ep.B)} drawn=${drawn(ep.B).toFixed(1)}% | `
             + `08:00 planned=${planned(ep.C).length} drawn=${drawn(ep.C).toFixed(1)}%`);
@@ -1927,7 +1936,8 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
         console.error('  setup drift: cross-day hold not armed, so nothing gates the morning');
         return false;
     }
-    if (!(inBand.B.schedule.length && 21 < floorOf(inBand.B) && 21 >= floorOf(inBand.B) - 2)) {
+    const bandCt = Number(PRESAT_RAW_MAX_REGRET_CT_DOC);
+    if (!(inBand.B.schedule.length && 21 < floorOf(inBand.B) && 21 >= floorOf(inBand.B) - bandCt)) {
         console.error(`  setup drift: 21ct is no longer inside the ${PRESAT_RAW_MAX_REGRET_CT_DOC}ct band under the `
             + `${floorOf(inBand.B)}ct floor`);
         return false;
@@ -1965,15 +1975,23 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
         return false;
     }
 
-    // Direction 3 — the regret bound. A morning 4ct under the floor is exactly
-    // the 2026-08-27 wobble, and must still wait for confirmation.
+    // Direction 3 — the band must reach the gap it exists for. 3ct under the
+    // floor is the 2026-08-29 shape: the only pre-wall slot pass 1 had left.
+    if (planned(midBand.B).length === 0 || !usedRawPath(midBand.B)) {
+        console.error(`  FAIL: 07:45 held the 19ct morning (3ct under a ${floorOf(midBand.B)}ct floor) — `
+            + `the ${bandCt}ct band still does not reach a morning peak that sits a few ct under an evening floor`);
+        return false;
+    }
+
+    // Direction 4 — the regret bound still bounds. 4.3ct under the floor is
+    // exactly the 2026-08-27 wobble, and must still wait for confirmation.
     if (planned(farBand.B).length > 0) {
-        console.error(`  FAIL: 07:45 sold ${planned(farBand.B).length} morning slot(s) at 18ct under a `
-            + `${floorOf(farBand.B)}ct floor — a one-run wobble now costs 4ct/kWh against the peak we are holding for`);
+        console.error(`  FAIL: 07:45 sold ${planned(farBand.B).length} morning slot(s) at 17.7ct under a `
+            + `${floorOf(farBand.B)}ct floor — a one-run wobble now costs 4.3ct/kWh against the peak we are holding for`);
         return false;
     }
     if (planned(farBand.C).length === 0) {
-        console.error('  FAIL: 18ct morning never sold, not even on the confirmed 08:00 run — '
+        console.error('  FAIL: 17.7ct morning never sold, not even on the confirmed 08:00 run — '
             + 'the regret bound has swallowed the damped path too');
         return false;
     }
@@ -1981,7 +1999,8 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
     console.log(`  PASS: 21ct (1ct under the ${floorOf(inBand.B)}ct floor) sold ${planned(inBand.B).length} slot(s) at 07:45 `
         + `on the raw exemption, ${(drawn(inBand.B) - drawn(farBand.B)).toFixed(1)}% more headroom than the blocked episode `
         + `and ${planned(inBand.C).length} slot(s)/${drawn(inBand.C).toFixed(1)}% once confirmed, tonight untouched; `
-        + `18ct (4ct under) held at 07:45 and sold ${planned(farBand.C).length} slot(s) at 08:00`);
+        + `19ct (3ct under) also sold ${planned(midBand.B).length} slot(s) at 07:45; `
+        + `17.7ct (4.3ct under) held at 07:45 and sold ${planned(farBand.C).length} slot(s) at 08:00`);
     return true;
 }
 
@@ -2092,6 +2111,156 @@ function scenario20_horizonAnchoredToTrough() {
 }
 
 // --- Run all ---
+
+// =========================================================
+// SCENARIO 21: User report 2026-08-29 — the plan projected the
+// pack sitting at 100% for over an hour while the 15-17ct
+// morning went unsold. The preemptive drain was ACTIVE and
+// wanted 65 points, but took nothing: its round-trip guard
+// priced replacement as a pre-sunrise grid rebuy, and after
+// sunrise on the glut day that window is empty, so the
+// replacement was Infinity and every DP reward was -Infinity.
+// 44% of logged runs (every post-sunrise one) were structurally
+// incapable of picking a slot. The energy drained here is
+// replaced by PV that would otherwise SPILL, so the replacement
+// is what the spill would fetch — but only once the overflow
+// has survived the damping window, and never below the
+// FEEDIN_MIN_MP_CT floor that `feedin_preemptive` bypasses.
+// =========================================================
+function scenario21_preemptiveReplacementPostSunrise() {
+    console.log('\n=== SCENARIO 21: Preemptive drain must act after sunrise on the glut day ===');
+
+    // Three runs, 15 min apart, all well after sunrise on the glut day itself.
+    // Tomorrow's prices have not published, so the schedule ends tonight and
+    // there is no pre-sunrise slot left anywhere in it: the old grid-rebuy
+    // replacement is structurally unavailable (minReplaceEff=∞).
+    //   07:30  weak forecast, no wall  -> nothing to drain for, seeds damping
+    //   07:45  wall appears (raw)      -> one run is not evidence, still holds
+    //   08:00  wall persists (damped)  -> drains the morning peak
+    const NOW_A = Date.UTC(2026, 7, 29, 5, 30); // 07:30 Berlin
+    const NOW_B = NOW_A + 15 * 60 * 1000;       // 07:45
+    const NOW_C = NOW_A + 30 * 60 * 1000;       // 08:00
+    const slots = 66;                            // → 23:45 Berlin
+
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+
+    const MORNING_CT = 16;                      // the peak that went unsold
+    const prices = buildPriceArray(NOW_A, slots, (t) => {
+        const h = berlinHour(t);
+        if (h < 9) return MORNING_CT;
+        if (h >= 10 && h < 15) return -0.5;     // the glut, confirmed by price
+        if (h < 17) return 1.5;
+        return 9;                               // evening, under spill + margin
+    });
+
+    const buildSolar = (minutesPerHour) => {
+        const out = [];
+        for (let h = 0; h < 20; h++) {
+            const t = NOW_A + h * 3600000;
+            const hour = berlinHour(t);
+            out.push({ time: t, sunshineDurationInMinutes: hour >= 7 && hour <= 19 ? minutesPerHour : 0 });
+        }
+        return out;
+    };
+    const solarWeak = buildSolar(16);   // thin morning: 1.1% projected spill, under PV_CURTAIL_MIN_SOC
+    const solarStrong = buildSolar(55);
+
+    const buildMsg = (now, solar, pvNow) => ({
+        payload: {
+            soc: [{ time: now, soc: 90 }],
+            acload: [{ time: now, acload: 700 }],
+            power: [{ time: now, power: -2000 }],
+            pv_now: [{ time: now, pv_now: pvNow }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(now),
+            pv_history: buildPvHistory(now)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 7, 29, 4, 10)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 7, 29, 17, 50)).toISOString(),
+            solarradiation: 650,
+            rainrate: 0
+        }
+    });
+
+    // One store across all three runs, so the overflow damping history carries.
+    const store = {};
+    const at = (now, solar, pvNow) => {
+        const result = withMockedNow(now, () => runOptimizer(buildMsg(now, solar, pvNow), store));
+        return { schedule: getSchedule(result), warns: warnLog.slice() };
+    };
+    const A = at(NOW_A, solarWeak, 200);
+    const B = at(NOW_B, solarStrong, 2500);
+    const C = at(NOW_C, solarStrong, 2500);
+
+    const activeOf = r => r.warns.find(w => w.includes('Preemptive ACTIVE:')) || '';
+    const picksOf = r => { const m = /slots=(\d+)/.exec(activeOf(r)); return m ? parseInt(m[1], 10) : -1; };
+    const replacementOf = r => { const m = /replacement=([\d.]+|∞)ct/.exec(activeOf(r)); return m ? m[1] : null; };
+    const confirmedOf = r => /pv-spill/.test(activeOf(r));
+    const preemptive = r => r.schedule.filter(s => s.state === 4 && /Pre-emptive discharge/.test(String(s.reason)));
+
+    for (const [label, r] of [['07:30', A], ['07:45', B], ['08:00', C]]) {
+        console.log(`  ${label}: active=${!!activeOf(r)} confirmed=${confirmedOf(r)} `
+            + `replacement=${replacementOf(r)}ct picks=${picksOf(r)} state4=${preemptive(r).length}`);
+    }
+
+    // Setup sanity: the phase has to be armed and genuinely post-sunrise,
+    // otherwise this tests nothing. An empty pre-sunrise replacement window
+    // (minReplaceEff=∞) is the exact condition that used to sterilise the DP.
+    if (!activeOf(A) || !activeOf(B) || !activeOf(C)) {
+        console.error('  setup drift: preemptive phase did not go ACTIVE on all three runs — '
+            + 'the glut day no longer arms it');
+        return false;
+    }
+    if (!/minReplaceEff=∞ct/.test(activeOf(C))) {
+        console.error(`  setup drift: a pre-sunrise replacement slot still exists (${activeOf(C)}) — `
+            + 'the post-sunrise case is not being exercised');
+        return false;
+    }
+
+    // Direction 1 — one run of overflow is not evidence. The run the wall first
+    // appears keeps the strict grid-rebuy replacement and picks nothing.
+    if (confirmedOf(B) || picksOf(B) !== 0) {
+        console.error(`  FAIL: 07:45 drained on unconfirmed spill (picks=${picksOf(B)}) — `
+            + 'a single forecast spike can now empty the pack ahead of the evening');
+        return false;
+    }
+
+    // Direction 2 — once the overflow persists, the drain has to act.
+    if (!confirmedOf(C)) {
+        console.error(`  FAIL: 08:00 never confirmed the spill (${activeOf(C)}) — damping window drifted`);
+        return false;
+    }
+    if (picksOf(C) === 0) {
+        console.error('  FAIL: 08:00 still picked nothing with the spill confirmed — '
+            + 'the post-sunrise drain is inert and the pack will ride at 100%');
+        return false;
+    }
+
+    // Direction 3 — the replacement price may drop to the spill price, but the
+    // floor and the round-trip margin still bound what it can sell.
+    const sold = preemptive(C);
+    if (sold.length === 0) {
+        console.error('  FAIL: 08:00 planned preemptive slots but none survived to state=4 — '
+            + 'Phase 4 demoted every one of them');
+        return false;
+    }
+    const cheap = sold.filter(s => s.marketPrice < 5);
+    if (cheap.length > 0) {
+        console.error(`  FAIL: 08:00 fed in ${cheap.length} slot(s) under the 5ct floor `
+            + `(cheapest ${Math.min(...cheap.map(s => s.marketPrice)).toFixed(1)}ct) — `
+            + 'feedin_preemptive bypasses planSlot(), so the floor must be stated in the DP');
+        return false;
+    }
+
+    console.log(`  PASS: 07:45 held (spill unconfirmed, replacement ${replacementOf(B)}ct); 08:00 confirmed the spill, `
+        + `repriced replacement to ${replacementOf(C)}ct and drained ${sold.length} slot(s) at `
+        + `${Math.min(...sold.map(s => s.marketPrice)).toFixed(1)}-${Math.max(...sold.map(s => s.marketPrice)).toFixed(1)}ct, `
+        + 'none under the 5ct floor');
+    return true;
+}
+
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
     ['no negative feed-in',         scenario2_noNegativeFeedIn],
@@ -2112,7 +2281,8 @@ const results = [
     ['saturating refill unlocks evening peak', scenario17_saturatingRefillUnlocksEveningPeak],
     ['damping window unlocks on second spill run', scenario18_dampingWindowUnlocksOnSecondRun],
     ['raw-spill exemption bounded by regret',     scenario19_rawSpillExemptionBoundedByRegret],
-    ['evening peak not outbid by tomorrow',       scenario20_horizonAnchoredToTrough]
+    ['evening peak not outbid by tomorrow',       scenario20_horizonAnchoredToTrough],
+    ['preemptive drain acts after sunrise',       scenario21_preemptiveReplacementPostSunrise]
 ];
 
 let passed = 0;
