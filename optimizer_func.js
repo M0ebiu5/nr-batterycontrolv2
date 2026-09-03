@@ -18,6 +18,9 @@ const PV_PEAK_W = 5000;
 const BASE_GRID_FEE = 13; // ct/kWh
 const FEEDIN_MIN_MP_CT = 5; // never feed in below this market price (cycle wear + inverter losses exceed sub-ct revenue)
 const MAX_GRID_CHARGE_SOC_PCT = 90; // Phase 3c projection cap: planner refuses to schedule grid-charge slots past 90% SOC. PV-driven fill above this is still allowed at runtime (no curtailment). Drops the most-expensive ~3 picks (typically pre-13:00 morning slots before next-day prices publish), reduces battery wear, preserves headroom for unforecast PV.
+const SOC_CEILING_PCT = 95;     // planning ceiling: the SOC the planner treats as a full pack. Every planning simulation clamps here and books the excess as spill, so the machinery that already exists for saturation (Phase 3d's pre-saturation pass, the feed-in budget, Phase 3d.2's cluster pre-pick) frees the room at the best-priced slots ahead of the morning wall and sells the evening peak back down to it. Keeps the pack off the top of the LFP charge plateau — where the per-pack CELL_FULL_V full-stop lives and where charge acceptance falls off — and leaves ~1.5 kWh of headroom for PV the forecast missed. Deliberately an AIM, not an enforcement: SOC_CURTAIL_PCT stays where it was, so a real overshoot is planned back down on the next cycle rather than dumped at the FEEDIN_MIN_MP_CT floor. When the pack starts a run ABOVE this (runtime is allowed to), the clamp books the difference as spill on the very first slot — the bias is conservative in the intended direction (it asks for a drain) and self-corrects each run against the fresh SOC reading.
+const SOC_CURTAIL_PCT = 99;     // runtime backstop: the SOC at which PV is genuinely being wasted, so Phase 4 sells at any mp above FEEDIN_MIN_MP_CT. Independent of SOC_CEILING_PCT by design — the ceiling governs what the planner aims for, this governs when an overshoot has stopped being worth holding. Lowering this to the ceiling would enforce 95% but only by selling stored energy at the 5 ct floor, against the round-trip discipline the feed-in rules exist to protect.
+const SOC_CEILING_BAND_PCT = SOC_CURTAIL_PCT - SOC_CEILING_PCT; // the headroom the ceiling reserves. Overflow inside this band is not a forecast guess — the pack really would sit there — so it is certain budget; only overflow past it is PV the forecast may have imagined.
 const PRESAT_MIN_GAIN_CT = 3; // Phase 3d pass 1: a pre-saturation drain must beat the price the same energy would fetch when Phase 4's runtime branch dumps it during saturation. Guards the pre-drain against becoming a low-price midday sale (see the "never pre-drain at low midday prices to make room for PV" rule): the hurdle is the realistic alternative price, not zero. 3 ct ≈ the observed 10–15 ct dump band vs 17–20 ct pre-saturation prices, so it fires on genuine spreads and stays quiet on near-ties.
 const PRESAT_RAW_EXEMPT_FRAC = 0.35; // Phase 3d pass 1 only: fraction of the UNDAMPED PV-only spill that may be treated as curtailment-bound on the FIRST run a saturation wall appears, before dampOverflow has confirmed it. The damping window is right for the mp-DESC pass (a 2026-07-28-style forecast spike there empties the pack past the evening peak) but it also costs pass 1 the best pre-wall price on every strong-PV morning, because the wall shows up mid-morning and the good slots decay 2-3 ct while the window fills (2026-08-24: 20.50 -> 18.04 ct). A wall can still evaporate in one slot (2026-08-27 07:45 projected 20.8% spill; the 08:00 run projected none), so this only ever bets a fraction, and only inside the price band set by PRESAT_RAW_MAX_REGRET_CT.
 const PRESAT_RAW_MAX_REGRET_CT = 4; // Phase 3d pass 1 raw-spill exemption: how much per kWh we are willing to lose against the peak the cross-day hold is protecting, if the unconfirmed wall turns out to wobble. Only slots priced within this much of the hold floor may use the raw exemption, so the downside is bounded at PRESAT_RAW_MAX_REGRET_CT x PRESAT_RAW_EXEMPT_FRAC. Was 2 until 2026-08-29, which turned out to be narrower than the gap this is meant to bridge: on a strong-PV day the evening peak sets a high floor (22.41ct peak -> 19.41ct floor) while the morning peak is 3-5ct lower, so the band never reached the only slots pass 1 could act on. That day the wall appeared at 07:45 with the best remaining slot at 16.41ct (2.99ct under the floor) and the exemption stayed shut; the sale landed one run later at 08:00 and everything after 08:30 priced at 1-5ct, under the dump hurdle. 4 admits that case and still excludes the 2026-08-27 wobble (17.05ct against a 21.31ct floor = 4.26ct of regret, and the wall was gone by the next run), which is the boundary this number is calibrated against.
@@ -29,7 +32,7 @@ const CROSSDAY_HOLD_MAX_AGE_MS = 12 * 3600 * 1000; // how long a cross-day hold 
 const ARB_MIN_NET_CT = 16;      // required NET profit per kWh after round-trip loss + cycle wear: peakMp*ARB_RT_EFF − chargeEff − ARB_CYCLE_WEAR_CT ≥ this
 const ARB_RT_EFF = 0.9;         // inverter+round-trip efficiency applied to sell revenue (~10% loss)
 const ARB_CYCLE_WEAR_CT = 1.5;  // battery cycle-wear cost per kWh cycled
-const ARB_CHARGE_SOC_PCT = 100; // arbitrage may fill to 100% (energy is dumped within hours; relaxes the normal 90% Phase 3c headroom cap)
+const ARB_CHARGE_SOC_PCT = SOC_CEILING_PCT; // arbitrage may fill to the planning ceiling (energy is dumped within hours; relaxes the normal 90% Phase 3c headroom cap, but not past the ceiling — the headroom the ceiling reserves is for PV the forecast missed, which arbitrage has no claim on)
 const TIMEZONE = 'Europe/Berlin';
 
 // Timezone-aware time extraction (all logic must use local Berlin time, not UTC)
@@ -813,7 +816,8 @@ let targetSocForSunrise = null;
     if (eveningSlots.length === 0) return;
 
     // Project SOC under PV+load only (no preemptive drain) across the window.
-    // Track overflow (curtailed PV above 100%) — that energy is also drainable
+    // Track overflow (curtailed PV above the physical rail) — that energy is
+    // also drainable
     // if we make room for it. Without PV in this calc, drain need is
     // under-estimated whenever the window includes daylight hours.
     let projSocAtSunrise = currentSoc;
@@ -821,9 +825,9 @@ let targetSocForSunrise = null;
     for (const s of eveningSlots) {
         const netKwh = (s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000;
         projSocAtSunrise += kwhToSoc(netKwh);
-        if (projSocAtSunrise > 100) {
-            overflowPct += projSocAtSunrise - 100;
-            projSocAtSunrise = 100;
+        if (projSocAtSunrise > SOC_CURTAIL_PCT) {
+            overflowPct += projSocAtSunrise - SOC_CURTAIL_PCT;
+            projSocAtSunrise = SOC_CURTAIL_PCT;
         }
         if (projSocAtSunrise < MIN_SOC_PCT) projSocAtSunrise = MIN_SOC_PCT;
     }
@@ -908,7 +912,7 @@ let targetSocForSunrise = null;
                     ? s.marketPrice * (skipDelta[i] - pickDelta[i])
                     : -Infinity);
 
-            const clipSoc = (soc) => Math.max(MIN_SOC_PCT, Math.min(100, soc));
+            const clipSoc = (soc) => Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, soc));
             const bucket = (soc) => Math.round(clipSoc(soc) / SOC_QUANT);
 
             const V = Array.from({ length: N + 1 }, () => new Float32Array(NUM_B));
@@ -988,7 +992,7 @@ for (let i = 0; i < schedule.length; i++) {
     const loadW = s.loadEst;
     const netPvW = pvW - loadW;
     const netEnergy = netPvW * INTERVAL_HOURS / 1000;
-    passiveSoc = Math.max(MIN_SOC_PCT, Math.min(100, passiveSoc + kwhToSoc(netEnergy)));
+    passiveSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, passiveSoc + kwhToSoc(netEnergy)));
     s._passiveSoc = passiveSoc;
 }
 
@@ -1120,9 +1124,11 @@ for (const s of schedule) {
 // all. Two consumers. Phase 3c reads satIdx as a "charge wall" — energy bought
 // before the pack saturates is displaced by the PV that then spills, so those
 // picks buy at retail what the sun delivers free. Phase 3d reads the overflow
-// to decide whether an in-horizon refill is genuinely free. Clamped at 99 (the
-// runtime curtailment trigger) rather than at MAX_GRID_CHARGE_SOC_PCT, so the
-// walk sees the REAL saturation that the planner's own 90% projection cap hides.
+// to decide whether an in-horizon refill is genuinely free. Clamped at the
+// physical rail rather than at MAX_GRID_CHARGE_SOC_PCT or the planning
+// ceiling, so the walk sees the REAL saturation that the planner's own 90%
+// projection cap hides — this asks whether PV is actually being wasted, which
+// the headroom policy does not change.
 let pvOnlySatIdx = -1;
 let pvOnlyOverflowRaw = 0;
 let pvOnlyTroughSoc = 0; // SOC that must stay in the pack to reach the saturation
@@ -1132,15 +1138,15 @@ let pvOnlyTroughSoc = 0; // SOC that must stay in the pack to reach the saturati
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
         s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
-        if (s0 > 99) {
+        if (s0 > SOC_CURTAIL_PCT) {
             if (pvOnlySatIdx < 0) {
                 pvOnlySatIdx = i;
                 // Depth of the dip between now and the saturation: sell past it
                 // and the house buys the difference back at retail overnight.
                 pvOnlyTroughSoc = Math.max(0, currentSoc - trough);
             }
-            pvOnlyOverflowRaw += s0 - 99;
-            s0 = 99;
+            pvOnlyOverflowRaw += s0 - SOC_CURTAIL_PCT;
+            s0 = SOC_CURTAIL_PCT;
         }
         if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
         if (pvOnlySatIdx < 0 && s0 < trough) trough = s0;
@@ -1243,7 +1249,7 @@ const pvSatWall = pvOnlyOverflowRaw >= PV_CURTAIL_MIN_SOC ? pvOnlySatIdx : -1;
                 // the pack by midday and then dumped at 11–15ct. The existing
                 // "did this pick raise traj[d]?" gate cannot catch this: the
                 // trajectory clamps at MAX_GRID_CHARGE_SOC_PCT (90), so the
-                // spill above 99 never appears in it.
+                // spill above the physical rail never appears in it.
                 if (pvSatWall >= 0 && i < pvSatWall && d >= pvSatWall) { wallBlocked++; continue; }
                 eligible.push({ idx: i, effPrice: s.effectivePrice, prePublish: berlinTime(s.time).hour < 13 });
             }
@@ -1293,7 +1299,7 @@ for (let i = 0; i < schedule.length; i++) {
     } else {
         simSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
     }
-    simSoc = Math.max(MIN_SOC_PCT, Math.min(100, simSoc));
+    simSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, simSoc));
     s._plannedSoc = simSoc;
 }
 
@@ -1370,7 +1376,7 @@ let horizonIdx = schedule.length;
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
         testSoc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
-        testSoc = Math.max(MIN_SOC_PCT, Math.min(100, testSoc));
+        testSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, testSoc));
         if (testSoc > peakSoc) peakSoc = testSoc;
         if (peakSoc - testSoc >= 5) dipped = true;
         if (dipped && s.pvPower > s.loadEst && testSoc - troughSoc >= HORIZON_RECOVER_PCT) {
@@ -1384,7 +1390,7 @@ let horizonIdx = schedule.length;
 // `replacementPrice` is hoisted so Phase 4's runtime "battery full" branch
 // can apply the same round-trip economic check that Phase 3d uses for
 // non-overflow feed-in (otherwise the runtime fires opportunistically at
-// the first soc≥95 slot regardless of whether the drained SOC will be
+// the first at-ceiling slot regardless of whether the drained SOC will be
 // replaced at a higher cost).
 let replacementPrice = Infinity;
 
@@ -1395,37 +1401,60 @@ let replacementPrice = Infinity;
 // sells stored energy but does nothing to stop the earlier curtailment).
 // -1 = no saturation projected.
 let satStartIdx = -1;
+// Where the same walk ends when it is clamped at the physical rail instead of
+// the planning ceiling. The walks that model real PV curtailment have to start
+// from this, not from the ceiling-clamped projection — otherwise the ceiling
+// hands them a pack that is SOC_CEILING_BAND_PCT emptier than it will really
+// be, and they under-report the spill that decides whether a late slot is
+// curtailment-bound.
+let projSocPhys = currentSoc;
 
 // Project SOC to the horizon WITHOUT any feed-in plans. Track overflow
-// (curtailed PV above 100%) separately so the "battery will actually be
+// (PV above the planning ceiling) separately so the "battery will actually be
 // full" case still contributes a feed-in budget.
 {
     let projSoc = currentSoc;
     let overflowSoc = 0;
+    // Same walk, clamped at the physical rail instead of the planning ceiling,
+    // solely to place satStartIdx. Cumulative overflow cannot stand in for it:
+    // a walk that saturates, drains on a planned slot and re-climbs keeps its
+    // overflow total but resets its SOC, so the total crosses the band while
+    // the pack is nowhere near the rail — which walks the wall backwards and
+    // strips the pre-saturation pass of the very morning slots it exists to sell.
+    let physSoc = currentSoc;
     for (let i = 0; i < horizonIdx; i++) {
         const s = schedule[i];
         const pvW = s.pvPower;
         const loadW = s.loadEst;
+        let delta;
         if (s._plan === 'charge') {
-            projSoc += kwhToSoc(maxChargeEnergy);
+            delta = kwhToSoc(maxChargeEnergy);
         } else if (s._plan === 'feedin_preemptive') {
-            projSoc -= feedinDrainSoc(s);
+            delta = -feedinDrainSoc(s);
         } else if (isProfitChargeSlot(s)) {
-            projSoc += kwhToSoc(maxChargeEnergy);
+            delta = kwhToSoc(maxChargeEnergy);
         } else {
-            projSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+            delta = kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
         }
-        // Cap at the runtime curtailment trigger (soc≥99), not 100. The budget
-        // must keep runtime peak BELOW 99 to prevent the soc≥99 branch from
-        // firing — using cap=100 here under-budgets by ~1% and leaves a stray
-        // curtailment slot at the edge.
-        if (projSoc > 99) {
+        projSoc += delta;
+        physSoc += delta;
+        if (physSoc > SOC_CURTAIL_PCT) {
             if (satStartIdx < 0) satStartIdx = i;
-            overflowSoc += projSoc - 99;
-            projSoc = 99;
+            physSoc = SOC_CURTAIL_PCT;
+        }
+        if (physSoc < MIN_SOC_PCT) physSoc = MIN_SOC_PCT;
+        // Two different thresholds on one walk. The BUDGET is everything above
+        // the planning ceiling — that is the room we want freed. The WALL is
+        // physical (physSoc, above): it marks where a pre-drain stops buying a
+        // free PV refill and starts merely selling stored energy, and PV is not
+        // actually lost until the pack reaches SOC_CURTAIL_PCT.
+        if (projSoc > SOC_CEILING_PCT) {
+            overflowSoc += projSoc - SOC_CEILING_PCT;
+            projSoc = SOC_CEILING_PCT;
         }
         if (projSoc < MIN_SOC_PCT) projSoc = MIN_SOC_PCT;
     }
+    projSocPhys = physSoc;
 
     // Continue projection PAST horizonIdx to capture PV curtailment beyond
     // the refill slot. Without this, an evening with SOC≈100% + strong-PV
@@ -1451,9 +1480,9 @@ let satStartIdx = -1;
             } else {
                 extSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
             }
-            if (extSoc > 99) {
-                postHorizonOverflow += extSoc - 99;
-                extSoc = 99;
+            if (extSoc > SOC_CEILING_PCT) {
+                postHorizonOverflow += extSoc - SOC_CEILING_PCT;
+                extSoc = SOC_CEILING_PCT;
             }
             if (extSoc < MIN_SOC_PCT) extSoc = MIN_SOC_PCT;
             if (isDaylight(s.time)) sawDaylight = true;
@@ -1519,8 +1548,20 @@ let satStartIdx = -1;
     // miss every strong-PV morning.
     // Helper hoisted above the preemptive phase (it damps its own overflow
     // evidence with the same window); the constants and history live there.
-    overflowSoc = dampOverflow('overflowSoc', overflowSoc);
-    postHorizonOverflow = dampOverflow('postHorizonOverflow', postHorizonOverflow);
+    // The overflow now spans two regimes and only one of them is a guess.
+    // What the walk books inside SOC_CEILING_BAND_PCT is the headroom policy
+    // itself: the pack really would sit there, so that band is certain budget
+    // and must not be damped away — it is precisely the energy the ceiling
+    // asks us to shed. Only overflow past the physical rail is PV the forecast
+    // may have imagined, and that is what dampOverflow exists to hold back.
+    // Damping the whole thing would delete the band from the budget on the
+    // first spill run (before the ceiling it lived inside projSoc, which was
+    // clamped at the rail), and the pre-saturation pass would then walk past
+    // the best morning price waiting for a confirmation the band never needed.
+    const _ovBand = Math.min(overflowSoc, SOC_CEILING_BAND_PCT);
+    const _phBand = Math.min(postHorizonOverflow, SOC_CEILING_BAND_PCT);
+    overflowSoc = _ovBand + dampOverflow('overflowSoc', overflowSoc - _ovBand);
+    postHorizonOverflow = _phBand + dampOverflow('postHorizonOverflow', postHorizonOverflow - _phBand);
     // Damped here rather than further down with the replacement-price block so
     // the free-refill test below can consult it. Same value, same single
     // dampOverflow call per run — only the position moved.
@@ -1639,7 +1680,7 @@ let satStartIdx = -1;
     let postSchedPvOverflow = 0;
     if (schedule.length > 0) {
         const lastSlotEnd_3d = schedule[schedule.length - 1].time + INTERVAL_HOURS * 3600 * 1000;
-        let walkSoc = projSoc;
+        let walkSoc = projSocPhys;
         for (let h = 0; h < 48; h++) {
             const t = lastSlotEnd_3d + h * 3600000;
             const loadW = getLoadEstimate(t);
@@ -1652,7 +1693,7 @@ let satStartIdx = -1;
                 pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
             }
             walkSoc += kwhToSoc((pvW - loadW) / 1000);
-            if (walkSoc > 99) { postSchedPvOverflow += walkSoc - 99; walkSoc = 99; }
+            if (walkSoc > SOC_CURTAIL_PCT) { postSchedPvOverflow += walkSoc - SOC_CURTAIL_PCT; walkSoc = SOC_CURTAIL_PCT; }
             if (walkSoc < MIN_SOC_PCT) walkSoc = MIN_SOC_PCT;
         }
     }
@@ -1888,12 +1929,12 @@ let satStartIdx = -1;
 }
 
 // --- 3d.2. Saturation cluster pre-pick ---
-// Even when projected SOC peaks below 100% (no formal overflow) but stays
-// at ≥95% across a run of PV-surplus slots, the runtime "battery full"
-// fallback would otherwise fire at the FIRST slot crossing 95% — which is
-// often a price dip, not the cluster's best mp. This pass walks the passive
+// Even when projected SOC peaks below the planning ceiling (no formal
+// overflow) but stays at the ceiling across a run of PV-surplus slots, the
+// runtime "battery full" fallback would otherwise fire at the FIRST slot
+// crossing it — which is often a price dip, not the cluster's best mp. This pass walks the passive
 // projection (`_plannedSoc` set in the simSoc loop above), identifies
-// consecutive (soc≥95 + PV>load+500) clusters Phase 3d didn't already
+// consecutive (soc at ceiling + PV>load+500) clusters Phase 3d didn't already
 // commit, and marks the highest-mp slot per cluster as `feedin_saturation`
 // — but only if mp beats `replacementPrice` (otherwise no feed-in is
 // economically justified anywhere in the cluster).
@@ -1901,11 +1942,11 @@ let satStartIdx = -1;
     let i = 0;
     while (i < schedule.length) {
         const s = schedule[i];
-        const inCluster = s._plannedSoc >= 95 && (s.pvPower - s.loadEst) > 500;
+        const inCluster = s._plannedSoc >= SOC_CEILING_PCT && (s.pvPower - s.loadEst) > 500;
         if (!inCluster) { i++; continue; }
         let j = i;
         while (j + 1 < schedule.length
-               && schedule[j+1]._plannedSoc >= 95
+               && schedule[j+1]._plannedSoc >= SOC_CEILING_PCT
                && (schedule[j+1].pvPower - schedule[j+1].loadEst) > 500) {
             j++;
         }
@@ -1973,7 +2014,7 @@ let satStartIdx = -1;
 
         walkSoc += socDelta;
         let overflow = 0;
-        if (walkSoc > 100) { overflow = walkSoc - 100; walkSoc = 100; }
+        if (walkSoc > SOC_CEILING_PCT) { overflow = walkSoc - SOC_CEILING_PCT; walkSoc = SOC_CEILING_PCT; }
         if (walkSoc < MIN_SOC_PCT) walkSoc = MIN_SOC_PCT;
 
         if (profitCharge) {
@@ -2022,7 +2063,7 @@ let satStartIdx = -1;
                  || s._plan === 'feedin_capacity') d = -feedinDrainSoc(s);
         else d = kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
         soc += d;
-        if (soc > 100) soc = 100;
+        if (soc > SOC_CEILING_PCT) soc = SOC_CEILING_PCT;
         if (soc < MIN_SOC_PCT) soc = MIN_SOC_PCT;
         return soc;
     }
@@ -2104,7 +2145,7 @@ let satStartIdx = -1;
             } else {
                 soc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
             }
-            if (soc > 100) soc = 100;
+            if (soc > SOC_CEILING_PCT) soc = SOC_CEILING_PCT;
             // Do NOT clamp at MIN here: we need the true trough depth to know
             // how much feed-in to give back.
             if (soc < minSoc) { minSoc = soc; minIdx = i; }
@@ -2157,7 +2198,7 @@ let satStartIdx = -1;
         } else {
             walkSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
         }
-        walkSoc = Math.max(MIN_SOC_PCT, Math.min(100, walkSoc));
+        walkSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, walkSoc));
         s._plannedSoc = walkSoc;
     }
 }
@@ -2235,21 +2276,21 @@ for (let i = 0; i < schedule.length; i++) {
     }
     // (Profit-charge is now planned in Phase 3f as _plan='charge'; no runtime branch.)
     // Strong PV surplus: let solar charge battery
-    else if (pvW - loadW > 1000 && soc < 95) {
+    else if (pvW - loadW > 1000 && soc < SOC_CEILING_PCT) {
         state = 3; setPoint = -AVG_LOAD_W;
         reason = `Strong PV surplus ${(pvW - loadW)}W, solar charges battery`;
     }
     // PV surplus + battery near full. Two firing conditions:
-    //   1. Imminent curtailment (soc ≥ 99): PV is being wasted, sell at any
+    //   1. Imminent curtailment (soc ≥ SOC_CURTAIL_PCT): PV is being wasted, sell at any
     //      mp > FEEDIN_MIN_MP_CT.
     //   2. Round-trip profitable: mp > replacementPrice (drained SOC is
     //      cheaper to replace at PV/morning-grid than the current sell mp).
     // Otherwise hold (state=3): the cluster best-mp slot was either picked
     // by Phase 3d's saturation pass (feedin_saturation plan) and will fire
     // at its slot, or no slot in the cluster is economic — don't cycle the
-    // battery for a loss-making sale at the first soc≥95 slot.
-    else if (pvW - loadW > 500 && soc >= 95) {
-        if (soc >= 99 && mp > FEEDIN_MIN_MP_CT) {
+    // battery for a loss-making sale at the first slot to touch the ceiling.
+    else if (pvW - loadW > 500 && soc >= SOC_CEILING_PCT) {
+        if (soc >= SOC_CURTAIL_PCT && mp > FEEDIN_MIN_MP_CT) {
             state = 4; setPoint = -MAX_DISCHARGE_W;
             reason = `Battery curtailing ${soc.toFixed(0)}%, feed-in at ${mp.toFixed(1)}ct`;
         } else if (mp > replacementPrice && mp > FEEDIN_MIN_MP_CT) {
@@ -2299,12 +2340,13 @@ for (let i = 0; i < schedule.length; i++) {
     // --- Hold-for-sun-poor-tomorrow override (user rule) ---------------------
     // On a sun-poor-tomorrow day, never feed STORED energy to the grid. Feed-in is
     // allowed ONLY as genuine overflow: there is live PV surplus (pv > load) AND the
-    // battery is already full (SOC >= 99 or cell at the ceiling) — i.e. PV that
+    // battery is already full (SOC >= SOC_CURTAIL_PCT or cell at the voltage
+    // ceiling) — i.e. PV that
     // physically can't be stored. Everything else (selling at the evening peak, or
     // dumping surplus while the battery still has room) is converted to compensate,
     // so the surplus tops the battery toward 100% and stored energy is held.
     const _pvOverflow = (pvW - loadW) > 0
-        && (soc >= 99 || (maxCellV !== null && maxCellV >= CELL_FULL_V));
+        && (soc >= SOC_CURTAIL_PCT || (maxCellV !== null && maxCellV >= CELL_FULL_V));
     if (state === 4 && tomorrowSunPoor && !_pvOverflow) {
         state = 3; setPoint = -AVG_LOAD_W;
         reason = `Hold for sun-poor tomorrow — no feed-in below full (was sell @${mp.toFixed(1)}ct, SOC ${soc.toFixed(0)}%)`;
