@@ -1132,9 +1132,19 @@ for (const s of schedule) {
 let pvOnlySatIdx = -1;
 let pvOnlyOverflowRaw = 0;
 let pvOnlyTroughSoc = 0; // SOC that must stay in the pack to reach the saturation
+// Whether PV ALONE brings the pack back UP to the planning ceiling after
+// dipping below it — i.e. "sufficient PV output on the next day" (user rule).
+// This is what makes the ceiling band free to sell: hold it and tomorrow's sun
+// is curtailed into the room it occupies; sell it and the same sun refills it,
+// leaving us the same SOC tomorrow evening plus tonight's revenue on the band.
+// The dip is required. Without it a dark day trivially qualifies, because a
+// pack that starts above the ceiling reads as "at the ceiling" for the first
+// few slots while it is simply draining and never coming back.
+let pvOnlyRefillsCeiling = false;
 {
     let s0 = currentSoc;
     let trough = currentSoc;
+    let dippedBelowCeiling = false;
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
         s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
@@ -1150,6 +1160,8 @@ let pvOnlyTroughSoc = 0; // SOC that must stay in the pack to reach the saturati
         }
         if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
         if (pvOnlySatIdx < 0 && s0 < trough) trough = s0;
+        if (s0 < SOC_CEILING_PCT) dippedBelowCeiling = true;
+        else if (dippedBelowCeiling) pvOnlyRefillsCeiling = true;
     }
 }
 
@@ -1558,10 +1570,32 @@ let projSocPhys = currentSoc;
     // first spill run (before the ceiling it lived inside projSoc, which was
     // clamped at the rail), and the pre-saturation pass would then walk past
     // the best morning price waiting for a confirmation the band never needed.
-    const _ovBand = Math.min(overflowSoc, SOC_CEILING_BAND_PCT);
+    const ceilingBandSoc = Math.min(overflowSoc, SOC_CEILING_BAND_PCT);
     const _phBand = Math.min(postHorizonOverflow, SOC_CEILING_BAND_PCT);
-    overflowSoc = _ovBand + dampOverflow('overflowSoc', overflowSoc - _ovBand);
+    overflowSoc = ceilingBandSoc + dampOverflow('overflowSoc', overflowSoc - ceilingBandSoc);
     postHorizonOverflow = _phBand + dampOverflow('postHorizonOverflow', postHorizonOverflow - _phBand);
+
+    // The ceiling band is exempt from the round-trip check and the cross-day
+    // hold exactly when the sun will put it back (user rule: apply the ceiling
+    // when sufficient PV is expected the next day). Holding the band against a
+    // higher peak tomorrow is a straight loss in that case — tomorrow's PV is
+    // curtailed at 0 ct into the room the band occupies, and we sell the same
+    // stored kWh at the higher price either way, so keeping it costs tonight's
+    // whole price. Bounded at SOC_CEILING_BAND_PCT (~1.2 kWh), which is also
+    // the exposure if the forecast is wrong and we grid-refill it instead.
+    // tomorrowSunPoor vetoes outright: that rule holds stored energy for the
+    // sunless day, and this is precisely its inverse, not an exception to it.
+    //
+    // Damped like every other overflow that unlocks a sale. The band itself is
+    // deterministic, but "the sun refills it" is a forecast claim, and it is
+    // only ever nonzero when the budget walk projects a climb past the ceiling
+    // — i.e. exactly the unconfirmed wall dampOverflow exists to sit out. Left
+    // raw it punched straight through the damping window and sold a near-floor
+    // morning on the first spill run (the 2026-08-27 wobble: 07:45 projected a
+    // wall, 08:00 projected none). Its own history key, so it confirms on the
+    // second consecutive run without borrowing another signal's window.
+    const ceilingBandExempt = dampOverflow('ceilingBandExempt',
+        (pvOnlyRefillsCeiling && !tomorrowSunPoor) ? ceilingBandSoc : 0);
     // Damped here rather than further down with the replacement-price block so
     // the free-refill test below can consult it. Same value, same single
     // dampOverflow call per run — only the position moved.
@@ -1716,7 +1750,12 @@ let projSocPhys = currentSoc;
     const replacementPriceLate = (cheapPvRefillAhead || pvWillCurtail || postSchedPvWillCurtail)
         ? Math.min(minReplacementEffPrice, pvOpportunityPrice)
         : minReplacementEffPrice;
-    const eligibleOverflowLate = pvOnlyOverflow + postSchedPvOverflow;
+    const eligibleOverflowLate = pvOnlyOverflow + postSchedPvOverflow + ceilingBandExempt;
+    // Base for the cross-day hold's curtailment-bound exemption. The hold
+    // deliberately does NOT get postSchedPvOverflow (speculative, days past the
+    // peak); the ceiling band is different in kind — it is energy the pack is
+    // carrying right now, above a ceiling we have already decided to hold to.
+    const eligibleOverflowHold = pvOnlyOverflow + ceilingBandExempt;
 
     // Single-pass selection with per-slot replacement logic. Candidates are
     // sorted by mp DESC, so picks happen in best-revenue-first order globally.
@@ -1820,11 +1859,11 @@ let projSocPhys = currentSoc;
         if (relief <= 0) return false;
         if (usedBudget >= budgetCap) return 'full';
         const holdExemptSoc = typeof exemptSoc === 'number' && isFinite(exemptSoc)
-            ? Math.max(pvOnlyOverflow, exemptSoc)
-            : pvOnlyOverflow;
+            ? Math.max(eligibleOverflowHold, exemptSoc)
+            : eligibleOverflowHold;
         const isLate = idx > lastPlannedChargeIdx;
         const slotReplacementPrice = isLate ? replacementPriceLate : replacementPriceEarly;
-        const slotEligibleOverflow = isLate ? eligibleOverflowLate : pvOnlyOverflow;
+        const slotEligibleOverflow = isLate ? eligibleOverflowLate : pvOnlyOverflow + ceilingBandExempt;
         // Curtailment ("overflow") energy only physically exists in slots where
         // PV actually exceeds load and the battery is at cap. Feeding the early
         // overflow budget into a PV<=load slot (e.g. tonight's evening peak,

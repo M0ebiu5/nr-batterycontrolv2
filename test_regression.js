@@ -2261,6 +2261,132 @@ function scenario21_preemptiveReplacementPostSunrise() {
     return true;
 }
 
+
+// =========================================================
+// SCENARIO 22: The planning ceiling (95%) leaves the top of
+// the pack free for the next morning's sun, but only when that
+// sun actually shows up. Holding the ceiling band against a
+// higher price tomorrow is a straight loss when tomorrow is
+// sunny: the PV that would have refilled the band gets
+// curtailed at 0 ct into the room the band occupies, and the
+// same stored kWh reaches tomorrow's peak either way — so the
+// hold costs tonight's whole price for nothing. When tomorrow
+// is dull the band is ordinary stored energy and the cross-day
+// hold must keep it. "Sunny enough" is a forecast claim, so it
+// carries the same damping window as every other overflow that
+// unlocks a sale: one run is not evidence.
+// =========================================================
+function scenario22_ceilingBandFreedByNextDaySun() {
+    console.log('\n=== SCENARIO 22: Ceiling band sells only when tomorrow refills it ===');
+
+    const CEILING = Number((/const SOC_CEILING_PCT = (\d+)/.exec(SRC) || [, '95'])[1]);
+
+    //   18:00  dull tomorrow      -> band is normal energy, hold; seeds damping
+    //   18:15  sunny tomorrow     -> first run of the claim, still holds
+    //   18:30  sunny tomorrow     -> confirmed, sells the band down to the ceiling
+    const NOW_A = Date.UTC(2026, 4, 6, 16, 0);  // 18:00 Berlin
+    const NOW_B = NOW_A + 15 * 60 * 1000;
+    const NOW_C = NOW_A + 30 * 60 * 1000;
+    const slots = 120;                          // ~30h → covers tomorrow's daylight
+
+    const berlinHour = (t) => (((new Date(t).getUTCHours() + 2) % 24) + 24) % 24;
+    const bDay = (ms) => { const d = new Date(ms + 2 * 3600000); return d.getUTCDate(); };
+
+    // Tomorrow's evening outbids tonight's, so the cross-day hold is the thing
+    // standing between us and the band. Without the ceiling rule it wins.
+    const TONIGHT_CT = 21, TOMORROW_CT = 26;
+    const prices = buildPriceArray(NOW_A, slots, (t) => {
+        const h = berlinHour(t);
+        if (h >= 18 && h <= 21) return bDay(t) === bDay(NOW_A) ? TONIGHT_CT : TOMORROW_CT;
+        if (h >= 6 && h <= 9) return 17;
+        if (h >= 10 && h <= 15) return 9;
+        return 14;
+    });
+
+    // Sunny = refills the pack past the ceiling. Dull = drains and never returns.
+    const buildSolar = (minutesPerHour) => {
+        const out = [];
+        for (let h = 0; h < 32; h++) {
+            const t = NOW_A + h * 3600000;
+            const hour = berlinHour(t);
+            out.push({ time: t, sunshineDurationInMinutes: (hour >= 8 && hour <= 16) ? minutesPerHour : 0 });
+        }
+        return out;
+    };
+    const solarDull = buildSolar(20);
+    const solarSunny = buildSolar(32);
+
+    const buildMsg = (now, solar) => ({
+        payload: {
+            soc: [{ time: NOW_A, soc: 98 }],        // above the ceiling, inside the band
+            acload: [{ time: NOW_A, acload: 700 }],
+            power: [{ time: NOW_A, power: 0 }],
+            pv_now: [{ time: NOW_A, pv_now: 0 }],
+            prices,
+            solar,
+            load_history: buildLoadHistory(NOW_A),
+            pv_history: buildPvHistory(NOW_A)
+        },
+        weather: {
+            sunRise: new Date(Date.UTC(2026, 4, 7, 3, 30)).toISOString(),
+            sunSet: new Date(Date.UTC(2026, 4, 7, 18, 30)).toISOString(),
+            solarradiation: 0,
+            rainrate: 0
+        }
+    });
+
+    // One store across all runs so the damping history carries.
+    const store = {};
+    const at = (now, solar) => {
+        const result = withMockedNow(now, () => runOptimizer(buildMsg(now, solar), store));
+        return getSchedule(result);
+    };
+    const A = at(NOW_A, solarDull);
+    const B = at(NOW_B, solarSunny);
+    const C = at(NOW_C, solarSunny);
+
+    const peakOf = r => Math.max(...r.map(s => s.predictedSoc));
+    const soldTonight = r => r.slice(0, 16).filter(s => s.state === 4).length;
+
+    for (const [label, r] of [['18:00 dull', A], ['18:15 sunny', B], ['18:30 sunny', C]]) {
+        console.log(`  ${label}: peakSoc=${peakOf(r).toFixed(1)}% tonightState4=${soldTonight(r)}`);
+    }
+
+    // Direction 1 — a dull tomorrow leaves the band alone. This is the sun-poor
+    // hold rule, and the ceiling must not become a loophole in it.
+    if (peakOf(A) <= CEILING || soldTonight(A) > 0) {
+        console.error(`  FAIL: dull tomorrow still sold the band (peak ${peakOf(A).toFixed(1)}%, `
+            + `${soldTonight(A)} slot(s)) — the ceiling is overriding the sun-poor hold`);
+        return false;
+    }
+
+    // Direction 2 — one sunny forecast is not evidence. A wobble must not move it.
+    if (peakOf(B) <= CEILING || soldTonight(B) > 0) {
+        console.error(`  FAIL: 18:15 sold the band on the FIRST sunny run (peak ${peakOf(B).toFixed(1)}%, `
+            + `${soldTonight(B)} slot(s)) — the band bypasses the damping window`);
+        return false;
+    }
+
+    // Direction 3 — once the sun is confirmed, the band has to go, even though
+    // tomorrow's peak is 5ct better than tonight's.
+    if (peakOf(C) > CEILING) {
+        console.error(`  FAIL: 18:30 held the pack at ${peakOf(C).toFixed(1)}% above the ${CEILING}% ceiling `
+            + `with tomorrow's sun confirmed — tomorrow's PV will be curtailed into that room, `
+            + `and the ${TOMORROW_CT}ct hold gains nothing over selling at ${TONIGHT_CT}ct`);
+        return false;
+    }
+    if (soldTonight(C) === 0) {
+        console.error('  FAIL: 18:30 planned to the ceiling but sold nothing tonight — '
+            + 'the band was clipped in the projection instead of being turned into revenue');
+        return false;
+    }
+
+    console.log(`  PASS: dull tomorrow held at ${peakOf(A).toFixed(1)}%; first sunny run held at `
+        + `${peakOf(B).toFixed(1)}%; confirmed run planned to ${peakOf(C).toFixed(1)}% (≤${CEILING}%) `
+        + `and sold ${soldTonight(C)} slot(s) tonight at ${TONIGHT_CT}ct`);
+    return true;
+}
+
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
     ['no negative feed-in',         scenario2_noNegativeFeedIn],
@@ -2282,7 +2408,8 @@ const results = [
     ['damping window unlocks on second spill run', scenario18_dampingWindowUnlocksOnSecondRun],
     ['raw-spill exemption bounded by regret',     scenario19_rawSpillExemptionBoundedByRegret],
     ['evening peak not outbid by tomorrow',       scenario20_horizonAnchoredToTrough],
-    ['preemptive drain acts after sunrise',       scenario21_preemptiveReplacementPostSunrise]
+    ['preemptive drain acts after sunrise',       scenario21_preemptiveReplacementPostSunrise],
+    ['ceiling band freed by next-day sun',        scenario22_ceilingBandFreedByNextDaySun]
 ];
 
 let passed = 0;
