@@ -510,33 +510,65 @@ function scenario5_cloudyForecastHonored() {
 
 // =========================================================
 // SCENARIO 6: User report — last slot at 14.04 23:45 predicted
-// SOC = 8.4% with bad next-day PV forecast. Root cause: the old
+// SOC = 8.4% with a bad next-day PV forecast. Root cause: the old
 // _postSchedLoadKwh computed the overnight gap via a broken
 // "sunrise + 24h" heuristic that returned 0 whenever the schedule
-// extended past the next sunrise. With no reserve, socNeeded at
-// the last slot was just MIN_SOC+5 = 8%, so the optimizer happily
-// drained the battery to the floor.
-// Fix: walk 24h forward from lastSlotEnd using forecast-weighted
+// extended past the next sunrise. With no reserve, the last slot's
+// target was just the plain minTargetSoc floor, so the optimizer
+// happily drained the battery to it right before a sunless day.
+// Fix: walk 48h forward from lastSlotEnd using forecast-weighted
 // net load. Bad forecast → reserve climbs → Phase 3 charges more.
+//
+// Re-anchored 2026-09-03. The original assertions capped the end
+// SOC at 40% and scraped socNeeded out of the last slot's reason
+// string. Both went stale when the multi-day reserve landed
+// (35064a2): on a dead-PV streak that reserve deliberately holds
+// ~80%, which is the documented calibration and the opposite of
+// the bug — and the last slot is now a planned charge, whose
+// reason carries no socNeeded to scrape, so the check read null
+// and failed on a reserve that was in fact being computed. The
+// scenario now asserts on the Phase 3c diagnostic, and brackets
+// the reserve from BOTH sides: it must be big enough that the old
+// drain-to-floor bug cannot come back, and bounded by
+// MAX_RESERVE_KWH so a runaway walk cannot quietly grid-charge
+// the pack full on every cloudy day.
 // =========================================================
 function scenario6_endOfScheduleReserveBadForecast() {
     console.log('\n=== SCENARIO 6: Schedule past next sunrise + bad forecast → reserve SOC ===');
 
+    // Read the calibration out of the source so retuning the reserve moves
+    // this test's bounds with it instead of silently failing.
+    const num = (re, dflt) => Number((re.exec(SRC) || [, dflt])[1]);
+    const CAP_KWH = num(/const MAX_RESERVE_KWH = (\d+)/, '21');
+    const BATT_KWH = num(/const BATTERY_CAPACITY_KWH = (\d+)/, '30');
+    const MIN_SOC = num(/const MIN_SOC_PCT = (\d+)/, '5');
+    const GRID_CAP = num(/const MAX_GRID_CHARGE_SOC_PCT = (\d+)/, '90');
+    const minTargetSoc = MIN_SOC + 5;                       // the old bug's floor
+    const cappedTarget = minTargetSoc + (CAP_KWH / BATT_KWH) * 100;  // ~80%
+
     // "Now" = 2026-04-13 15:00 Berlin (UTC 13:00). Day-ahead prices for
-    // 14.04 already published, so schedule extends to 14.04 23:45 Berlin.
+    // 14.04 already published, so schedule extends to 14.04 23:45 Berlin
+    // and the FULL multi-day walk runs (not the pre-publish bridge).
     const NOW = Date.UTC(2026, 3, 13, 13, 0);
     const startMs = NOW;
     const slots = 132; // 33h → 15:00 today to 14.04 23:45 Berlin
 
-    // Realistic price profile with some cheap slots available for charging
+    // Deterministic jitter. This used to be Math.random(), which moved the
+    // end SOC by ~0.5 points between runs — tolerable for a pass/fail band,
+    // but it makes any failure here unreproducible.
+    let _seed = 20260413;
+    const jitter = () => {
+        _seed = (_seed * 1103515245 + 12345) & 0x7fffffff;
+        return _seed / 0x7fffffff;
+    };
     const prices = buildPriceArray(startMs, slots, (t) => {
         const hour = ((new Date(t).getUTCHours() + 2) % 24 + 24) % 24;
-        if (hour >= 18 && hour < 22) return 22 + Math.random() * 4; // evening peak
-        if (hour >= 22) return 12 + Math.random() * 2;
-        if (hour < 5) return 6 + Math.random() * 2; // overnight trough
-        if (hour < 9) return 14 + Math.random() * 3; // morning ramp
-        if (hour < 15) return 10 + Math.random() * 3; // midday (no PV trough because cloudy)
-        return 13 + Math.random() * 3;
+        if (hour >= 18 && hour < 22) return 22 + jitter() * 4; // evening peak
+        if (hour >= 22) return 12 + jitter() * 2;
+        if (hour < 5) return 6 + jitter() * 2;  // overnight trough
+        if (hour < 9) return 14 + jitter() * 3; // morning ramp
+        if (hour < 15) return 10 + jitter() * 3; // midday (no PV trough because cloudy)
+        return 13 + jitter() * 3;
     });
 
     // BAD forecast: almost no sunshine at all — simulating cloudy/rainy day
@@ -570,40 +602,69 @@ function scenario6_endOfScheduleReserveBadForecast() {
 
     const result = withMockedNow(NOW, () => runOptimizer(msg));
     const schedule = getSchedule(result);
+    const warns = warnLog.slice();
 
     const lastSlot = schedule[schedule.length - 1];
     console.log(`  last slot: ${fmtSlot(lastSlot)}`);
 
-    // Extract socNeeded from the reason string
-    const m = /> (\d+)% needed/.exec(lastSlot.reason);
-    const socNeeded = m ? parseInt(m[1]) : null;
-    if (socNeeded !== null) console.log(`  last slot socNeeded = ${socNeeded}%`);
+    // The reserve is observable in the Phase 3c line: endTarget is
+    // minTargetSoc + kwhToSoc(_postSchedLoadKwh) for the final slot.
+    const phase3c = warns.find(w => w.includes('Phase 3c:')) || '';
+    const endTarget = Number((/endTarget=([\d.]+)%/.exec(phase3c) || [, NaN])[1]);
+    const peakTraj = Number((/peakTraj=([\d.]+)%/.exec(phase3c) || [, NaN])[1]);
+    console.log(`  reserve: endTarget=${endTarget}% peakTraj=${peakTraj}% endSoc=${lastSlot.predictedSoc}%`);
 
-    // Acceptance: with a bad-forecast reserve the floor should be
-    // meaningfully above the old bug's MIN_SOC+5 = 8%, but not absurd.
-    // The reserve covers the blind window until next-day prices publish
-    // (~14h × ~700W × mostly-no-PV → ~9.8 kWh → capped at 6 kWh = 20%,
-    // then +MIN_SOC(3)+5 = ~28%).
+    // Setup sanity: this scenario is about the MULTI-DAY reserve, which only
+    // runs once tomorrow's prices are published. If the schedule stopped
+    // short, the pre-publish overnight bridge would run instead and the
+    // scenario would be testing a different branch entirely.
+    if (!phase3c) {
+        console.error('  setup drift: no Phase 3c diagnostic — the reserve is no longer reported there');
+        return false;
+    }
+    if (/multi-day reserve deferred/.test(phase3c)) {
+        console.error(`  setup drift: reserve was DEFERRED (${phase3c}) — the schedule no longer `
+            + 'reaches past the publish threshold, so the multi-day walk is not being exercised');
+        return false;
+    }
+
     let ok = true;
-    if (socNeeded === null || socNeeded < 20) {
-        console.error(`  FAIL: socNeeded ${socNeeded}% < 20% (reserve not honoring bad forecast)`);
+
+    // Direction 1 — the bug. A sunless 48h ahead must produce a real reserve,
+    // nowhere near the bare minTargetSoc floor the optimizer used to drain to.
+    if (!isFinite(endTarget) || endTarget < 60) {
+        console.error(`  FAIL: endTarget ${endTarget}% is not honoring the bad forecast `
+            + `(bare floor is ${minTargetSoc}%) — the post-schedule walk has gone blind again`);
         ok = false;
     }
-    if (socNeeded !== null && socNeeded > 35) {
-        console.error(`  FAIL: socNeeded ${socNeeded}% > 35% (reserve too aggressive)`);
+
+    // Direction 2 — the reserve must stay bounded. MAX_RESERVE_KWH is what
+    // stops a dead-PV walk from reserving the whole pack and grid-charging
+    // to full at retail on every cloudy day.
+    if (endTarget > cappedTarget + 0.5) {
+        console.error(`  FAIL: endTarget ${endTarget}% exceeds the ${CAP_KWH}kWh cap `
+            + `(${cappedTarget.toFixed(1)}%) — MAX_RESERVE_KWH is no longer binding`);
         ok = false;
     }
-    if (lastSlot.predictedSoc < 15) {
-        console.error(`  FAIL: last slot SOC ${lastSlot.predictedSoc}% too low (draining to floor)`);
+
+    // Direction 3 — computing a reserve is not the same as honoring it. The
+    // plan has to actually arrive at the end of the schedule holding it.
+    if (lastSlot.predictedSoc < endTarget - 10) {
+        console.error(`  FAIL: last slot SOC ${lastSlot.predictedSoc}% falls ${(endTarget - lastSlot.predictedSoc).toFixed(1)} `
+            + `points short of the ${endTarget}% reserve — Phase 3c computed it and the plan ignored it`);
         ok = false;
     }
-    if (lastSlot.predictedSoc > 40) {
-        console.error(`  FAIL: last slot SOC ${lastSlot.predictedSoc}% > 40% (over-reserving)`);
+
+    // Direction 4 — the reserve must not push planned grid-charging past the
+    // Phase 3c cap; that cap is what keeps unforecast PV some headroom.
+    if (isFinite(peakTraj) && peakTraj > GRID_CAP + 0.5) {
+        console.error(`  FAIL: peakTraj ${peakTraj}% breaks the ${GRID_CAP}% grid-charge cap`);
         ok = false;
     }
 
     if (ok) {
-        console.log(`  PASS: socNeeded=${socNeeded}%, endSOC=${lastSlot.predictedSoc}%`);
+        console.log(`  PASS: dead-PV 48h → reserve ${endTarget}% (capped at ${cappedTarget.toFixed(1)}%), `
+            + `plan ends at ${lastSlot.predictedSoc}%, peak ${peakTraj}% under the ${GRID_CAP}% cap`);
         return true;
     }
     return false;
