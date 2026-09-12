@@ -103,6 +103,9 @@ const CELL_FULL_V = 3.50;       // V/cell ceiling that blocks grid-charge
 const _nowMs = Date.now();
 let maxCellV = lastVal(raw.soc, 'maxCellV');
 if (typeof maxCellV !== 'number' || !isFinite(maxCellV)) maxCellV = null;
+let minCellV = lastVal(raw.soc, 'minCellV');
+if (typeof minCellV !== 'number' || !isFinite(minCellV)) minCellV = null;
+const _minCellTxt = minCellV === null ? 'n/a' : minCellV.toFixed(3) + 'V';
 
 let socTrust = true;
 if (!(typeof currentSoc === 'number' && isFinite(currentSoc) && currentSoc >= 0 && currentSoc <= 100)) {
@@ -157,6 +160,42 @@ global.set('socFresh', { soc: currentSoc, changedAt: _socChangedAt, warnedAt: _s
 // Suppress grid-charge of the LIVE slot when the reading can't be trusted or a pack
 // is at the cell-voltage ceiling. (Applied at i===0 only; future slots re-evaluate.)
 const gridChargeBlocked = !socTrust || (maxCellV !== null && maxCellV >= CELL_FULL_V);
+
+// --- Cell-voltage floor (the mirror of CELL_FULL_V) --------------------------
+// CELL_FULL_V trusts cell voltage over SOC% at the top of the pack. Nothing did
+// the same at the bottom, and that is where the trusted BMS SOC is least honest:
+// on the night of 2026-09-11 bat_ost's minimum cell fell to 3.176 V - the bottom
+// of the LFP knee - while it still reported 25.2%, the weighted feed said ~35%,
+// and the planner sat comfortably above its floor. Victron read 6% that night.
+// Cell voltage is measured, not integrated, and it does not care which counter
+// has drifted, so use it at the bottom too: stop exporting at CELL_EMPTY_V, and
+// below CELL_CRITICAL_V stop discharging at all and let the grid carry the house
+// until the pack comes back to CELL_RECOVER_V. The latch is what makes the lower
+// tier usable - a rested pack rebounds above the trip point within seconds, so
+// without hysteresis the guard would chatter on and off every run.
+// Anchored to what the packs actually do, not to a datasheet: over 2026-09-11/12
+// the trough was 3.176 V (bat_ost, at ~0.03C) and the lowest reading under real
+// load (>10 A) was 3.199 V. A critical tier down at 3.10 would never once have
+// fired. 3.18 sits just above that trough, so it bites at the bottom of the night
+// and nowhere else; no healthy pack under load came near it.
+const CELL_EMPTY_V    = 3.22;   // any pack's min cell at/below this: no export
+const CELL_CRITICAL_V = 3.18;   // ...and at/below this: no discharge at all
+const CELL_RECOVER_V  = 3.26;   // the latch clears only once a pack recovers here
+const _cellGuard = global.get('cellGuard') || {};
+let cellFloorLatched = !!_cellGuard.latched;
+if (minCellV !== null) {
+    if (minCellV <= CELL_CRITICAL_V) cellFloorLatched = true;
+    else if (minCellV >= CELL_RECOVER_V) cellFloorLatched = false;
+}
+if (cellFloorLatched !== !!_cellGuard.latched) {
+    global.set('cellGuard', { latched: cellFloorLatched, since: _nowMs });
+    node.warn(cellFloorLatched
+        ? `Cell floor: min cell ${_minCellTxt} \u2264 ${CELL_CRITICAL_V}V while SOC reads ${currentSoc.toFixed(1)}% \u2192 resting the pack, grid carries the house until ${CELL_RECOVER_V}V`
+        : `Cell floor cleared: min cell ${_minCellTxt} \u2265 ${CELL_RECOVER_V}V \u2192 discharge released`);
+}
+// Applied at i===0 only, exactly like gridChargeBlocked; future slots re-evaluate.
+const exportBlocked = cellFloorLatched || (minCellV !== null && minCellV <= CELL_EMPTY_V);
+const dischargeBlocked = cellFloorLatched;
 
 // Current AC load
 let currentLoad = lastVal(raw.acload, 'acload');
@@ -2400,6 +2439,13 @@ for (let i = 0; i < schedule.length; i++) {
         reason = `Feed-in blocked: last command under-delivered (SOC ${soc.toFixed(0)}% not deliverable)`;
     }
 
+    // --- Cell-voltage floor -------------------------------------------------
+    // A pack down at the knee has nothing left to sell, whatever SOC claims.
+    if (i === 0 && state === 4 && exportBlocked) {
+        state = 3; setPoint = -AVG_LOAD_W;
+        reason = `Feed-in blocked: min cell ${_minCellTxt} at the floor (SOC ${soc.toFixed(0)}% not deliverable)`;
+    }
+
     // === Update SOC prediction ===
     let socDelta = 0;
 
@@ -2470,7 +2516,9 @@ msg.summary = {
     preemptiveSlots: preemptiveDischargeSlots.size,
     socSource: _socSource,
     socFlatMin: Math.round(_socFlatMin),
-    socStale: socStale
+    socStale: socStale,
+    minCellV: minCellV,
+    cellFloorLatched: cellFloorLatched
 };
 
 
@@ -2518,6 +2566,17 @@ if (_cmdState === 1) {
     _maxDischarge = -1;
     _setPointWhy = `state 3 at ${_mpTxt}: self-consumption, grid held near ${IDLE_SETPOINT_W}W so the pack covers the house and nothing is forced either way`;
     _maxDischargeWhy = '-1 = no limit, the pack is free to cover whatever the house draws';
+}
+
+// Cell floor: a pack is at the bottom of the knee whatever the SOC number says.
+// Hold the grid setpoint at idle with discharge pinned to 0 and the house runs on
+// the grid until the cells recover. State 1 already pins discharge to 0 while it
+// fills the pack, so this only ever bites on a state 3 or on a cancelled export.
+if (dischargeBlocked && _maxDischarge !== 0) {
+    _acSetPoint = IDLE_SETPOINT_W;
+    _maxDischarge = 0;
+    _setPointWhy = `cell floor at ${_minCellTxt}: grid held near ${IDLE_SETPOINT_W}W, nothing forced either way`;
+    _maxDischargeWhy = `pinned to 0: a pack sits at or below ${CELL_CRITICAL_V}V per cell, so the grid carries the house until it recovers to ${CELL_RECOVER_V}V`;
 }
 
 // Hard rule: never export at a negative market price - we would be paying the

@@ -51,6 +51,8 @@ function runOptimizer(msg, globalStore) {
 }
 
 const PRESAT_RAW_MAX_REGRET_CT_DOC = (/const PRESAT_RAW_MAX_REGRET_CT = (\d+)/.exec(SRC) || [, '?'])[1];
+const CELL_V = Object.fromEntries(['CELL_EMPTY_V', 'CELL_CRITICAL_V', 'CELL_RECOVER_V'].map(
+    k => [k, parseFloat((new RegExp('const ' + k + '\\s*=\\s*([\\d.]+)').exec(SRC) || [, 'NaN'])[1])]));
 
 // --- Scenario builders ---
 
@@ -2448,6 +2450,92 @@ function scenario22_ceilingBandFreedByNextDaySun() {
     return true;
 }
 
+// =========================================================
+// SCENARIO 23: Cell-voltage floor. The trusted BMS SOC runs
+// optimistic at the bottom — on the night of 2026-09-11
+// bat_ost's minimum cell reached 3.176 V, the bottom of the
+// LFP knee, while it still reported 25.2% and the weighted
+// feed said ~35%. SOC alone therefore cannot protect the pack,
+// so cell voltage gates discharge the way CELL_FULL_V already
+// gates charge. Same SOC (a comfortable 60%) and the same rich
+// evening price in every case; only minCellV moves, so any
+// difference in the verdict is the floor and nothing else.
+// The latch is the part worth pinning: a rested pack rebounds
+// above the trip point within seconds, so a guard without
+// hysteresis would release on its very next run.
+// =========================================================
+function scenario23_cellVoltageFloor() {
+    console.log('\n=== SCENARIO 23: Cell-voltage floor gates discharge, not SOC ===');
+    const NOW = Date.UTC(2026, 8, 12, 17, 0);         // 19:00 Berlin, evening peak
+    const startMs = NOW - 3600 * 1000;
+
+    function run(minCellV, store) {
+        const socRow = { time: NOW, soc: 60, maxCellV: 3.33 };
+        if (minCellV !== null) socRow.minCellV = minCellV;
+        const msg = {
+            payload: {
+                soc: [socRow],
+                acload: [{ time: NOW, acload: 700 }],
+                power: [{ time: NOW, power: -700 }],
+                pv_now: [{ time: NOW, pv_now: 0 }],
+                // Rich now, cheap later: the plan wants to sell this slot.
+                prices: buildPriceArray(startMs, 96, (t, i) => (i < 6 ? 35 : 8)),
+                solar: buildSolarForecast(startMs, 36),
+                load_history: buildLoadHistory(NOW),
+                pv_history: buildPvHistory(NOW)
+            },
+            weather: {
+                sunRise: new Date(Date.UTC(2026, 8, 13, 4, 40)).toISOString(),
+                sunSet: new Date(Date.UTC(2026, 8, 12, 17, 20)).toISOString(),
+                solarradiation: 0,
+                rainrate: 0
+            }
+        };
+        const out = withMockedNow(NOW, () => runOptimizer(msg, store || {}));
+        return {
+            state: out[2].payload.state,
+            setPoint: out[2].payload.cerbo.AcPowerSetPoint.value,
+            maxDischarge: out[2].payload.cerbo.MaxDischargePower.value,
+            latched: out[0].summary.cellFloorLatched,
+            reason: out[0].currentAction ? out[0].currentAction.reason : ''
+        };
+    }
+
+    const _healthy = +(CELL_V.CELL_RECOVER_V + 0.05).toFixed(3);
+    let ok = true;
+    function check(label, r, want) {
+        const pass = r.state === want.state
+            && r.maxDischarge === want.maxDischarge
+            && r.latched === want.latched;
+        if (!pass) ok = false;
+        console.log(`  ${pass ? 'ok  ' : 'FAIL'} ${label}: state=${r.state} ` +
+            `setPoint=${r.setPoint}W maxDischarge=${r.maxDischarge} latched=${r.latched}` +
+            (pass ? '' : ` (wanted state=${want.state} maxDischarge=${want.maxDischarge} latched=${want.latched})`));
+    }
+
+    // Healthy pack: the 35ct slot sells, exactly as it did before the guard.
+    check(`healthy cells ${_healthy}V`, run(_healthy), { state: 4, maxDischarge: -1, latched: false });
+    // No minCellV at all (feed absent): must not block anything.
+    check('minCellV absent', run(null), { state: 4, maxDischarge: -1, latched: false });
+    // At the export floor: stop selling, but the pack may still cover the house.
+    check(`at CELL_EMPTY_V ${CELL_V.CELL_EMPTY_V}V`, run(CELL_V.CELL_EMPTY_V), { state: 3, maxDischarge: -1, latched: false });
+    // Below the critical floor: stop discharging altogether, grid takes the house.
+    check(`at CELL_CRITICAL_V ${CELL_V.CELL_CRITICAL_V}V`, run(CELL_V.CELL_CRITICAL_V), { state: 3, maxDischarge: 0, latched: true });
+
+    // The latch: once tripped it must survive a rebound to 3.22V (above the
+    // 3.20V export floor, below the 3.25V recovery point) and only release at 3.25V.
+    const _mid = +((CELL_V.CELL_EMPTY_V + CELL_V.CELL_RECOVER_V) / 2).toFixed(3);
+    const latched = { cellGuard: { latched: true, since: NOW - 600000 } };
+    check(`rebound to ${_mid}V stays latched`, run(_mid, latched), { state: 3, maxDischarge: 0, latched: true });
+    const recovering = { cellGuard: { latched: true, since: NOW - 600000 } };
+    check(`recovered to ${CELL_V.CELL_RECOVER_V}V releases`, run(CELL_V.CELL_RECOVER_V, recovering), { state: 4, maxDischarge: -1, latched: false });
+
+    console.log(ok
+        ? `  PASS: ${CELL_V.CELL_EMPTY_V}V stops the sale, ${CELL_V.CELL_CRITICAL_V}V rests the pack, the latch holds through ${_mid}V and clears at ${CELL_V.CELL_RECOVER_V}V`
+        : '  FAIL: cell floor verdict wrong for at least one case');
+    return ok;
+}
+
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
     ['no negative feed-in',         scenario2_noNegativeFeedIn],
@@ -2470,7 +2558,8 @@ const results = [
     ['raw-spill exemption bounded by regret',     scenario19_rawSpillExemptionBoundedByRegret],
     ['evening peak not outbid by tomorrow',       scenario20_horizonAnchoredToTrough],
     ['preemptive drain acts after sunrise',       scenario21_preemptiveReplacementPostSunrise],
-    ['ceiling band freed by next-day sun',        scenario22_ceilingBandFreedByNextDaySun]
+    ['ceiling band freed by next-day sun',        scenario22_ceilingBandFreedByNextDaySun],
+    ['cell-voltage floor gates discharge',       scenario23_cellVoltageFloor]
 ];
 
 let passed = 0;
