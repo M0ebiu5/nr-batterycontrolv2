@@ -136,8 +136,9 @@ global.set('socGuard', { soc: currentSoc, time: _nowMs });
 // is, and those are exempt.
 const SOC_STALE_MIN = 120;
 const _bmsCtx = global.get('bms') || {};
-const _socSource = (typeof _bmsCtx.weightedSoc === 'number'
-    && typeof _bmsCtx.ts === 'number' && _bmsCtx.ts > _nowMs - 1800000) ? 'bms' : 'ess';
+const _socSource = lastVal(raw.soc, 'socSource')
+    || ((typeof _bmsCtx.weightedSoc === 'number'
+        && typeof _bmsCtx.ts === 'number' && _bmsCtx.ts > _nowMs - 1800000) ? 'bms' : 'ess');
 // Kept in the file store: a Node-RED restart is exactly what someone does while
 // troubleshooting an outage, and losing changedAt there would re-arm the whole
 // window and buy the fault another two hours of blind operation.
