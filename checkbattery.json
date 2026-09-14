@@ -1,0 +1,703 @@
+{
+    "id": "8a7a85d30c1477cc",
+    "label": "checkbattery",
+    "nodes": [
+        {
+            "id": "cb_changelog",
+            "type": "comment",
+            "z": "8a7a85d30c1477cc",
+            "name": "=== Changelog ===",
+            "info": "### 2026-09-14\n- `capture` now keeps a stale pack's cell voltages in `minCellV`/`maxCellV` for up to 6 h (`VOLT_FRESH_MS`), gated on each voltage record's own `_ts` rather than on the pack's SOC freshness, and reports the dropped packs as `global.bms.voltOnlyPacks`. `bat_west` went dark for 4h15m on 2026-09-14 behind a stale BlueZ GATT cache (`org.bluez.Error.NotPermitted: Notify acquired`, cleared by `bluetoothctl remove`), and because the `FRESH_MS` check `continue`d before the voltage reads, the pack left the gates entirely: `minCellV` published `bat_ost`'s 3.322 V while `bat_west` - lowest pack in the fleet at 41.4% against 50.1/54.3, and so the first to reach the LFP knee - was invisible to the floor that exists to protect it. Min/max across packs only move the fleet extremes outward, so a stale reading can only tighten both gates, never loosen them. The 6 h bound is there because a sag latched at the wrong moment would otherwise jam no-discharge for as long as the pack stayed dark.\n- Recorded while fixing the above: `global.ess.Soc` read **21%** against a true weighted 50.7%, and the offset EMA seeded at **29.4 pp** on its first all-banks sample. The offset only samples when `nBanks === 3`, so it had never been measured while `bat_west` was down - had the whole feed died in that window, `query_soc` would have fallen through to the uncorrected 21%.\n\n### 2026-09-12\n- `capture` now publishes `global.bms.minCellV` (min `cell_voltages/min` across fresh packs) alongside `maxCellV`, and `frozenPacks`. The optimizer had a `CELL_FULL_V` ceiling but nothing at the bottom, so the only thing standing between the pack and over-discharge was the SOC number - which runs optimistic down there. On the night of 2026-09-11 `bat_ost`'s minimum cell fell to 3.176 V (the bottom of the LFP knee) while it still reported 25.2% and the weighted feed said ~35%; Victron read 6%.\n- `capture` now drops a pack from the SOC average once its coulomb counter freezes. `bat_west` republishes a stale `soc/soc_percent` for hours - pinned at 46.4% from 19:00 to 06:00 UTC on 2026-09-12, and at 47.5% for five hours over midday - while its own ammeter integrated 88.8 Ah into the pack for a registered +1.1 pp. The `FRESH_MS` check cannot see this: the stale value keeps arriving with a fresh `_ts`, so the frozen pack stayed in the weighted average at full weight. Detection integrates each pack's own `soc/current` between its `soc_percent` messages (`flow.bms_socmove`) and distrusts the pack once >2% of its capacity has moved with SOC unchanged - ~20 min at 7 A on `bat_west`. Trickle below 1 A is ignored, since a flat SOC is honest there, and the dt is capped at 15 min so a restart or broker gap cannot bank hours of charge.\n- Cell voltages are kept from every fresh pack, frozen or not: they are measured rather than integrated, so a stuck counter says nothing about them - and they are exactly what the new bottom guard runs on.\n\n### 2026-06-28b\n- `capture` now also publishes `global.bms.maxCellV` (max `cell_voltages/max` across fresh packs). The optimizer gates grid-charge on cell voltage rather than the miscalibrated SOC%, so bat_big can fill while the small packs sit at ~3.40 V.\n\n### 2026-06-28\n- `capture` now also publishes a capacity-weighted aggregate SOC to `global.bms` ({weightedSoc, maxPackSoc, ts, oldestTs}), weighting each bank's `soc/soc_percent` by `soc/aged_capacity` and skipping packs whose reading is >30 min stale. Consumed by the Battery Controller v2 optimizer as a trustworthy replacement for the jumpy Victron SOC.\n\n### 2026-05-12\n- Iter4o: light grey chart text on dark dashboard. First tried CSS targeting SVG `text` \u2014 ineffective because Node-RED dashboard 3.6.6 uses Chart.js 2.3 (canvas-rendered, not styleable by CSS). Replaced with a `<script>` in `mon_ui_dark_css` that sets `Chart.defaults.global.defaultFontColor = #b0b0b0`, dims gridlines to rgba(255,255,255,0.08), and walks `Chart.instances` to update legend/axis ticks on existing charts. Polls for 2 min to catch late-loaded charts after refresh.\n\n### 2026-05-11\n- Iter4n: fix group ordering so the Refresh button actually appears on top. Dashboard 1 treats order=0 as unset and pushes the group to the bottom. Shifted all bb_grp_* orders up by one: ctrl=1, ess=2, ost=3, west=4, big=5.\n\n### 2026-05-11\n- Iter4m: ESS card compacted to a single-row layout (height 7 -> 3, stats inline next to the ESS label). Refresh button widened to fill its group (width 4 -> 14) so it's a full-width bar at the top of the tab. Group order unchanged (ctrl=0, ess=1, banks=2-4).\n\n### 2026-05-11\n- Iter4l: ESS card bigger and moved below Refresh button. Card height 4 -> 7 grid units; stat font 16 -> 26px; title 20 -> 26px; thicker left accent (4 -> 6px) and more padding. Groups reordered: ctrl=0 (Refresh), ess=1 (ESS card), ost=2, west=3, big=4.\n\n### 2026-05-11\n- Iter4k: ESS header card at top of Batteries tab, above the bank cards. `bb_publish` gains a 4th output emitting ESS payload from `global.ess` (Soc, Voltage, Power, AcPowerSetPoint, acload, pac); new `bb_tpl_ess` ui_template renders it. New `bb_grp_ess` group at order 0; existing groups renumbered ctrl=1, ost=2, west=3, big=4. Power and AC Setpoint are color-coded by sign (green positive, amber negative); other fields neutral.\n\n### 2026-05-11\n- Iter4j: chart now overlays SOC as a third series. Query fetches MEAN(soc_percent); format scales SOC% to the cell voltage Y axis with y = 2.8 + (SOC/100) * 0.8 so 0% sits at 2.8V and 100% at 3.6V \u2014 same range as cell operating window. Series label includes current SOC: \"SOC 67% (scaled)\". Color soft purple (#ba68c8) to stand apart from min cyan / max gold.\n\n### 2026-05-11\n- Iter4i: header now also shows SOC% and Power, alongside total voltage and current. Power uses the same charge/discharge color as current (green when positive = charging, amber when negative = discharging). SOC stays neutral white.\n\n### 2026-05-11\n- Iter4h: chart legend now shows the current min/max cell number, e.g. \"min (cell 8)\" / \"max (cell 2)\". `bb_chart_format` reads `flow.bms_state` for the latest `cell_voltages/min_index` and `cell_voltages/max_index` per bank and injects them into the ui_chart series names. No schema change.\n\n### 2026-05-11\n- Iter4f: fix `bb_chart_query` to use `influxdb_config` (db=tmp) \u2014 the bms_health measurement is written to `tmp`, not `infra` as the node name suggested. Note: `cb_trend_query` reads from `infra` so the trend pipeline has been silently empty; not changed here, flagged for follow-up.\n\n### 2026-05-11\n- Iter4e: 48h cell min/max line chart per bank. New `bb_chart_query` (influxdb in, 48h MEAN(cell_min/cell_max) GROUP BY time(15m), bank FILL(none)) -> `bb_chart_format` (function, 3 outputs) -> per-bank `bb_chart_<bank>` (ui_chart, line, order 2 inside each bank group, sits below the cell grid). Refreshes on each 180s `cb_cron` tick and on Refresh button click.\n\n### 2026-05-11\n- Iter4d: manual refresh. New `bb_grp_ctrl` ui_group at top of Batteries tab with a `bb_btn_refresh` ui_button (\"\u21bb Refresh\") wired into `bb_publish`. Click fires the publish function on demand without waiting for the 180s tick.\n\n### 2026-05-11\n- Iter4c: dashboard publish now reuses the 180s `cb_cron` tick \u2014 dedicated `bb_pub_cron` removed. Dashboard cards refresh on the same cadence as the evaluator (every 3 minutes, wall-clock aligned to 0/3 min).\n\n### 2026-05-11\n- Iter4b: dark card theme, white text. Per-cell tile now shows signed deviation from bank avg as the dominant value (large), with voltage below. Header now carries total voltage + current next to bank name (current colored green when charging, amber when discharging). Min cell border cyan, max cell border gold.\n\n### 2026-05-11\n- Iter4: dashboard visualization. New \"Batteries\" tab, one card per bank stacked vertically.\n- `bb_pub_cron` (cronplus, 5s) -> `bb_publish` (function, 3 outputs) -> per-bank `bb_tpl_<bank>` (ui_template).\n- `bb_publish` reads `flow.bms_state`, computes per-cell severity (ok/warn/crit) using same thresholds as `cb_evaluate`: cell_under <2.80V / cell_over >3.60V => crit; |v - bank_avg| > 30mV => warn. Delta severity: <50mV ok, 50-100mV warn, >=100mV crit. Temps outside [-10,50]C and MOSFET >60C => crit. Switches not ON => crit. Comm dropout >3min dims the card and shows STALE banner.\n- Each card: header (bank name + age), summary grid (SOC, voltage, current, power, cycles, delta, T1/T2/MOSFET, min/max/avg cell), switch chips, 4x4 cell tile grid (idx + voltage, color-coded; min cell border blue, max cell border red).\n\n### 2026-05-05\n- Iter3: debounce + trend.\n- Per-condition debounce in `cb_evaluate`. Statistical checks (cell_delta_warn/alert, cell_outlier_*, temp_high/low_*, mosfet_temp_high) require 3 consecutive ticks (~9min @ 180s) before flipping state. Safety-critical checks (no_data, comm_dropout, cell_under, cell_over, switch_charge_off, switch_discharge_off) emit `active` immediately, require 3 clear ticks to resolve. Events (bms_reboot, cycles_reset) stay one-shot.\n- Trend pipeline: `cb_trend_cron` (cronplus, hourly @ HH:05) -> `cb_trend_query` (influxdb in, raw output, 1h-bucketed MEDIAN of cell_delta over 24h GROUP BY bank) -> `cb_trend_eval` (linear regression of slope, mV/day) -> `cb_alert_out`. Threshold 5 mV/day; needs >=6 hourly buckets.\n\n### 2026-05-05\n- Iter2: monitoring pipeline. cron-plus tick @ 180s aligned -> cb_evaluate -> alert MQTT (`checkbattery/alert`) + InfluxDB `infra.bms_health`.\n- Health checks: comm dropout (3min), cell delta warn/alert (50/100mV), cell hard limits (2.8/3.6V), per-cell outlier (30mV from bank avg), temperatures 1+2 (-10/50C, sensors 3/4 ignored), MOSFET temp (60C), switch charge/discharge OFF, BMS reboot, cycle counter monotonic.\n- InfluxDB metrics per bank: soc_percent, total_voltage, current, power, balance_current, num_cycles, cell_delta/min/max/avg, capacity_ah, mosfet_temp, temp1, temp2.\n- Alerts emit only on state transitions (active / cleared) -- no per-tick spam.\n\n### 2026-05-05\n- Bootstrap: subscribe to bat_ost, bat_west, bat_big at central MQTT broker; capture last payload per leaf-topic into `global.checkbattery_samples` for schema discovery.\n",
+            "x": 160,
+            "y": 40,
+            "wires": []
+        },
+        {
+            "id": "cb_capture",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "capture",
+            "func": "// Latch each MQTT message into flow.bms_state[bank][field] = {value, _ts}.\nconst parts = msg.topic.split('/');\nconst bank = parts[0];\nconst field = parts.slice(1).join('/');\nif (!field) return null;  // skip bare-topic messages (no field)\n\nconst nowMs = Date.now();\nconst state = flow.get('bms_state') || {};\nconst bankState = state[bank] || {};\nbankState[field] = { value: msg.payload, _ts: nowMs };\nstate[bank] = bankState;\nflow.set('bms_state', state);\n\n// --- Frozen-counter detection ----------------------------------------------\n// A pack can republish a stale soc_percent indefinitely. On 2026-09-12 bat_west\n// sat pinned at 46.4% from 19:00 to 06:00 UTC, and again at 47.5% for five hours\n// over midday, while its own ammeter integrated 88.8 Ah into the pack for a\n// registered +1.1 pp. The FRESH_MS check below cannot see that - the stale value\n// keeps arriving with a fresh _ts - so the frozen pack stayed in the weighted\n// average at full weight and dragged the aggregate the optimizer plans on.\n// So integrate each pack's own current between its soc_percent messages: once\n// more than FREEZE_FRAC of its capacity has moved with the SOC unchanged, the\n// counter is not counting and the pack drops out of the SOC average. Its cell\n// voltages are measured rather than integrated, so those keep counting either way.\nconst FREEZE_FRAC = 0.02;     // of pack capacity, ~2.4-6.2 Ah here\nconst FREEZE_MIN_A = 1.0;     // ignore trickle: below this a flat SOC is honest\nconst move = flow.get('bms_socmove') || {};\nif (field === 'soc/soc_percent') {\n    const m = move[bank] || {};\n    const socNow = parseFloat(msg.payload);\n    const curRec = bankState['soc/current'];\n    const iNow = curRec ? Math.abs(parseFloat(curRec.value)) : NaN;\n    const dtH = (typeof m.lastTs === 'number') ? (nowMs - m.lastTs) / 3600000 : 0;\n    // Cap dt: a Node-RED restart or a broker gap must not bank hours of charge.\n    if (dtH > 0 && dtH < 0.25 && isFinite(iNow) && iNow >= FREEZE_MIN_A) {\n        m.ah = (m.ah || 0) + iNow * dtH;\n    }\n    if (!isFinite(socNow) || socNow !== m.soc) { m.ah = 0; m.soc = socNow; }\n    m.lastTs = nowMs;\n    move[bank] = m;\n    flow.set('bms_socmove', move);\n}\n\n// --- Publish aggregate battery state to global for the battery optimizer ---\n// The Victron aggregate (global.ess.Soc) is unreliable, and the packs' reported\n// SOC% is miscalibrated (small packs read ~99.8% at only ~3.40 V/cell). So we\n// publish both a capacity-weighted SOC (for energy planning) and the cell voltage\n// extremes across packs - the true fullness and emptiness signals the optimizer\n// gates charge and discharge on.\nconst BANKS = ['bat_ost', 'bat_west', 'bat_big'];\nconst FRESH_MS = 30 * 60 * 1000;\n// Cell voltages get a longer window than the SOC average. A pack that has dropped\n// off the BLE feed is still wired in parallel on the same DC bus, and min/max across\n// packs only ever move the fleet extremes outward - folding a stale pack back in can\n// only lower minCellV (the discharge gate) and only raise maxCellV (the charge gate),\n// so it errs toward not moving energy in either direction. On 2026-09-14 bat_west sat\n// off the feed for 4h15m behind a stale BlueZ GATT cache, and the FRESH_MS check\n// dropped it before its voltages were read: minCellV published bat_ost's 3.322 V while\n// bat_west - the lowest pack in the fleet, and so the one that reaches the LFP knee\n// first - was invisible to the gate that exists to protect it. Past VOLT_FRESH_MS the\n// last reading says nothing about the pack any more, and a sag latched at, say, 3.21 V\n// would jam no-discharge for as long as the pack stayed dark, so it is dropped instead\n// of held. Each field carries its own _ts, so gate on the voltage record's age rather\n// than the SOC record's.\nconst VOLT_FRESH_MS = 6 * 60 * 60 * 1000;\nlet wsum = 0, csum = 0, nBanks = 0, maxSoc = null, maxCellV = null, minCellV = null, oldest = null;\nconst frozen = [];\nconst voltOnly = [];\nfor (const b of BANKS) {\n    const bs = state[b];\n    if (!bs) continue;\n\n    let usedVolts = false;\n    const cvRec = bs['cell_voltages/max'];\n    if (cvRec && nowMs - cvRec._ts <= VOLT_FRESH_MS) {\n        const cv = parseFloat(cvRec.value);\n        if (isFinite(cv)) {\n            usedVolts = true;\n            if (maxCellV === null || cv > maxCellV) maxCellV = cv;\n        }\n    }\n    const cnRec = bs['cell_voltages/min'];\n    if (cnRec && nowMs - cnRec._ts <= VOLT_FRESH_MS) {\n        const cn = parseFloat(cnRec.value);\n        if (isFinite(cn)) {\n            usedVolts = true;\n            if (minCellV === null || cn < minCellV) minCellV = cn;\n        }\n    }\n\n    const socRec = bs['soc/soc_percent'];\n    if (!socRec || nowMs - socRec._ts > FRESH_MS) {\n        // Missing or stale SOC: out of the weighted average, voltages kept above.\n        // Only claim the pack if a voltage actually landed - past VOLT_FRESH_MS\n        // it contributes nothing at all and should not read as half-present.\n        if (usedVolts) voltOnly.push(b);\n        continue;\n    }\n\n    const capRec = bs['soc/aged_capacity'] || bs['soc/capacity'];\n    const cap = capRec ? parseFloat(capRec.value) : NaN;\n    if (isFinite(cap) && cap > 0 && ((move[b] || {}).ah || 0) > cap * FREEZE_FRAC) {\n        frozen.push(b);   // counter stuck: keep its voltages above, drop its SOC\n        continue;\n    }\n\n    const soc = parseFloat(socRec.value);\n    if (isFinite(soc)) {\n        if (maxSoc === null || soc > maxSoc) maxSoc = soc;\n        if (oldest === null || socRec._ts < oldest) oldest = socRec._ts;\n        if (isFinite(cap) && cap > 0) { wsum += soc * cap; csum += cap; nBanks++; }\n    }\n}\n// --- Victron SOC calibration offset ----------------------------------------\n// The Cerbo has no battery-monitor service at all: `Settings/SystemSetup/BatteryService`\n// is \"default\" and resolves to com.victronenergy.vebus.ttyS4, so `global.ess.Soc` is\n// nothing but the MultiPlus's own coulomb counter. That counter re-zeroes only when the\n// Multi completes an absorption with tail current, which the 95% planning ceiling\n// guarantees will never happen, so its error is frozen wherever it last landed. On\n// 2026-09-14 it read 18% against a real ~50%, and over 09-12..09-14 it sat a flat\n// 18-32 pp low while tracking the true curve slope-for-slope: the shape is sound, only\n// the level is wrong. `query_soc` falls back to that number once this feed is 30 min\n// old, and a 26 pp understatement is exactly what makes the planner panic-buy a\n// half-full pack. So carry a running correction for the level and let the fallback\n// apply it. It rides in `global.bms`, which stops being rewritten when the feed dies -\n// the offset that survives is therefore the last one measured while both feeds were\n// healthy, and its age doubles as the age of the outage.\n// Only sample when every bank is in the average: a partial fleet (bat_west has gone\n// silent for hours at a time) biases the weighted SOC, while ess.Soc reads the whole\n// DC bus regardless. The EMA is slow on purpose - the offset is stable over days, and\n// if the Multi ever does re-zero itself the correction should decay, not snap.\nconst OFFSET_ALPHA = 0.02;    // ~50 soc_percent messages to converge, order of an hour\nconst OFFSET_MAX_PP = 50;     // beyond this one of the two feeds is broken, not offset\nlet offRec = global.get('bmsEssOffset', 'file') || {};\nif (field === 'soc/soc_percent' && nBanks === BANKS.length && csum > 0) {\n    const essSoc = parseFloat((global.get('ess') || {}).Soc);\n    if (isFinite(essSoc) && essSoc >= 0 && essSoc <= 100) {\n        let off = (wsum / csum) - essSoc;\n        off = Math.max(-OFFSET_MAX_PP, Math.min(OFFSET_MAX_PP, off));\n        const prev = (typeof offRec.pp === 'number' && isFinite(offRec.pp)) ? offRec.pp : off;\n        offRec = { pp: prev + OFFSET_ALPHA * (off - prev), ts: nowMs };\n        global.set('bmsEssOffset', offRec, 'file');\n    }\n}\n\nif (maxSoc !== null || maxCellV !== null) {\n    global.set('bms', {\n        weightedSoc: csum > 0 ? Math.round((wsum / csum) * 10) / 10 : null,\n        maxPackSoc: maxSoc,\n        maxCellV: maxCellV,\n        minCellV: minCellV,\n        frozenPacks: frozen,\n        voltOnlyPacks: voltOnly,\n        banks: nBanks,\n        essOffset: (typeof offRec.pp === 'number' && isFinite(offRec.pp))\n            ? Math.round(offRec.pp * 10) / 10 : undefined,\n        essOffsetTs: offRec.ts,\n        ts: nowMs,\n        oldestTs: oldest\n    });\n}\nreturn null;\n",
+            "outputs": 1,
+            "timeout": 0,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 380,
+            "y": 180,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_ost_w",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_ost/#",
+            "topic": "bat_ost/#",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 300,
+            "wires": [
+                [
+                    "cb_capture"
+                ]
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_west_w",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_west/#",
+            "topic": "bat_west/#",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 340,
+            "wires": [
+                [
+                    "cb_capture"
+                ]
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_big_w",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_big/#",
+            "topic": "bat_big/#",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 380,
+            "wires": [
+                [
+                    "cb_capture"
+                ]
+            ]
+        },
+        {
+            "id": "cb_cron",
+            "type": "cronplus",
+            "z": "8a7a85d30c1477cc",
+            "name": "tick 180s",
+            "outputField": "payload",
+            "timeZone": "",
+            "storeName": "",
+            "commandResponseMsgOutput": "output1",
+            "defaultLocation": "",
+            "defaultLocationType": "default",
+            "outputs": 1,
+            "options": [
+                {
+                    "name": "tick180s",
+                    "topic": "tick180s",
+                    "payloadType": "default",
+                    "payload": "",
+                    "expressionType": "cron",
+                    "expression": "0 0/3 * * * * *",
+                    "location": "",
+                    "offset": "0",
+                    "solarType": "all",
+                    "solarEvents": "sunrise,sunset"
+                }
+            ],
+            "x": 150,
+            "y": 540,
+            "wires": [
+                [
+                    "cb_evaluate",
+                    "bb_publish",
+                    "bb_chart_query"
+                ]
+            ]
+        },
+        {
+            "id": "cb_evaluate",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "evaluate",
+            "func": "// Per-tick health checks with per-condition debounce.\n//   - Statistical checks (default {active:3, clear:3}) require 3 consecutive\n//     ticks (~9min @ 180s) before flipping state \u2014 suppresses BMS noise.\n//   - Safety-critical checks ({active:1, clear:3}) emit 'active' on the first\n//     tick the condition holds, but require 3 clear ticks before resolving.\n//   - Events (bms_reboot, cycles_reset) emit one-shot, no debounce.\n// Out 1 = alerts (one msg per emit, topic=checkbattery/alert)\n// Out 2 = influx batch (single msg with payload=[points...])\n\nconst NOW = Date.now();\nconst NOW_ISO = new Date(NOW).toISOString();\nconst BANKS = ['bat_ost', 'bat_west', 'bat_big'];\n\nconst STATE = flow.get('bms_state') || {};\nconst PREV  = flow.get('bms_prev') || {};\nconst DB    = flow.get('bms_debounce') || {};\n\nconst TH = {\n    cell_delta_warn:  0.050,\n    cell_delta_alert: 0.100,\n    cell_min:         2.80,\n    cell_max:         3.60,\n    cell_outlier:     0.030,\n    temp_min:         -10,\n    temp_max:         50,\n    mosfet_temp_max:  60,\n    comm_dropout_ms:  3 * 60 * 1000\n};\n\nconst DEBOUNCE = {\n    no_data:               { active: 1, clear: 3 },\n    comm_dropout:          { active: 1, clear: 3 },\n    cell_under:            { active: 1, clear: 3 },\n    cell_over:             { active: 1, clear: 3 },\n    switch_charge_off:     { active: 1, clear: 3 },\n    switch_discharge_off:  { active: 1, clear: 3 }\n};\nconst DEBOUNCE_DEFAULT = { active: 3, clear: 3 };\n\nconst alerts = [];\nconst points = [];\n\nfunction num(v) {\n    if (v === undefined || v === null) return null;\n    const n = parseFloat(v);\n    return Number.isFinite(n) ? n : null;\n}\n\n// hold=true: condition currently violating; hold=false: currently OK.\nfunction condition(bank, code, hold, value, severity, message) {\n    const cfg = DEBOUNCE[code] || DEBOUNCE_DEFAULT;\n    const bankDb = DB[bank] || (DB[bank] = {});\n    let e = bankDb[code];\n    if (!e) {\n        e = { state: 'clear', candidate: 'clear', count: 0 };\n        bankDb[code] = e;\n    }\n    const cand = hold ? 'active' : 'clear';\n    if (cand === e.state) {\n        e.candidate = cand;\n        e.count = 0;\n        if (hold) e.value = value;\n        return;\n    }\n    if (cand === e.candidate) {\n        e.count++;\n    } else {\n        e.candidate = cand;\n        e.count = 1;\n    }\n    if (hold) e.value = value;\n    const need = hold ? cfg.active : cfg.clear;\n    if (e.count >= need) {\n        if (hold) {\n            e.state = 'active';\n            e.since = NOW_ISO;\n            alerts.push({\n                ts: NOW_ISO, bank, severity, code, msg: message,\n                value, since: NOW_ISO, state: 'active', debounceTicks: need\n            });\n        } else {\n            const since = e.since;\n            e.state = 'clear';\n            delete e.since;\n            alerts.push({\n                ts: NOW_ISO, bank, severity: 'info', code,\n                msg: 'cleared', value: null, since, state: 'cleared'\n            });\n        }\n        e.count = 0;\n    }\n}\n\nfunction event(bank, code, value, severity, message) {\n    alerts.push({\n        ts: NOW_ISO, bank, severity, code, msg: message,\n        value, since: NOW_ISO, state: 'event'\n    });\n}\n\nfor (const bank of BANKS) {\n    const s = STATE[bank];\n    const get = (path) => (s && s[path]) ? num(s[path].value) : null;\n\n    const hasData = !!s && Object.keys(s).length > 0;\n    condition(bank, 'no_data', !hasData, null, 'alert', 'No data ever received from bank');\n    if (!hasData) continue;\n\n    let newestTs = 0;\n    for (const k in s) if (s[k]._ts > newestTs) newestTs = s[k]._ts;\n    const ageMs = NOW - newestTs;\n    const ageS = Math.round(ageMs / 1000);\n    condition(bank, 'comm_dropout', ageMs > TH.comm_dropout_ms, ageS, 'alert',\n        `No update in ${ageS}s`);\n\n    const cellMin   = get('cell_voltages/min');\n    const cellMax   = get('cell_voltages/max');\n    const cellAvg   = get('cell_voltages/average');\n    const cellDelta = get('cell_voltages/delta');\n    const minIdx    = get('cell_voltages/min_index');\n    const maxIdx    = get('cell_voltages/max_index');\n\n    if (cellDelta !== null) {\n        const isAlertDelta = cellDelta >= TH.cell_delta_alert;\n        const isWarnDelta  = !isAlertDelta && cellDelta >= TH.cell_delta_warn;\n        condition(bank, 'cell_delta_alert', isAlertDelta, cellDelta, 'alert',\n            `Cell delta ${(cellDelta*1000).toFixed(0)}mV >= ${TH.cell_delta_alert*1000}mV (cell ${maxIdx} high, cell ${minIdx} low)`);\n        condition(bank, 'cell_delta_warn', isWarnDelta, cellDelta, 'warn',\n            `Cell delta ${(cellDelta*1000).toFixed(0)}mV >= ${TH.cell_delta_warn*1000}mV (cell ${maxIdx} high, cell ${minIdx} low)`);\n    }\n\n    if (cellMin !== null) {\n        condition(bank, 'cell_under', cellMin < TH.cell_min, cellMin, 'alert',\n            `Cell ${minIdx} at ${cellMin.toFixed(3)}V below ${TH.cell_min}V`);\n    }\n    if (cellMax !== null) {\n        condition(bank, 'cell_over', cellMax > TH.cell_max, cellMax, 'alert',\n            `Cell ${maxIdx} at ${cellMax.toFixed(3)}V above ${TH.cell_max}V`);\n    }\n\n    if (cellAvg !== null) {\n        for (let i = 1; i <= 16; i++) {\n            const v = get('cell_voltages/' + i);\n            if (v === null) {\n                condition(bank, 'cell_outlier_' + i, false, null, 'warn', '');\n                continue;\n            }\n            const dev = Math.abs(v - cellAvg);\n            condition(bank, 'cell_outlier_' + i, dev > TH.cell_outlier, v, 'warn',\n                `Cell ${i} at ${v.toFixed(3)}V deviates ${(dev*1000).toFixed(0)}mV from bank avg ${cellAvg.toFixed(3)}V`);\n        }\n    }\n\n    for (const i of [1, 2]) {\n        const t = get('temperatures/' + i);\n        if (t === null) {\n            condition(bank, 'temp_high_' + i, false, null, 'alert', '');\n            condition(bank, 'temp_low_'  + i, false, null, 'alert', '');\n            continue;\n        }\n        condition(bank, 'temp_high_' + i, t > TH.temp_max, t, 'alert',\n            `Temp sensor ${i} at ${t.toFixed(1)}C above ${TH.temp_max}C`);\n        condition(bank, 'temp_low_' + i, t < TH.temp_min, t, 'alert',\n            `Temp sensor ${i} at ${t.toFixed(1)}C below ${TH.temp_min}C`);\n    }\n\n    const mosfetTemp = get('mosfet_status/temperature');\n    if (mosfetTemp !== null) {\n        condition(bank, 'mosfet_temp_high', mosfetTemp > TH.mosfet_temp_max, mosfetTemp, 'alert',\n            `MOSFET temp ${mosfetTemp.toFixed(1)}C above ${TH.mosfet_temp_max}C`);\n    }\n\n    const swCharge = (s['switch/charge'] || {}).value;\n    const swDisch  = (s['switch/discharge'] || {}).value;\n    if (swCharge !== undefined) {\n        condition(bank, 'switch_charge_off', String(swCharge) !== 'ON', swCharge, 'alert',\n            `Charge switch is ${swCharge}`);\n    }\n    if (swDisch !== undefined) {\n        condition(bank, 'switch_discharge_off', String(swDisch) !== 'ON', swDisch, 'alert',\n            `Discharge switch is ${swDisch}`);\n    }\n\n    const uptime = get('bms/uptime');\n    if (uptime !== null) {\n        const prevUp = (PREV[bank] || {}).uptime;\n        if (prevUp !== undefined && uptime < prevUp - 10000) {\n            event(bank, 'bms_reboot', uptime, 'warn',\n                `BMS uptime decreased: ${prevUp}ms -> ${uptime}ms (likely reboot)`);\n        }\n        PREV[bank] = PREV[bank] || {};\n        PREV[bank].uptime = uptime;\n    }\n\n    const cycles = get('soc/num_cycles');\n    if (cycles !== null) {\n        const prevCyc = (PREV[bank] || {}).cycles;\n        if (prevCyc !== undefined && cycles < prevCyc) {\n            event(bank, 'cycles_reset', cycles, 'warn',\n                `Cycle counter decreased: ${prevCyc} -> ${cycles}`);\n        }\n        PREV[bank] = PREV[bank] || {};\n        PREV[bank].cycles = cycles;\n    }\n\n    const fields = {};\n    const map = {\n        soc_percent:     'soc/soc_percent',\n        total_voltage:   'soc/total_voltage',\n        current:         'soc/current',\n        power:           'soc/power',\n        balance_current: 'soc/balance_current',\n        num_cycles:      'soc/num_cycles',\n        cell_delta:      'cell_voltages/delta',\n        cell_min:        'cell_voltages/min',\n        cell_max:        'cell_voltages/max',\n        cell_avg:        'cell_voltages/average',\n        capacity_ah:     'mosfet_status/capacity_ah',\n        mosfet_temp:     'mosfet_status/temperature',\n        temp1:           'temperatures/1',\n        temp2:           'temperatures/2'\n    };\n    for (const fk in map) {\n        const v = get(map[fk]);\n        if (v !== null) fields[fk] = v;\n    }\n    if (Object.keys(fields).length > 0) {\n        points.push({\n            measurement: 'bms_health',\n            tags: { bank },\n            fields,\n            timestamp: NOW\n        });\n    }\n}\n\nflow.set('bms_debounce', DB);\nflow.set('bms_prev', PREV);\n\n// Capacity-weighted BMS SOC -> tmp.ess.socbms. This is the same value the\n// optimizer seeds predictedSoc from (global.bms.weightedSoc); logging it here\n// gives the dashboard an actual-SOC line that overlays the prediction,\n// instead of the Victron ess.Soc which reads ~16pt lower.\nconst _bms = global.get('bms');\nif (_bms && typeof _bms.weightedSoc === 'number' && isFinite(_bms.weightedSoc)) {\n    points.push({ measurement: 'ess', fields: { socbms: _bms.weightedSoc }, timestamp: NOW });\n}\n\nconst outAlerts = alerts.map(a => ({ topic: 'checkbattery/alert', payload: a }));\nconst outInflux = points.length > 0 ? { payload: points } : null;\nreturn [outAlerts, outInflux];\n",
+            "outputs": 2,
+            "timeout": 0,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 380,
+            "y": 540,
+            "wires": [
+                [
+                    "cb_alert_out",
+                    "cb_eval_debug"
+                ],
+                [
+                    "cb_influx_out",
+                    "8eb9d7b9d7f29c88"
+                ]
+            ]
+        },
+        {
+            "id": "cb_alert_out",
+            "type": "mqtt out",
+            "z": "8a7a85d30c1477cc",
+            "name": "checkbattery/alert",
+            "topic": "",
+            "qos": "0",
+            "retain": "false",
+            "respTopic": "",
+            "contentType": "",
+            "userProps": "",
+            "correl": "",
+            "expiry": "",
+            "broker": "mqtt_broker_config",
+            "x": 660,
+            "y": 480,
+            "wires": []
+        },
+        {
+            "id": "cb_eval_debug",
+            "type": "debug",
+            "z": "8a7a85d30c1477cc",
+            "name": "alerts",
+            "active": false,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "payload",
+            "targetType": "msg",
+            "statusVal": "",
+            "statusType": "auto",
+            "x": 640,
+            "y": 540,
+            "wires": []
+        },
+        {
+            "id": "cb_influx_out",
+            "type": "influxdb batch",
+            "z": "8a7a85d30c1477cc",
+            "influxdb": "influxdb_config",
+            "precision": "ms",
+            "retentionPolicy": "",
+            "name": "infra.bms_health",
+            "database": "database",
+            "precisionV18FluxV20": "ms",
+            "retentionPolicyV18Flux": "",
+            "org": "organisation",
+            "bucket": "bucket",
+            "x": 670,
+            "y": 600,
+            "wires": []
+        },
+        {
+            "id": "8eb9d7b9d7f29c88",
+            "type": "debug",
+            "z": "8a7a85d30c1477cc",
+            "name": "debug 2",
+            "active": false,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "false",
+            "statusVal": "",
+            "statusType": "auto",
+            "x": 490,
+            "y": 680,
+            "wires": []
+        },
+        {
+            "id": "cb_trend_cron",
+            "type": "cronplus",
+            "z": "8a7a85d30c1477cc",
+            "name": "trend tick HH:05",
+            "outputField": "payload",
+            "timeZone": "",
+            "storeName": "",
+            "commandResponseMsgOutput": "output1",
+            "defaultLocation": "",
+            "defaultLocationType": "default",
+            "outputs": 1,
+            "options": [
+                {
+                    "name": "trendHourly",
+                    "topic": "trendHourly",
+                    "payloadType": "default",
+                    "payload": "",
+                    "expressionType": "cron",
+                    "expression": "0 5 * * * * *",
+                    "location": "",
+                    "offset": "0",
+                    "solarType": "all",
+                    "solarEvents": "sunrise,sunset"
+                }
+            ],
+            "x": 150,
+            "y": 700,
+            "wires": [
+                [
+                    "cb_trend_query"
+                ]
+            ]
+        },
+        {
+            "id": "cb_trend_query",
+            "type": "influxdb in",
+            "z": "8a7a85d30c1477cc",
+            "influxdb": "influxdb_config_infra",
+            "name": "24h cell_delta medians",
+            "query": "SELECT MEDIAN(cell_delta) FROM bms_health WHERE time > now() - 24h GROUP BY time(1h), bank FILL(none)",
+            "rawOutput": true,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "organisation",
+            "x": 410,
+            "y": 700,
+            "wires": [
+                [
+                    "cb_trend_eval"
+                ]
+            ]
+        },
+        {
+            "id": "cb_trend_eval",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "trend_eval",
+            "func": "// Trend evaluator. Receives raw InfluxDB query result on msg.payload:\n//   SELECT MEDIAN(cell_delta) FROM bms_health\n//   WHERE time > now() - 24h GROUP BY time(1h), bank FILL(none)\n// Per bank, fits a linear regression to the hourly medians. Emits a\n// `trend_cell_delta_growth` event when slope exceeds threshold (mV/day).\n// Needs >= 6 hourly buckets to fire \u2014 earlier hours just no-op.\n\nconst TH_SLOPE_MV_PER_DAY = 5;\nconst NOW_ISO = new Date().toISOString();\n\nconst data = msg.payload;\nlet series = [];\nif (data && data.results && data.results[0] && Array.isArray(data.results[0].series)) {\n    series = data.results[0].series;\n} else if (Array.isArray(data) && data[0] && data[0].series) {\n    series = data[0].series;\n}\nif (!series.length) {\n    node.warn('trend_eval: no series in payload');\n    return null;\n}\n\nconst out = [];\nfor (const ser of series) {\n    const bank = ser.tags && ser.tags.bank;\n    if (!bank) continue;\n    const cols = ser.columns || [];\n    const tIdx = cols.indexOf('time');\n    let mIdx = cols.indexOf('median');\n    if (mIdx < 0) mIdx = cols.findIndex(c => typeof c === 'string' && c.indexOf('median') === 0);\n    if (tIdx < 0 || mIdx < 0) continue;\n\n    const pts = [];\n    for (const row of ser.values || []) {\n        const t = new Date(row[tIdx]).getTime();\n        const m = parseFloat(row[mIdx]);\n        if (Number.isFinite(m) && Number.isFinite(t)) pts.push([t, m]);\n    }\n    if (pts.length < 6) continue;\n\n    const t0 = pts[0][0];\n    let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;\n    for (const p of pts) {\n        const x = (p[0] - t0) / 3600000;\n        n++; sx += x; sy += p[1]; sxx += x*x; sxy += x*p[1];\n    }\n    const denom = n*sxx - sx*sx;\n    if (denom === 0) continue;\n    const slopeVPerHr = (n*sxy - sx*sy) / denom;\n    const slopeMvPerDay = slopeVPerHr * 24 * 1000;\n\n    if (slopeMvPerDay > TH_SLOPE_MV_PER_DAY) {\n        out.push({\n            topic: 'checkbattery/alert',\n            payload: {\n                ts: NOW_ISO,\n                bank,\n                severity: 'warn',\n                code: 'trend_cell_delta_growth',\n                msg: `cell_delta median trending +${slopeMvPerDay.toFixed(2)} mV/day over last 24h (n=${n} hourly buckets)`,\n                value: slopeMvPerDay,\n                since: NOW_ISO,\n                state: 'event'\n            }\n        });\n    }\n}\nreturn [out];\n",
+            "outputs": 1,
+            "timeout": 0,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 660,
+            "y": 700,
+            "wires": [
+                [
+                    "cb_alert_out",
+                    "cb_trend_debug"
+                ]
+            ]
+        },
+        {
+            "id": "cb_trend_debug",
+            "type": "debug",
+            "z": "8a7a85d30c1477cc",
+            "name": "trend",
+            "active": false,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "payload",
+            "targetType": "msg",
+            "statusVal": "",
+            "statusType": "auto",
+            "x": 870,
+            "y": 700,
+            "wires": []
+        },
+        {
+            "id": "bb_publish",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "publish per-bank state",
+            "func": "const NOW = Date.now();\nconst NOW_ISO = new Date(NOW).toISOString();\nconst BANKS = ['bat_ost', 'bat_west', 'bat_big'];\nconst TH = {\n    cell_delta_warn:  0.050,\n    cell_delta_alert: 0.100,\n    cell_min:         2.80,\n    cell_max:         3.60,\n    cell_outlier:     0.030,\n    temp_min:         -10,\n    temp_max:         50,\n    mosfet_temp_max:  60,\n    comm_dropout_ms:  3 * 60 * 1000\n};\nconst STATE = flow.get('bms_state') || {};\n\nfunction num(v) {\n    if (v === undefined || v === null) return null;\n    const n = parseFloat(v);\n    return Number.isFinite(n) ? n : null;\n}\n\nfunction build(bank) {\n    const s = STATE[bank];\n    if (!s || !Object.keys(s).length) {\n        return { bank, hasData: false, ts: NOW_ISO, ageS: null, stale: true };\n    }\n    const g = (path) => (s[path] ? num(s[path].value) : null);\n    const raw = (path) => (s[path] ? s[path].value : null);\n\n    let newestTs = 0;\n    for (const k in s) if (s[k]._ts > newestTs) newestTs = s[k]._ts;\n    const ageMs = NOW - newestTs;\n    const stale = ageMs > TH.comm_dropout_ms;\n\n    const cellAvg = g('cell_voltages/average');\n    const cellMin = g('cell_voltages/min');\n    const cellMax = g('cell_voltages/max');\n    const cellDelta = g('cell_voltages/delta');\n    const minIdx = g('cell_voltages/min_index');\n    const maxIdx = g('cell_voltages/max_index');\n\n    const cells = [];\n    for (let i = 1; i <= 16; i++) {\n        const v = g('cell_voltages/' + i);\n        let sev = 'na';\n        let devMv = null;\n        if (v !== null) {\n            sev = 'ok';\n            if (cellAvg !== null) {\n                devMv = Math.round((v - cellAvg) * 1000);\n                if (Math.abs(v - cellAvg) > TH.cell_outlier) sev = 'warn';\n            }\n            if (v < TH.cell_min || v > TH.cell_max) sev = 'crit';\n        }\n        cells.push({ i, v, devMv, sev, isMin: i === minIdx, isMax: i === maxIdx });\n    }\n\n    const t1 = g('temperatures/1');\n    const t2 = g('temperatures/2');\n    const mt = g('mosfet_status/temperature');\n    const tempSev = (t) => t === null ? 'na' : (t < TH.temp_min || t > TH.temp_max ? 'crit' : 'ok');\n    const mosfetSev = mt === null ? 'na' : (mt > TH.mosfet_temp_max ? 'crit' : 'ok');\n\n    let deltaSev = 'na';\n    if (cellDelta !== null) {\n        deltaSev = 'ok';\n        if (cellDelta >= TH.cell_delta_warn) deltaSev = 'warn';\n        if (cellDelta >= TH.cell_delta_alert) deltaSev = 'crit';\n    }\n\n    const swCharge = raw('switch/charge');\n    const swDisch  = raw('switch/discharge');\n    const swBal    = raw('switch/balance');\n    const swSev = (sw) => sw == null ? 'na' : (String(sw) === 'ON' ? 'ok' : 'crit');\n\n    return {\n        bank, hasData: true, ts: NOW_ISO,\n        ageS: Math.round(ageMs / 1000), stale,\n        soc: g('soc/soc_percent'),\n        voltage: g('soc/total_voltage'),\n        current: g('soc/current'),\n        power: g('soc/power'),\n        cycles: g('soc/num_cycles'),\n        t1, t2, mt,\n        tempSev1: tempSev(t1),\n        tempSev2: tempSev(t2),\n        mosfetSev,\n        cellAvg, cellMin, cellMax, cellDelta,\n        deltaSev, minIdx, maxIdx, cells,\n        swCharge, swDisch, swBal,\n        swChargeSev: swSev(swCharge),\n        swDischSev:  swSev(swDisch),\n        swBalSev:    swSev(swBal)\n    };\n}\n\nfunction buildEss() {\n    const e = global.get('ess') || {};\n    const hasData = ['Soc','Voltage','Power','AcPowerSetPoint','acload','pac']\n        .some(k => e[k] !== undefined && e[k] !== null);\n    return {\n        hasData,\n        ts: NOW_ISO,\n        soc:      num(e.Soc),\n        voltage:  num(e.Voltage),\n        power:    num(e.Power),\n        setpoint: num(e.AcPowerSetPoint),\n        acload:   num(e.acload),\n        pac:      num(e.pac)\n    };\n}\n\nreturn [\n    { topic: 'bat_ost',  payload: build('bat_ost')  },\n    { topic: 'bat_west', payload: build('bat_west') },\n    { topic: 'bat_big',  payload: build('bat_big')  },\n    { topic: 'ess',      payload: buildEss()        }\n];",
+            "outputs": 4,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 410,
+            "y": 880,
+            "wires": [
+                [
+                    "bb_tpl_ost"
+                ],
+                [
+                    "bb_tpl_west"
+                ],
+                [
+                    "bb_tpl_big"
+                ],
+                [
+                    "bb_tpl_ess"
+                ]
+            ]
+        },
+        {
+            "id": "bb_tpl_ost",
+            "type": "ui_template",
+            "z": "8a7a85d30c1477cc",
+            "group": "bb_grp_ost",
+            "name": "bat_ost card",
+            "order": 1,
+            "width": 14,
+            "height": 9,
+            "format": "<style>\n.bb-card{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:12px;color:#ffffff;background:#1f2937;border-radius:6px;}\n.bb-hdr{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:8px;flex-wrap:wrap;}\n.bb-hdr-left{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;}\n.bb-bank{font-size:20px;font-weight:700;color:#ffffff;}\n.bb-headline{font-size:18px;font-weight:600;color:#ffffff;}\n.bb-headline .u{font-size:12px;font-weight:400;color:rgba(255,255,255,0.65);margin-left:1px;}\n.bb-headline.charge{color:#81c784;}\n.bb-headline.discharge{color:#ffb74d;}\n.bb-age{font-size:11px;color:rgba(255,255,255,0.55);}\n.bb-stale{color:#fff;background:#c62828;font-weight:700;font-size:11px;padding:2px 8px;border-radius:3px;letter-spacing:0.5px;}\n.bb-sum{display:grid;grid-template-columns:repeat(6,1fr);gap:8px 12px;font-size:13px;margin:8px 0;color:#ffffff;}\n.bb-sum .cell b{display:block;font-size:9px;color:rgba(255,255,255,0.55);font-weight:400;text-transform:uppercase;letter-spacing:0.6px;line-height:1.6;}\n.bb-sw{display:flex;gap:6px;font-size:11px;margin:8px 0 4px 0;}\n.bb-sw span{padding:3px 10px;border-radius:3px;font-weight:600;color:#ffffff;}\n.bb-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:8px;}\n.bb-tile{padding:8px 4px 7px 4px;border-radius:4px;text-align:center;border:2px solid transparent;color:#ffffff;}\n.bb-tile .ti{font-size:10px;line-height:1.1;opacity:0.75;}\n.bb-tile .td{font-size:20px;font-weight:700;line-height:1.15;margin-top:2px;letter-spacing:-0.2px;}\n.bb-tile .td .u{font-size:11px;font-weight:400;opacity:0.7;margin-left:1px;}\n.bb-tile .tv{font-size:11px;line-height:1.2;opacity:0.85;margin-top:1px;}\n.bb-ok{background:#2e7d32;}\n.bb-warn{background:#ef6c00;}\n.bb-crit{background:#c62828;}\n.bb-na{background:#424242;color:rgba(255,255,255,0.6);}\n.bb-sw .bb-ok{background:#2e7d32;}\n.bb-sw .bb-warn{background:#ef6c00;}\n.bb-sw .bb-crit{background:#c62828;}\n.bb-sw .bb-na{background:#424242;}\n.bb-tile.bb-is-min{border-color:#4dd0e1;}\n.bb-tile.bb-is-max{border-color:#ffd54f;}\n.bb-stale-card{opacity:0.5;}\n.bb-v-ok{color:#81c784;}\n.bb-v-warn{color:#ffb74d;font-weight:600;}\n.bb-v-crit{color:#ef5350;font-weight:700;}\n.bb-v-na{color:rgba(255,255,255,0.5);}\n.bb-nodata{color:rgba(255,255,255,0.5);font-style:italic;padding:16px;text-align:center;}\n</style>\n<div class=\"bb-card\" ng-class=\"{'bb-stale-card': msg.payload.stale && msg.payload.hasData}\">\n  <div class=\"bb-hdr\">\n    <div class=\"bb-hdr-left\">\n      <span class=\"bb-bank\">{{msg.payload.bank}}</span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\">{{msg.payload.voltage | number:2}}<span class=\"u\">&nbsp;V</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\"\n            ng-class=\"msg.payload.current >= 0 ? 'charge' : 'discharge'\">{{msg.payload.current | number:2}}<span class=\"u\">&nbsp;A</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\">{{msg.payload.soc | number:1}}<span class=\"u\">&nbsp;%</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\"\n            ng-class=\"msg.payload.power >= 0 ? 'charge' : 'discharge'\">{{msg.payload.power | number:0}}<span class=\"u\">&nbsp;W</span></span>\n    </div>\n    <div>\n      <span ng-if=\"msg.payload.hasData && msg.payload.stale\" class=\"bb-stale\">STALE {{msg.payload.ageS}}s</span>\n      <span ng-if=\"msg.payload.hasData && !msg.payload.stale\" class=\"bb-age\">updated {{msg.payload.ageS}}s ago</span>\n    </div>\n  </div>\n  <div ng-if=\"!msg.payload.hasData\" class=\"bb-nodata\">no data received yet</div>\n  <div ng-if=\"msg.payload.hasData\">\n    <div class=\"bb-sum\">\n      <div class=\"cell\"><b>SOC</b>{{msg.payload.soc | number:1}}%</div>\n      <div class=\"cell\"><b>Power</b>{{msg.payload.power | number:0}} W</div>\n      <div class=\"cell\"><b>Cycles</b>{{msg.payload.cycles}}</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.deltaSev\"><b>Cell &Delta;</b>{{(msg.payload.cellDelta*1000) | number:0}} mV</div>\n      <div class=\"cell\"><b>Cell Avg</b>{{msg.payload.cellAvg | number:3}} V</div>\n      <div class=\"cell\"><b>Min / Max</b>{{msg.payload.cellMin | number:3}} / {{msg.payload.cellMax | number:3}}</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.tempSev1\"><b>Temp 1</b>{{msg.payload.t1 | number:1}} &deg;C</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.tempSev2\"><b>Temp 2</b>{{msg.payload.t2 | number:1}} &deg;C</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.mosfetSev\"><b>MOSFET</b>{{msg.payload.mt | number:1}} &deg;C</div>\n    </div>\n    <div class=\"bb-sw\">\n      <span ng-class=\"'bb-' + msg.payload.swChargeSev\">charge: {{msg.payload.swCharge}}</span>\n      <span ng-class=\"'bb-' + msg.payload.swDischSev\">discharge: {{msg.payload.swDisch}}</span>\n      <span ng-class=\"'bb-' + msg.payload.swBalSev\">balance: {{msg.payload.swBal}}</span>\n    </div>\n    <div class=\"bb-grid\">\n      <div ng-repeat=\"c in msg.payload.cells track by c.i\" class=\"bb-tile\"\n           ng-class=\"['bb-' + c.sev, {'bb-is-min': c.isMin, 'bb-is-max': c.isMax}]\">\n        <div class=\"ti\">cell {{c.i}}</div>\n        <div class=\"td\">{{c.devMv >= 0 ? '+' : ''}}{{c.devMv}}<span class=\"u\">&nbsp;mV</span></div>\n        <div class=\"tv\">{{c.v | number:3}} V</div>\n      </div>\n    </div>\n  </div>\n</div>",
+            "storeOutMessages": true,
+            "fwdInMessages": false,
+            "resendOnRefresh": true,
+            "templateScope": "local",
+            "className": "",
+            "x": 720,
+            "y": 840,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "bb_tpl_west",
+            "type": "ui_template",
+            "z": "8a7a85d30c1477cc",
+            "group": "bb_grp_west",
+            "name": "bat_west card",
+            "order": 1,
+            "width": 14,
+            "height": 9,
+            "format": "<style>\n.bb-card{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:12px;color:#ffffff;background:#1f2937;border-radius:6px;}\n.bb-hdr{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:8px;flex-wrap:wrap;}\n.bb-hdr-left{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;}\n.bb-bank{font-size:20px;font-weight:700;color:#ffffff;}\n.bb-headline{font-size:18px;font-weight:600;color:#ffffff;}\n.bb-headline .u{font-size:12px;font-weight:400;color:rgba(255,255,255,0.65);margin-left:1px;}\n.bb-headline.charge{color:#81c784;}\n.bb-headline.discharge{color:#ffb74d;}\n.bb-age{font-size:11px;color:rgba(255,255,255,0.55);}\n.bb-stale{color:#fff;background:#c62828;font-weight:700;font-size:11px;padding:2px 8px;border-radius:3px;letter-spacing:0.5px;}\n.bb-sum{display:grid;grid-template-columns:repeat(6,1fr);gap:8px 12px;font-size:13px;margin:8px 0;color:#ffffff;}\n.bb-sum .cell b{display:block;font-size:9px;color:rgba(255,255,255,0.55);font-weight:400;text-transform:uppercase;letter-spacing:0.6px;line-height:1.6;}\n.bb-sw{display:flex;gap:6px;font-size:11px;margin:8px 0 4px 0;}\n.bb-sw span{padding:3px 10px;border-radius:3px;font-weight:600;color:#ffffff;}\n.bb-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:8px;}\n.bb-tile{padding:8px 4px 7px 4px;border-radius:4px;text-align:center;border:2px solid transparent;color:#ffffff;}\n.bb-tile .ti{font-size:10px;line-height:1.1;opacity:0.75;}\n.bb-tile .td{font-size:20px;font-weight:700;line-height:1.15;margin-top:2px;letter-spacing:-0.2px;}\n.bb-tile .td .u{font-size:11px;font-weight:400;opacity:0.7;margin-left:1px;}\n.bb-tile .tv{font-size:11px;line-height:1.2;opacity:0.85;margin-top:1px;}\n.bb-ok{background:#2e7d32;}\n.bb-warn{background:#ef6c00;}\n.bb-crit{background:#c62828;}\n.bb-na{background:#424242;color:rgba(255,255,255,0.6);}\n.bb-sw .bb-ok{background:#2e7d32;}\n.bb-sw .bb-warn{background:#ef6c00;}\n.bb-sw .bb-crit{background:#c62828;}\n.bb-sw .bb-na{background:#424242;}\n.bb-tile.bb-is-min{border-color:#4dd0e1;}\n.bb-tile.bb-is-max{border-color:#ffd54f;}\n.bb-stale-card{opacity:0.5;}\n.bb-v-ok{color:#81c784;}\n.bb-v-warn{color:#ffb74d;font-weight:600;}\n.bb-v-crit{color:#ef5350;font-weight:700;}\n.bb-v-na{color:rgba(255,255,255,0.5);}\n.bb-nodata{color:rgba(255,255,255,0.5);font-style:italic;padding:16px;text-align:center;}\n</style>\n<div class=\"bb-card\" ng-class=\"{'bb-stale-card': msg.payload.stale && msg.payload.hasData}\">\n  <div class=\"bb-hdr\">\n    <div class=\"bb-hdr-left\">\n      <span class=\"bb-bank\">{{msg.payload.bank}}</span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\">{{msg.payload.voltage | number:2}}<span class=\"u\">&nbsp;V</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\"\n            ng-class=\"msg.payload.current >= 0 ? 'charge' : 'discharge'\">{{msg.payload.current | number:2}}<span class=\"u\">&nbsp;A</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\">{{msg.payload.soc | number:1}}<span class=\"u\">&nbsp;%</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\"\n            ng-class=\"msg.payload.power >= 0 ? 'charge' : 'discharge'\">{{msg.payload.power | number:0}}<span class=\"u\">&nbsp;W</span></span>\n    </div>\n    <div>\n      <span ng-if=\"msg.payload.hasData && msg.payload.stale\" class=\"bb-stale\">STALE {{msg.payload.ageS}}s</span>\n      <span ng-if=\"msg.payload.hasData && !msg.payload.stale\" class=\"bb-age\">updated {{msg.payload.ageS}}s ago</span>\n    </div>\n  </div>\n  <div ng-if=\"!msg.payload.hasData\" class=\"bb-nodata\">no data received yet</div>\n  <div ng-if=\"msg.payload.hasData\">\n    <div class=\"bb-sum\">\n      <div class=\"cell\"><b>SOC</b>{{msg.payload.soc | number:1}}%</div>\n      <div class=\"cell\"><b>Power</b>{{msg.payload.power | number:0}} W</div>\n      <div class=\"cell\"><b>Cycles</b>{{msg.payload.cycles}}</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.deltaSev\"><b>Cell &Delta;</b>{{(msg.payload.cellDelta*1000) | number:0}} mV</div>\n      <div class=\"cell\"><b>Cell Avg</b>{{msg.payload.cellAvg | number:3}} V</div>\n      <div class=\"cell\"><b>Min / Max</b>{{msg.payload.cellMin | number:3}} / {{msg.payload.cellMax | number:3}}</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.tempSev1\"><b>Temp 1</b>{{msg.payload.t1 | number:1}} &deg;C</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.tempSev2\"><b>Temp 2</b>{{msg.payload.t2 | number:1}} &deg;C</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.mosfetSev\"><b>MOSFET</b>{{msg.payload.mt | number:1}} &deg;C</div>\n    </div>\n    <div class=\"bb-sw\">\n      <span ng-class=\"'bb-' + msg.payload.swChargeSev\">charge: {{msg.payload.swCharge}}</span>\n      <span ng-class=\"'bb-' + msg.payload.swDischSev\">discharge: {{msg.payload.swDisch}}</span>\n      <span ng-class=\"'bb-' + msg.payload.swBalSev\">balance: {{msg.payload.swBal}}</span>\n    </div>\n    <div class=\"bb-grid\">\n      <div ng-repeat=\"c in msg.payload.cells track by c.i\" class=\"bb-tile\"\n           ng-class=\"['bb-' + c.sev, {'bb-is-min': c.isMin, 'bb-is-max': c.isMax}]\">\n        <div class=\"ti\">cell {{c.i}}</div>\n        <div class=\"td\">{{c.devMv >= 0 ? '+' : ''}}{{c.devMv}}<span class=\"u\">&nbsp;mV</span></div>\n        <div class=\"tv\">{{c.v | number:3}} V</div>\n      </div>\n    </div>\n  </div>\n</div>",
+            "storeOutMessages": true,
+            "fwdInMessages": false,
+            "resendOnRefresh": true,
+            "templateScope": "local",
+            "className": "",
+            "x": 720,
+            "y": 880,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "bb_tpl_big",
+            "type": "ui_template",
+            "z": "8a7a85d30c1477cc",
+            "group": "bb_grp_big",
+            "name": "bat_big card",
+            "order": 1,
+            "width": 14,
+            "height": 9,
+            "format": "<style>\n.bb-card{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:12px;color:#ffffff;background:#1f2937;border-radius:6px;}\n.bb-hdr{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:8px;flex-wrap:wrap;}\n.bb-hdr-left{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;}\n.bb-bank{font-size:20px;font-weight:700;color:#ffffff;}\n.bb-headline{font-size:18px;font-weight:600;color:#ffffff;}\n.bb-headline .u{font-size:12px;font-weight:400;color:rgba(255,255,255,0.65);margin-left:1px;}\n.bb-headline.charge{color:#81c784;}\n.bb-headline.discharge{color:#ffb74d;}\n.bb-age{font-size:11px;color:rgba(255,255,255,0.55);}\n.bb-stale{color:#fff;background:#c62828;font-weight:700;font-size:11px;padding:2px 8px;border-radius:3px;letter-spacing:0.5px;}\n.bb-sum{display:grid;grid-template-columns:repeat(6,1fr);gap:8px 12px;font-size:13px;margin:8px 0;color:#ffffff;}\n.bb-sum .cell b{display:block;font-size:9px;color:rgba(255,255,255,0.55);font-weight:400;text-transform:uppercase;letter-spacing:0.6px;line-height:1.6;}\n.bb-sw{display:flex;gap:6px;font-size:11px;margin:8px 0 4px 0;}\n.bb-sw span{padding:3px 10px;border-radius:3px;font-weight:600;color:#ffffff;}\n.bb-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:8px;}\n.bb-tile{padding:8px 4px 7px 4px;border-radius:4px;text-align:center;border:2px solid transparent;color:#ffffff;}\n.bb-tile .ti{font-size:10px;line-height:1.1;opacity:0.75;}\n.bb-tile .td{font-size:20px;font-weight:700;line-height:1.15;margin-top:2px;letter-spacing:-0.2px;}\n.bb-tile .td .u{font-size:11px;font-weight:400;opacity:0.7;margin-left:1px;}\n.bb-tile .tv{font-size:11px;line-height:1.2;opacity:0.85;margin-top:1px;}\n.bb-ok{background:#2e7d32;}\n.bb-warn{background:#ef6c00;}\n.bb-crit{background:#c62828;}\n.bb-na{background:#424242;color:rgba(255,255,255,0.6);}\n.bb-sw .bb-ok{background:#2e7d32;}\n.bb-sw .bb-warn{background:#ef6c00;}\n.bb-sw .bb-crit{background:#c62828;}\n.bb-sw .bb-na{background:#424242;}\n.bb-tile.bb-is-min{border-color:#4dd0e1;}\n.bb-tile.bb-is-max{border-color:#ffd54f;}\n.bb-stale-card{opacity:0.5;}\n.bb-v-ok{color:#81c784;}\n.bb-v-warn{color:#ffb74d;font-weight:600;}\n.bb-v-crit{color:#ef5350;font-weight:700;}\n.bb-v-na{color:rgba(255,255,255,0.5);}\n.bb-nodata{color:rgba(255,255,255,0.5);font-style:italic;padding:16px;text-align:center;}\n</style>\n<div class=\"bb-card\" ng-class=\"{'bb-stale-card': msg.payload.stale && msg.payload.hasData}\">\n  <div class=\"bb-hdr\">\n    <div class=\"bb-hdr-left\">\n      <span class=\"bb-bank\">{{msg.payload.bank}}</span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\">{{msg.payload.voltage | number:2}}<span class=\"u\">&nbsp;V</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\"\n            ng-class=\"msg.payload.current >= 0 ? 'charge' : 'discharge'\">{{msg.payload.current | number:2}}<span class=\"u\">&nbsp;A</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\">{{msg.payload.soc | number:1}}<span class=\"u\">&nbsp;%</span></span>\n      <span ng-if=\"msg.payload.hasData\" class=\"bb-headline\"\n            ng-class=\"msg.payload.power >= 0 ? 'charge' : 'discharge'\">{{msg.payload.power | number:0}}<span class=\"u\">&nbsp;W</span></span>\n    </div>\n    <div>\n      <span ng-if=\"msg.payload.hasData && msg.payload.stale\" class=\"bb-stale\">STALE {{msg.payload.ageS}}s</span>\n      <span ng-if=\"msg.payload.hasData && !msg.payload.stale\" class=\"bb-age\">updated {{msg.payload.ageS}}s ago</span>\n    </div>\n  </div>\n  <div ng-if=\"!msg.payload.hasData\" class=\"bb-nodata\">no data received yet</div>\n  <div ng-if=\"msg.payload.hasData\">\n    <div class=\"bb-sum\">\n      <div class=\"cell\"><b>SOC</b>{{msg.payload.soc | number:1}}%</div>\n      <div class=\"cell\"><b>Power</b>{{msg.payload.power | number:0}} W</div>\n      <div class=\"cell\"><b>Cycles</b>{{msg.payload.cycles}}</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.deltaSev\"><b>Cell &Delta;</b>{{(msg.payload.cellDelta*1000) | number:0}} mV</div>\n      <div class=\"cell\"><b>Cell Avg</b>{{msg.payload.cellAvg | number:3}} V</div>\n      <div class=\"cell\"><b>Min / Max</b>{{msg.payload.cellMin | number:3}} / {{msg.payload.cellMax | number:3}}</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.tempSev1\"><b>Temp 1</b>{{msg.payload.t1 | number:1}} &deg;C</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.tempSev2\"><b>Temp 2</b>{{msg.payload.t2 | number:1}} &deg;C</div>\n      <div class=\"cell\" ng-class=\"'bb-v-' + msg.payload.mosfetSev\"><b>MOSFET</b>{{msg.payload.mt | number:1}} &deg;C</div>\n    </div>\n    <div class=\"bb-sw\">\n      <span ng-class=\"'bb-' + msg.payload.swChargeSev\">charge: {{msg.payload.swCharge}}</span>\n      <span ng-class=\"'bb-' + msg.payload.swDischSev\">discharge: {{msg.payload.swDisch}}</span>\n      <span ng-class=\"'bb-' + msg.payload.swBalSev\">balance: {{msg.payload.swBal}}</span>\n    </div>\n    <div class=\"bb-grid\">\n      <div ng-repeat=\"c in msg.payload.cells track by c.i\" class=\"bb-tile\"\n           ng-class=\"['bb-' + c.sev, {'bb-is-min': c.isMin, 'bb-is-max': c.isMax}]\">\n        <div class=\"ti\">cell {{c.i}}</div>\n        <div class=\"td\">{{c.devMv >= 0 ? '+' : ''}}{{c.devMv}}<span class=\"u\">&nbsp;mV</span></div>\n        <div class=\"tv\">{{c.v | number:3}} V</div>\n      </div>\n    </div>\n  </div>\n</div>",
+            "storeOutMessages": true,
+            "fwdInMessages": false,
+            "resendOnRefresh": true,
+            "templateScope": "local",
+            "className": "",
+            "x": 720,
+            "y": 920,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "bb_btn_refresh",
+            "type": "ui_button",
+            "z": "8a7a85d30c1477cc",
+            "name": "refresh",
+            "group": "bb_grp_ctrl",
+            "order": 1,
+            "width": 14,
+            "height": 1,
+            "passthru": false,
+            "label": "\u21bb Refresh",
+            "tooltip": "Trigger an immediate dashboard refresh",
+            "color": "",
+            "bgcolor": "",
+            "className": "",
+            "icon": "",
+            "payload": "manual",
+            "payloadType": "str",
+            "topic": "refresh",
+            "topicType": "str",
+            "x": 150,
+            "y": 820,
+            "wires": [
+                [
+                    "bb_publish",
+                    "bb_chart_query"
+                ]
+            ]
+        },
+        {
+            "id": "bb_chart_query",
+            "type": "influxdb in",
+            "z": "8a7a85d30c1477cc",
+            "influxdb": "influxdb_config",
+            "name": "48h cell min/max",
+            "query": "SELECT MEAN(cell_min) AS cmin, MEAN(cell_max) AS cmax, MEAN(soc_percent) AS soc FROM bms_health WHERE time > now() - 48h GROUP BY time(15m), bank FILL(none)",
+            "rawOutput": true,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "organisation",
+            "x": 410,
+            "y": 940,
+            "wires": [
+                [
+                    "bb_chart_format"
+                ]
+            ]
+        },
+        {
+            "id": "bb_chart_format",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "format chart data",
+            "func": "// Format InfluxDB raw output into ui_chart reload payload, per bank.\n// Three series per bank: min (cell N), max (cell N), SOC (scaled).\n// SOC is mapped from 0..100 to the cell voltage range 2.80..3.60\n// so it shares the cell Y axis: y = 2.8 + (SOC/100) * 0.8.\n\nconst SOC_Y_MIN = 2.8;\nconst SOC_Y_SPAN = 0.8;   // 3.6 - 2.8\n\nconst data = msg.payload;\nlet series = [];\nif (data && data.results && data.results[0] && Array.isArray(data.results[0].series)) {\n    series = data.results[0].series;\n} else if (Array.isArray(data) && data[0] && data[0].series) {\n    series = data[0].series;\n}\n\nconst STATE = flow.get('bms_state') || {};\n\nfunction currentIdx(bank, which) {\n    const s = STATE[bank];\n    if (!s) return null;\n    const entry = s['cell_voltages/' + which + '_index'];\n    if (!entry) return null;\n    const n = parseInt(entry.value, 10);\n    return Number.isFinite(n) ? n : null;\n}\n\nfunction currentSoc(bank) {\n    const s = STATE[bank];\n    if (!s) return null;\n    const e = s['soc/soc_percent'];\n    if (!e) return null;\n    const n = parseFloat(e.value);\n    return Number.isFinite(n) ? n : null;\n}\n\nconst banks = {\n    bat_ost:  { min: [], max: [], soc: [] },\n    bat_west: { min: [], max: [], soc: [] },\n    bat_big:  { min: [], max: [], soc: [] }\n};\n\nfor (const ser of series) {\n    const bank = ser.tags && ser.tags.bank;\n    if (!banks[bank]) continue;\n    const cols = ser.columns || [];\n    const tIdx   = cols.indexOf('time');\n    const minIdx = cols.indexOf('cmin');\n    const maxIdx = cols.indexOf('cmax');\n    const socIdx = cols.indexOf('soc');\n    if (tIdx < 0) continue;\n    for (const row of ser.values || []) {\n        const t = new Date(row[tIdx]).getTime();\n        if (!Number.isFinite(t)) continue;\n        if (minIdx >= 0) {\n            const v = parseFloat(row[minIdx]);\n            if (Number.isFinite(v)) banks[bank].min.push({ x: t, y: v });\n        }\n        if (maxIdx >= 0) {\n            const v = parseFloat(row[maxIdx]);\n            if (Number.isFinite(v)) banks[bank].max.push({ x: t, y: v });\n        }\n        if (socIdx >= 0) {\n            const s = parseFloat(row[socIdx]);\n            if (Number.isFinite(s)) {\n                banks[bank].soc.push({ x: t, y: SOC_Y_MIN + (s / 100) * SOC_Y_SPAN });\n            }\n        }\n    }\n}\n\nfunction label(prefix, idx) {\n    return idx != null ? `${prefix} (cell ${idx})` : prefix;\n}\n\nfunction socLabel(bank) {\n    const cur = currentSoc(bank);\n    return cur != null ? `SOC ${cur.toFixed(0)}% (scaled)` : 'SOC (scaled)';\n}\n\nfunction chartMsg(bank) {\n    const mi = currentIdx(bank, 'min');\n    const xi = currentIdx(bank, 'max');\n    return {\n        topic: bank,\n        payload: [{\n            series: [label('min', mi), label('max', xi), socLabel(bank)],\n            data:   [banks[bank].min, banks[bank].max, banks[bank].soc],\n            labels: ['']\n        }]\n    };\n}\n\nreturn [chartMsg('bat_ost'), chartMsg('bat_west'), chartMsg('bat_big')];",
+            "outputs": 3,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 660,
+            "y": 940,
+            "wires": [
+                [
+                    "bb_chart_ost"
+                ],
+                [
+                    "bb_chart_west"
+                ],
+                [
+                    "bb_chart_big"
+                ]
+            ]
+        },
+        {
+            "id": "bb_chart_ost",
+            "type": "ui_chart",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_ost cell min/max",
+            "group": "bb_grp_ost",
+            "order": 2,
+            "width": 14,
+            "height": 5,
+            "label": "Cell min / max \u2014 last 48h",
+            "chartType": "line",
+            "legend": "true",
+            "xformat": "HH:mm",
+            "interpolate": "linear",
+            "nodata": "loading\u2026",
+            "dot": false,
+            "ymin": "",
+            "ymax": "",
+            "removeOlder": "48",
+            "removeOlderPoints": "",
+            "removeOlderUnit": "3600",
+            "cutout": 0,
+            "useOneColor": false,
+            "useUTC": false,
+            "colors": [
+                "#4dd0e1",
+                "#ffd54f",
+                "#ba68c8",
+                "#98df8a",
+                "#d62728",
+                "#ff9896",
+                "#9467bd",
+                "#c5b0d5"
+            ],
+            "outputs": 1,
+            "useDifferentColor": false,
+            "className": "",
+            "x": 920,
+            "y": 940,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "bb_chart_west",
+            "type": "ui_chart",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_west cell min/max",
+            "group": "bb_grp_west",
+            "order": 2,
+            "width": 14,
+            "height": 5,
+            "label": "Cell min / max \u2014 last 48h",
+            "chartType": "line",
+            "legend": "true",
+            "xformat": "HH:mm",
+            "interpolate": "linear",
+            "nodata": "loading\u2026",
+            "dot": false,
+            "ymin": "",
+            "ymax": "",
+            "removeOlder": "48",
+            "removeOlderPoints": "",
+            "removeOlderUnit": "3600",
+            "cutout": 0,
+            "useOneColor": false,
+            "useUTC": false,
+            "colors": [
+                "#4dd0e1",
+                "#ffd54f",
+                "#ba68c8",
+                "#98df8a",
+                "#d62728",
+                "#ff9896",
+                "#9467bd",
+                "#c5b0d5"
+            ],
+            "outputs": 1,
+            "useDifferentColor": false,
+            "className": "",
+            "x": 920,
+            "y": 940,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "bb_chart_big",
+            "type": "ui_chart",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_big cell min/max",
+            "group": "bb_grp_big",
+            "order": 2,
+            "width": 14,
+            "height": 5,
+            "label": "Cell min / max \u2014 last 48h",
+            "chartType": "line",
+            "legend": "true",
+            "xformat": "HH:mm",
+            "interpolate": "linear",
+            "nodata": "loading\u2026",
+            "dot": false,
+            "ymin": "",
+            "ymax": "",
+            "removeOlder": "48",
+            "removeOlderPoints": "",
+            "removeOlderUnit": "3600",
+            "cutout": 0,
+            "useOneColor": false,
+            "useUTC": false,
+            "colors": [
+                "#4dd0e1",
+                "#ffd54f",
+                "#ba68c8",
+                "#98df8a",
+                "#d62728",
+                "#ff9896",
+                "#9467bd",
+                "#c5b0d5"
+            ],
+            "outputs": 1,
+            "useDifferentColor": false,
+            "className": "",
+            "x": 920,
+            "y": 940,
+            "wires": [
+                []
+            ]
+        },
+        {
+            "id": "bb_tpl_ess",
+            "type": "ui_template",
+            "z": "8a7a85d30c1477cc",
+            "group": "bb_grp_ess",
+            "name": "ESS card",
+            "order": 1,
+            "width": 14,
+            "height": 3,
+            "format": "<style>\n.ess-card{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:10px 14px;color:#ffffff;background:#0f172a;border-radius:6px;border-left:6px solid #64b5f6;display:flex;align-items:center;gap:18px;flex-wrap:wrap;}\n.ess-title{font-size:18px;font-weight:700;letter-spacing:0.5px;flex:0 0 auto;}\n.ess-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:6px 16px;flex:1 1 auto;}\n.ess-grid .c{font-size:18px;font-weight:700;line-height:1.1;}\n.ess-grid .c b{display:block;font-size:9px;color:rgba(255,255,255,0.6);font-weight:400;text-transform:uppercase;letter-spacing:0.6px;line-height:1.5;}\n.ess-grid .c .u{font-size:11px;font-weight:500;color:rgba(255,255,255,0.65);margin-left:1px;}\n.ess-pos{color:#81c784;}\n.ess-neg{color:#ffb74d;}\n.ess-nodata{color:rgba(255,255,255,0.5);font-style:italic;}\n</style>\n<div class=\"ess-card\">\n  <span class=\"ess-title\">ESS</span>\n  <div ng-if=\"!msg.payload.hasData\" class=\"ess-nodata\">no ESS data</div>\n  <div ng-if=\"msg.payload.hasData\" class=\"ess-grid\">\n    <div class=\"c\"><b>SOC</b>{{msg.payload.soc | number:0}}<span class=\"u\">&nbsp;%</span></div>\n    <div class=\"c\"><b>Pack V</b>{{msg.payload.voltage | number:2}}<span class=\"u\">&nbsp;V</span></div>\n    <div class=\"c\" ng-class=\"msg.payload.power >= 0 ? 'ess-pos' : 'ess-neg'\"><b>Power</b>{{msg.payload.power | number:0}}<span class=\"u\">&nbsp;W</span></div>\n    <div class=\"c\" ng-class=\"msg.payload.setpoint >= 0 ? 'ess-pos' : 'ess-neg'\"><b>AC Setpoint</b>{{msg.payload.setpoint | number:0}}<span class=\"u\">&nbsp;W</span></div>\n    <div class=\"c\"><b>AC Load</b>{{msg.payload.acload | number:0}}<span class=\"u\">&nbsp;W</span></div>\n    <div class=\"c\"><b>PV (pac)</b>{{msg.payload.pac | number:0}}<span class=\"u\">&nbsp;W</span></div>\n  </div>\n</div>",
+            "storeOutMessages": true,
+            "fwdInMessages": false,
+            "resendOnRefresh": true,
+            "templateScope": "local",
+            "className": "",
+            "x": 720,
+            "y": 800,
+            "wires": [
+                []
+            ]
+        }
+    ],
+    "configs": [
+        {
+            "id": "bb_tab",
+            "type": "ui_tab",
+            "z": "8a7a85d30c1477cc",
+            "name": "Batteries",
+            "icon": "battery_full",
+            "order": 20,
+            "disabled": false,
+            "hidden": false
+        },
+        {
+            "id": "bb_grp_ost",
+            "type": "ui_group",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_ost",
+            "tab": "bb_tab",
+            "order": 3,
+            "disp": false,
+            "width": 14,
+            "collapse": false,
+            "className": ""
+        },
+        {
+            "id": "bb_grp_west",
+            "type": "ui_group",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_west",
+            "tab": "bb_tab",
+            "order": 4,
+            "disp": false,
+            "width": 14,
+            "collapse": false,
+            "className": ""
+        },
+        {
+            "id": "bb_grp_big",
+            "type": "ui_group",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_big",
+            "tab": "bb_tab",
+            "order": 5,
+            "disp": false,
+            "width": 14,
+            "collapse": false,
+            "className": ""
+        },
+        {
+            "id": "bb_grp_ctrl",
+            "type": "ui_group",
+            "z": "8a7a85d30c1477cc",
+            "name": "controls",
+            "tab": "bb_tab",
+            "order": 1,
+            "disp": false,
+            "width": 14,
+            "collapse": false,
+            "className": ""
+        },
+        {
+            "id": "bb_grp_ess",
+            "type": "ui_group",
+            "z": "8a7a85d30c1477cc",
+            "name": "ess",
+            "tab": "bb_tab",
+            "order": 2,
+            "disp": false,
+            "width": 14,
+            "collapse": false,
+            "className": ""
+        }
+    ]
+}
