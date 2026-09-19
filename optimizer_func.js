@@ -2530,10 +2530,57 @@ var weather7 = global.get("weather7days", "file")
 // state 3 (cover the household load) rather than acting on it. Emitting nothing
 // would leave the Cerbo pinned in whatever state 1 or 4 the last good run had
 // commanded, charging or draining blind - worse than doing nothing.
-const _cmdState = socStale ? 3 : (currentSlot ? currentSlot.state : 3);
-const _cmdReason = socStale
+let _cmdState = socStale ? 3 : (currentSlot ? currentSlot.state : 3);
+let _cmdReason = socStale
     ? `SOC stale (${currentSoc.toFixed(1)}% flat ${Math.round(_socFlatMin)}min, source ${_socSource}) - holding at load compensation`
     : (currentSlot ? currentSlot.reason : 'no data');
+
+// === Top-of-charge calibration override (temporary - remove after 2026-09-20) ==
+// Both SOC counters integrate current correctly and neither one is anchored.
+// Measured 2026-09-19 over a 4.5 h rest at 0.00 A, where three hard-paralleled
+// packs must share a terminal voltage by construction: bat_ost and bat_west both
+// read 3.205 V/cell, bat_big read 3.245. That +40 mV/cell is in what bat_big
+// measures, not in its charge, which is why it re-zeroes to 100% early, latches
+// full while genuinely lower, and - at 310 of 563 Ah - carries weightedSoc up
+// with it. Integrating each pack's own shunt from that anchor gave 1.03/1.02/1.01
+// against its own dsoc, so the integrators are sound and only the zero point is
+// wrong. A completed absorption is the one event that re-anchors a counter for
+// free, and at this time of year PV cannot reach one: ~20 kWh is needed from
+// ~30%, and a late-September day nets under 6 kWh after house load. Waiting for
+// sun defers the fix to spring instead of delivering it.
+// So buy the gap once, in the cheapest window of the day - market ran 0.14-0.70
+// ct/kWh, about 13.6 ct effective, roughly EUR 2 for the whole calibration - and
+// hold the result overnight rather than selling it into the evening peak.
+// This deliberately overrides the standing rules against pre-price grid-charge
+// and against holding back a priced evening sale. It is a maintenance charge, not
+// an arbitrage, which is why it sits behind dated constants that expire on their
+// own rather than behind a tuned threshold someone could later mistake for policy.
+// Three independent stops: the cell ceiling, CAL_CHARGE_UNTIL, CAL_HOLD_UNTIL.
+// Bounded at BOTH ends on purpose. An open-ended `_nowMs < CAL_HOLD_UNTIL` is
+// true for every moment before the deadline, including the April 2026 clock the
+// regression harness mocks, so the override silently rewrote the cell-floor
+// scenarios and turned 23/23 into 21/23 - the floor cases came back as state 1.
+const CAL_FROM         = Date.UTC(2026, 8, 19,  9, 0);  // 11:00 CEST - when this was authorised
+const CAL_CHARGE_UNTIL = Date.UTC(2026, 8, 19, 14, 0);  // 16:00 CEST - end of the cheap window
+const CAL_HOLD_UNTIL   = Date.UTC(2026, 8, 20,  4, 0);  // 06:00 CEST tomorrow - end of the no-sale hold
+if (_nowMs >= CAL_FROM && _nowMs < CAL_HOLD_UNTIL) {
+    const _calCellTxt = maxCellV === null ? 'n/a' : maxCellV.toFixed(3) + 'V';
+    const _calTop = maxCellV !== null && maxCellV >= CELL_FULL_V;
+    if (_cmdState === 4) {
+        _cmdState = 3;
+        _cmdReason = `calibration hold: evening sale suppressed, the charge we just bought is the measurement`;
+    }
+    if (_calTop) {
+        // Let the Multi taper on its own from here; forcing import into a pack at
+        // the ceiling just makes the BMS do the stopping instead of the charger.
+        _cmdReason = `calibration: max cell ${_calCellTxt} at or above ${CELL_FULL_V}V - absorption reached, forced charge released`;
+    } else if (_nowMs < CAL_CHARGE_UNTIL) {
+        // state 1 pins _maxDischarge to 0, so the cell floor still cannot be discharged
+        // through even if the pack somehow sits at the bottom while we are filling it.
+        _cmdState = 1;
+        _cmdReason = `calibration: forcing grid charge toward absorption (max cell ${_calCellTxt}, releasing at ${CELL_FULL_V}V)`;
+    }
+}
 
 // === Device parameters (Cerbo + Symo) ===
 // The published command carries the concrete settings each box is about to
