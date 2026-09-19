@@ -2561,7 +2561,11 @@ let _cmdReason = socStale
 // regression harness mocks, so the override silently rewrote the cell-floor
 // scenarios and turned 23/23 into 21/23 - the floor cases came back as state 1.
 const CAL_FROM         = Date.UTC(2026, 8, 19,  9, 0);  // 11:00 CEST - when this was authorised
-const CAL_CHARGE_UNTIL = Date.UTC(2026, 8, 19, 14, 0);  // 16:00 CEST - end of the cheap window
+const CAL_CHARGE_UNTIL = Date.UTC(2026, 8, 19, 16, 30);  // 18:30 CEST - backstop only; the
+// 3.50 V/cell ceiling above is the real terminator. 16:00 was the end of the cheap window
+// and would have stopped the charge at ~88%, with no resync and the whole spend wasted:
+// 19.6 kWh was still needed at 11:20 and 3.5 kW is the charge cap, so the linear finish is
+// ~16:50 before the absorption taper adds its usual hour or two on top.
 const CAL_HOLD_UNTIL   = Date.UTC(2026, 8, 20,  4, 0);  // 06:00 CEST tomorrow - end of the no-sale hold
 if (_nowMs >= CAL_FROM && _nowMs < CAL_HOLD_UNTIL) {
     const _calCellTxt = maxCellV === null ? 'n/a' : maxCellV.toFixed(3) + 'V';
