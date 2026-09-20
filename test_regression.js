@@ -1716,7 +1716,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     const prices = buildPriceArray(NOW_A, 156, (t) => {
         const h = berlinHour(t), day = dayOffset(t);
         if (day === 0) {
-            if (h < 10) return 17;          // the morning window the user asked about — kept more
+            if (h < 10) return 15.5;        // the morning window the user asked about — kept more
                                             // than PRESAT_RAW_MAX_REGRET_CT under the 22ct hold floor,
                                             // so only the DAMPED path can ever sell it (scenario 19
                                             // owns the raw exemption's boundary)
@@ -1827,7 +1827,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     // Direction 1 — the wobble guard. The 07:45 run SEES the wall and still
     // reports nothing curtailment-bound, because one run of spill is not
     // evidence: the wall-free 07:30 entry is still in the window and the
-    // rolling min is 0. With the exemption shut, the 17ct morning sits under
+    // rolling min is 0. With the exemption shut, the 15.5ct morning sits under
     // the 22ct hold floor and cannot be sold.
     if (exemptOf(runB) !== 0 || presatOf(runB) || planned(runB).length > 0) {
         console.error(`  FAIL: the FIRST spill run (07:45) already unlocked feed-in `
@@ -1837,7 +1837,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     }
 
     // Direction 2 — the miss the user reported. Two consecutive runs of spill
-    // is the whole evidence bar; the 08:00 morning must sell at 17ct rather
+    // is the whole evidence bar; the 08:00 morning must sell at 15.5ct rather
     // than wait for a later run and a worse price.
     if (exemptOf(runC) < 5) {
         console.error(`  FAIL: the SECOND spill run (08:00) still reports only ${exemptOf(runC).toFixed(1)}% `
@@ -1863,7 +1863,7 @@ function scenario18_dampingWindowUnlocksOnSecondRun() {
     console.log(`  PASS: 07:45 saw ${spillOf(runB).toFixed(1)}% spill and held (curtailment-bound 0.0%, `
         + `${reactive(runB).length} morning slot(s) left to dump reactively at 100%); `
         + `08:00 confirmed it (${exemptOf(runC).toFixed(1)}%) and sold ${planned(runC).length} morning slot(s) `
-        + `at 17ct under a 22ct hold floor, SOC ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}%`);
+        + `at 15.5ct under a 22ct hold floor, SOC ${socStart.toFixed(1)}% -> ${socEnd.toFixed(1)}%`);
     return true;
 }
 
@@ -1874,18 +1874,20 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
     // the morning price is the variable. The cross-day hold floor is 22ct
     // throughout (25ct peak beyond the horizon, minus CROSSDAY_HOLD_SLACK_CT).
     //
-    //   in-band  21ct   -> 1.0ct of regret if the wall is a wobble -> may sell at 07:45
-    //   in-band  19ct   -> 3.0ct of regret                         -> may sell at 07:45
-    //   far      17.7ct -> 4.3ct of regret                         -> must wait for 08:00
+    //   in-band  21ct       -> 1.0ct of regret if the wall is a wobble -> may sell at 07:45
+    //   in-band  19ct       -> 3.0ct of regret                        -> may sell at 07:45
+    //   far      (floor - band - 0.3)ct -> band+0.3ct of regret       -> must wait for 08:00
     //
     // The 19ct case is 2026-08-29 to scale: a 22.41ct evening peak set a 19.41ct
     // floor while the best pre-wall morning slot was 16.41ct, 2.99ct under it, so
     // a 2ct band could not reach the only slot pass 1 had left.
-    // The 17.7ct case is the 2026-08-27 07:45 wobble to scale: that run projected
-    // 20.8% spill at 17.05ct against a 21.31ct floor, and the 08:00 run projected
-    // no wall at all. Selling it would have cost 4.3ct/kWh against a peak that
-    // was still coming — 0.3ct outside the band, which is the boundary
-    // PRESAT_RAW_MAX_REGRET_CT is calibrated against.
+    // The "far" case is pinned 0.3ct outside whatever PRESAT_RAW_MAX_REGRET_CT
+    // currently is, so this stays a real boundary test as that constant moves —
+    // it no longer hardcodes the 2026-08-27 wobble's 4.3ct now that the band has
+    // been widened past it (2026-09-20: 4 -> 6, see the constant's own comment).
+    const floorCt = 22;
+    const bandCt = Number(PRESAT_RAW_MAX_REGRET_CT_DOC);
+    const farBandCt = floorCt - (bandCt + 0.3);
     const NOW_A = Date.UTC(2026, 7, 24, 5, 30);
     const NOW_B = NOW_A + 15 * 60 * 1000;
     const NOW_C = NOW_A + 30 * 60 * 1000;
@@ -1980,9 +1982,9 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
 
     const inBand = runEpisode(21);
     const midBand = runEpisode(19);
-    const farBand = runEpisode(17.7);
+    const farBand = runEpisode(farBandCt);
 
-    for (const [label, ep] of [['21ct (1ct regret)', inBand], ['19ct (3ct regret)', midBand], ['17.7ct (4.3ct regret)', farBand]]) {
+    for (const [label, ep] of [['21ct (1ct regret)', inBand], ['19ct (3ct regret)', midBand], [`${farBandCt.toFixed(1)}ct (${(bandCt + 0.3).toFixed(1)}ct regret)`, farBand]]) {
         console.log(`  ${label}: floor=${floorOf(ep.B)}ct spill@07:45=${spillOf(ep.B).toFixed(1)}% `
             + `07:45 planned=${planned(ep.B).length} raw=${usedRawPath(ep.B)} drawn=${drawn(ep.B).toFixed(1)}% | `
             + `08:00 planned=${planned(ep.C).length} drawn=${drawn(ep.C).toFixed(1)}%`);
@@ -1999,7 +2001,6 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
         console.error('  setup drift: cross-day hold not armed, so nothing gates the morning');
         return false;
     }
-    const bandCt = Number(PRESAT_RAW_MAX_REGRET_CT_DOC);
     if (!(inBand.B.schedule.length && 21 < floorOf(inBand.B) && 21 >= floorOf(inBand.B) - bandCt)) {
         console.error(`  setup drift: 21ct is no longer inside the ${PRESAT_RAW_MAX_REGRET_CT_DOC}ct band under the `
             + `${floorOf(inBand.B)}ct floor`);
@@ -2049,12 +2050,12 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
     // Direction 4 — the regret bound still bounds. 4.3ct under the floor is
     // exactly the 2026-08-27 wobble, and must still wait for confirmation.
     if (planned(farBand.B).length > 0) {
-        console.error(`  FAIL: 07:45 sold ${planned(farBand.B).length} morning slot(s) at 17.7ct under a `
-            + `${floorOf(farBand.B)}ct floor — a one-run wobble now costs 4.3ct/kWh against the peak we are holding for`);
+        console.error(`  FAIL: 07:45 sold ${planned(farBand.B).length} morning slot(s) at ${farBandCt.toFixed(1)}ct under a `
+            + `${floorOf(farBand.B)}ct floor — a one-run wobble now costs ${(bandCt + 0.3).toFixed(1)}ct/kWh against the peak we are holding for`);
         return false;
     }
     if (planned(farBand.C).length === 0) {
-        console.error('  FAIL: 17.7ct morning never sold, not even on the confirmed 08:00 run — '
+        console.error(`  FAIL: ${farBandCt.toFixed(1)}ct morning never sold, not even on the confirmed 08:00 run — `
             + 'the regret bound has swallowed the damped path too');
         return false;
     }
@@ -2063,7 +2064,7 @@ function scenario19_rawSpillExemptionBoundedByRegret() {
         + `on the raw exemption, ${(drawn(inBand.B) - drawn(farBand.B)).toFixed(1)}% more headroom than the blocked episode `
         + `and ${planned(inBand.C).length} slot(s)/${drawn(inBand.C).toFixed(1)}% once confirmed, tonight untouched; `
         + `19ct (3ct under) also sold ${planned(midBand.B).length} slot(s) at 07:45; `
-        + `17.7ct (4.3ct under) held at 07:45 and sold ${planned(farBand.C).length} slot(s) at 08:00`);
+        + `${farBandCt.toFixed(1)}ct (${(bandCt + 0.3).toFixed(1)}ct under) held at 07:45 and sold ${planned(farBand.C).length} slot(s) at 08:00`);
     return true;
 }
 
