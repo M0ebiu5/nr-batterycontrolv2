@@ -158,6 +158,10 @@ if (socStale) {
     }
 }
 global.set('socFresh', { soc: currentSoc, changedAt: _socChangedAt, warnedAt: _socWarnedAt }, 'file');
+// What the planner actually ran on, for whoever logs an "actual SOC" line. The
+// two feeds sit ~36 pp apart today, so a consumer that always reads the BMS ends
+// up plotting a different quantity than the one predictedSoc was projected from.
+global.set('socUsed', { soc: currentSoc, source: _socSource, ts: _nowMs });
 // Suppress grid-charge of the LIVE slot when the reading can't be trusted or a pack
 // is at the cell-voltage ceiling. (Applied at i===0 only; future slots re-evaluate.)
 const gridChargeBlocked = !socTrust || (maxCellV !== null && maxCellV >= CELL_FULL_V);
@@ -446,22 +450,25 @@ function getSunshineForecast(timeMs) {
     return null;
 }
 
-function estimatePvPower(timeMs) {
-    if (!isDaylight(timeMs)) return 0;
-    const now = Date.now();
-    const hoursAhead = (timeMs - now) / (3600 * 1000);
+// Per-slot PV baseline before any live-data correction: the historical
+// hourly profile scaled by the per-slot sunshine forecast.
+function estimatePvBaseline(timeMs) {
     const h = berlinTime(timeMs).hour;
     const { profile: hourlyPv, refRatio: baselineRefRatio } = getDayBaseline(timeMs);
     const basePvRaw = hourlyPv[h] || 0;
-
-    // Scale the per-day baseline by the per-slot sunshine forecast. baseline
-    // is calibrated to that day's peak sun ratio, but the morning/afternoon
-    // forecast can still differ from the peak hour within the same day.
     let basePv = basePvRaw;
     const slotForecast = getSunshineForecast(timeMs);
     if (slotForecast !== null && basePvRaw > 0) {
         basePv = basePvRaw * Math.min(slotForecast / baselineRefRatio, 1.2);
     }
+    return { basePvRaw, basePv };
+}
+
+function estimatePvPower(timeMs) {
+    if (!isDaylight(timeMs)) return 0;
+    const now = Date.now();
+    const hoursAhead = (timeMs - now) / (3600 * 1000);
+    const { basePvRaw, basePv } = estimatePvBaseline(timeMs);
 
     // Correct with real-time data for all remaining daylight slots today:
     // 1. Actual inverter PV power (PAC) — most accurate
@@ -513,6 +520,34 @@ function estimatePvPower(timeMs) {
     if (weather.rainrate > 0) rainFactor = 0.3;
 
     return Math.min(basePv * rainFactor, PV_PEAK_W);
+}
+
+// Baseline + rain factor only, no live-PAC/radiation correction. The live
+// correction blends toward actual inverter output, which under-reads during
+// the morning ramp (PAC lags the true curve as panels come out of shadow/low
+// angle) — 2026-09-20 the pack sat at 100% SoC for ~4h before the corrected
+// estimate caught up and the saturation wall fired. Used only to widen the
+// dawn-hours wall check below, never for dispatch or the reserve floor.
+function estimatePvPowerForecastOnly(timeMs) {
+    if (!isDaylight(timeMs)) return 0;
+    const { basePv } = estimatePvBaseline(timeMs);
+    if (basePv <= 0) return 0;
+    let rainFactor = 1;
+    if (weather.rainrate > 0) rainFactor = 0.3;
+    return Math.min(basePv * rainFactor, PV_PEAK_W);
+}
+
+// Dawn window during which the live-corrected estimate above is least
+// trustworthy for the near-term ramp (see estimatePvPowerForecastOnly).
+// Day-agnostic (minutes since that day's sunrise), like isDaylight().
+const DAWN_EAGER_HOURS = 3;
+function isDawnEagerWindow(timeMs) {
+    if (!sunRise) return false;
+    const rise = berlinTime(sunRise);
+    const cur = berlinTime(timeMs);
+    const mins = cur.hour * 60 + cur.minute;
+    const riseMins = rise.hour * 60 + rise.minute;
+    return mins >= riseMins && mins < riseMins + DAWN_EAGER_HOURS * 60;
 }
 
 function getGridFee(timeMs) {
@@ -1460,6 +1495,12 @@ let satStartIdx = -1;
 // be, and they under-report the spill that decides whether a late slot is
 // curtailment-bound.
 let projSocPhys = currentSoc;
+// Dawn-eager analog of pvOnlyOverflowRaw, but on this plan-aware walk instead
+// of the PV-only one: how much the physical wall walk below overflows past
+// SOC_CURTAIL_PCT once the forecast-only PV nudge (dawn window only) is
+// applied. Bounded by the same clamp that places satStartIdx; feeds only the
+// Phase 3d raw-spill exemption sizing, never overflowSoc/feedinBudgetSoc.
+let satOverflowRawEager = 0;
 
 // Project SOC to the horizon WITHOUT any feed-in plans. Track overflow
 // (PV above the planning ceiling) separately so the "battery will actually be
@@ -1479,6 +1520,7 @@ let projSocPhys = currentSoc;
         const pvW = s.pvPower;
         const loadW = s.loadEst;
         let delta;
+        let deltaUsesPv = false;
         if (s._plan === 'charge') {
             delta = kwhToSoc(maxChargeEnergy);
         } else if (s._plan === 'feedin_preemptive') {
@@ -1487,11 +1529,24 @@ let projSocPhys = currentSoc;
             delta = kwhToSoc(maxChargeEnergy);
         } else {
             delta = kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+            deltaUsesPv = true;
         }
         projSoc += delta;
         physSoc += delta;
+        // Dawn-eager wall only: nudge the WALL (physSoc/satStartIdx) with the
+        // forecast-only PV estimate when it exceeds the live-corrected one, so
+        // the pre-saturation pass can open before the live correction has
+        // caught up. Never touches projSoc/overflowSoc, so feedinBudgetSoc and
+        // the multi-day reserve floor are unaffected.
+        if (deltaUsesPv && isDawnEagerWindow(s.time)) {
+            const pvWEager = Math.max(pvW, estimatePvPowerForecastOnly(s.time));
+            if (pvWEager > pvW) {
+                physSoc += kwhToSoc((pvWEager - pvW) * INTERVAL_HOURS / 1000);
+            }
+        }
         if (physSoc > SOC_CURTAIL_PCT) {
             if (satStartIdx < 0) satStartIdx = i;
+            satOverflowRawEager += physSoc - SOC_CURTAIL_PCT;
             physSoc = SOC_CURTAIL_PCT;
         }
         if (physSoc < MIN_SOC_PCT) physSoc = MIN_SOC_PCT;
@@ -1885,7 +1940,12 @@ let projSocPhys = currentSoc;
         const satRun = [];
         for (let i = satStartIdx; i < horizonIdx; i++) {
             const s = schedule[i];
-            if (s.pvPower <= s.loadEst) break;
+            // Eager-aware: satStartIdx may have fired on the forecast-only
+            // estimate (dawn window), where real s.pvPower hasn't yet crossed
+            // load — don't let that immediately break the run.
+            const pvSurplus = s.pvPower > s.loadEst
+                || (isDawnEagerWindow(s.time) && estimatePvPowerForecastOnly(s.time) > s.loadEst);
+            if (!pvSurplus) break;
             if (typeof s.marketPrice === 'number') satRun.push(s.marketPrice);
         }
         if (satRun.length) satDumpPrice = satRun.reduce((a, b) => a + b, 0) / satRun.length;
@@ -1962,10 +2022,23 @@ let projSocPhys = currentSoc;
         // nothing for the exemption to clear, and widening the cap on an
         // unconfirmed forecast would be the 2026-07-28 spike all over again.
         const holdArmed = isFinite(futurePeakHoldPrice);
-        const presatRawExempt = (holdArmed && pvOnlyOverflowRaw >= PV_CURTAIL_MIN_SOC)
-            ? Math.max(pvOnlyOverflow, pvOnlyOverflowRaw * PRESAT_RAW_EXEMPT_FRAC)
+        // Dawn-eager: when the confirmed pvOnlyOverflowRaw hasn't caught up
+        // yet but the plan-aware wall walk above already crossed the trigger
+        // on the forecast-only estimate, size the exemption off that instead.
+        // Same bounded fraction/regret-band as the ordinary raw-spill path —
+        // this only changes WHICH unconfirmed spill number is trusted, not
+        // how much of it is trusted.
+        const rawOverflowForExempt = Math.max(pvOnlyOverflowRaw, satOverflowRawEager);
+        const presatRawExempt = (holdArmed && rawOverflowForExempt >= PV_CURTAIL_MIN_SOC)
+            ? Math.max(pvOnlyOverflow, rawOverflowForExempt * PRESAT_RAW_EXEMPT_FRAC)
             : pvOnlyOverflow;
-        const presatCap = Math.min(feedinBudgetSoc, Math.max(0, overflowSoc, presatRawExempt));
+        // At dawn feedinBudgetSoc itself hasn't caught up either (it derives
+        // from the same damped overflowSoc); widen it only by the already-
+        // bounded exemption amount so this pass's cap isn't zeroed by an
+        // unrelated outer budget. Local to this pass — feedinBudgetSoc itself
+        // (and Pass 2's cap) is untouched.
+        const feedinBudgetSocForPresat = Math.max(feedinBudgetSoc, presatRawExempt);
+        const presatCap = Math.min(feedinBudgetSocForPresat, Math.max(0, overflowSoc, presatRawExempt));
         const presat = candidates.filter(({ idx, s }) =>
             idx < satStartIdx && s.marketPrice >= satDumpPrice + PRESAT_MIN_GAIN_CT);
         let picked = 0;
@@ -1985,11 +2058,12 @@ let projSocPhys = currentSoc;
             }
         }
         if (picked > 0) {
+            const eagerActive = satOverflowRawEager > pvOnlyOverflowRaw;
             node.warn(`Phase 3d pre-saturation: ${picked} slot(s) before idx=${satStartIdx} `
                 + `(dump would fetch ${satDumpPrice.toFixed(1)}ct, hurdle ${(satDumpPrice + PRESAT_MIN_GAIN_CT).toFixed(1)}ct, `
                 + `cap ${presatCap.toFixed(1)}%`
-                + `${usedRaw ? `, raw-spill exemption ${presatRawExempt.toFixed(1)}% of ${pvOnlyOverflowRaw.toFixed(1)}% unconfirmed spill, `
-                    + `floor ${futurePeakHoldPrice.toFixed(1)}ct` : ''})`);
+                + `${usedRaw ? `, raw-spill exemption ${presatRawExempt.toFixed(1)}% of ${rawOverflowForExempt.toFixed(1)}% unconfirmed spill`
+                    + `${eagerActive ? ' (dawn-eager)' : ''}, floor ${futurePeakHoldPrice.toFixed(1)}ct` : ''})`);
         }
     }
 
@@ -2299,6 +2373,20 @@ let projSocPhys = currentSoc;
 // ================================================================
 let soc = currentSoc;
 
+// === Top-of-charge calibration window (temporary - remove after 2026-09-20) ===
+// Applied here, inside the final projection loop, rather than further down where
+// the device command is assembled. Overriding only the command leaves the planner
+// still projecting the state it chose rather than the one being sent: on the
+// first cut of this the plan modelled state 3 all afternoon while the inverter was
+// actually held at state 1, so predictedSoc drifted from the real trajectory as
+// soon as PV stopped covering the forced charge. Set the slot state and the
+// projection, the reason string and the published command all follow from it.
+// Bounded at both ends - an open-ended `< CAL_HOLD_UNTIL` is also true of the
+// April 2026 clock test_regression.js mocks.
+const CAL_FROM         = Date.UTC(2026, 8, 19,  9, 0);   // 11:00 CEST - when this was authorised
+const CAL_CHARGE_UNTIL = Date.UTC(2026, 8, 19, 16, 30);  // 18:30 CEST - backstop; the cell ceiling is the real stop
+const CAL_HOLD_UNTIL   = Date.UTC(2026, 8, 20,  4, 0);   // 06:00 CEST tomorrow - end of the no-sale hold
+
 for (let i = 0; i < schedule.length; i++) {
     const slot = schedule[i];
     const t = slot.time;
@@ -2447,6 +2535,27 @@ for (let i = 0; i < schedule.length; i++) {
         reason = `Feed-in blocked: min cell ${_minCellTxt} at the floor (SOC ${soc.toFixed(0)}% not deliverable)`;
     }
 
+    // --- Top-of-charge calibration (temporary) ------------------------------
+    // Buying one completed absorption because it is the only event that re-zeroes
+    // a coulomb counter for free, and PV cannot reach one this late in the year.
+    // Deliberately overrides the standing pre-price grid-charge and evening-sale
+    // rules; it is a maintenance charge, not an arbitrage.
+    if (t >= CAL_FROM && t < CAL_HOLD_UNTIL) {
+        const _calCell = maxCellV === null ? 'n/a' : maxCellV.toFixed(3) + 'V';
+        if (state === 4) {
+            state = 3; setPoint = -AVG_LOAD_W;
+            reason = `Calibration hold: evening sale suppressed, the charge we just bought is the measurement`;
+        }
+        if (maxCellV !== null && maxCellV >= CELL_FULL_V) {
+            // Let the Multi taper on its own; forcing import into a pack at the
+            // ceiling just makes the BMS do the stopping instead of the charger.
+            reason = `Calibration: max cell ${_calCell} at the ${CELL_FULL_V}V ceiling - absorption reached, forced charge released`;
+        } else if (t < CAL_CHARGE_UNTIL) {
+            state = 1; setPoint = MAX_CHARGE_W;
+            reason = `Calibration: forcing grid charge toward absorption (max cell ${_calCell}, releasing at ${CELL_FULL_V}V)`;
+        }
+    }
+
     // === Update SOC prediction ===
     let socDelta = 0;
 
@@ -2530,61 +2639,10 @@ var weather7 = global.get("weather7days", "file")
 // state 3 (cover the household load) rather than acting on it. Emitting nothing
 // would leave the Cerbo pinned in whatever state 1 or 4 the last good run had
 // commanded, charging or draining blind - worse than doing nothing.
-let _cmdState = socStale ? 3 : (currentSlot ? currentSlot.state : 3);
-let _cmdReason = socStale
+const _cmdState = socStale ? 3 : (currentSlot ? currentSlot.state : 3);
+const _cmdReason = socStale
     ? `SOC stale (${currentSoc.toFixed(1)}% flat ${Math.round(_socFlatMin)}min, source ${_socSource}) - holding at load compensation`
     : (currentSlot ? currentSlot.reason : 'no data');
-
-// === Top-of-charge calibration override (temporary - remove after 2026-09-20) ==
-// Both SOC counters integrate current correctly and neither one is anchored.
-// Measured 2026-09-19 over a 4.5 h rest at 0.00 A, where three hard-paralleled
-// packs must share a terminal voltage by construction: bat_ost and bat_west both
-// read 3.205 V/cell, bat_big read 3.245. That +40 mV/cell is in what bat_big
-// measures, not in its charge, which is why it re-zeroes to 100% early, latches
-// full while genuinely lower, and - at 310 of 563 Ah - carries weightedSoc up
-// with it. Integrating each pack's own shunt from that anchor gave 1.03/1.02/1.01
-// against its own dsoc, so the integrators are sound and only the zero point is
-// wrong. A completed absorption is the one event that re-anchors a counter for
-// free, and at this time of year PV cannot reach one: ~20 kWh is needed from
-// ~30%, and a late-September day nets under 6 kWh after house load. Waiting for
-// sun defers the fix to spring instead of delivering it.
-// So buy the gap once, in the cheapest window of the day - market ran 0.14-0.70
-// ct/kWh, about 13.6 ct effective, roughly EUR 2 for the whole calibration - and
-// hold the result overnight rather than selling it into the evening peak.
-// This deliberately overrides the standing rules against pre-price grid-charge
-// and against holding back a priced evening sale. It is a maintenance charge, not
-// an arbitrage, which is why it sits behind dated constants that expire on their
-// own rather than behind a tuned threshold someone could later mistake for policy.
-// Three independent stops: the cell ceiling, CAL_CHARGE_UNTIL, CAL_HOLD_UNTIL.
-// Bounded at BOTH ends on purpose. An open-ended `_nowMs < CAL_HOLD_UNTIL` is
-// true for every moment before the deadline, including the April 2026 clock the
-// regression harness mocks, so the override silently rewrote the cell-floor
-// scenarios and turned 23/23 into 21/23 - the floor cases came back as state 1.
-const CAL_FROM         = Date.UTC(2026, 8, 19,  9, 0);  // 11:00 CEST - when this was authorised
-const CAL_CHARGE_UNTIL = Date.UTC(2026, 8, 19, 16, 30);  // 18:30 CEST - backstop only; the
-// 3.50 V/cell ceiling above is the real terminator. 16:00 was the end of the cheap window
-// and would have stopped the charge at ~88%, with no resync and the whole spend wasted:
-// 19.6 kWh was still needed at 11:20 and 3.5 kW is the charge cap, so the linear finish is
-// ~16:50 before the absorption taper adds its usual hour or two on top.
-const CAL_HOLD_UNTIL   = Date.UTC(2026, 8, 20,  4, 0);  // 06:00 CEST tomorrow - end of the no-sale hold
-if (_nowMs >= CAL_FROM && _nowMs < CAL_HOLD_UNTIL) {
-    const _calCellTxt = maxCellV === null ? 'n/a' : maxCellV.toFixed(3) + 'V';
-    const _calTop = maxCellV !== null && maxCellV >= CELL_FULL_V;
-    if (_cmdState === 4) {
-        _cmdState = 3;
-        _cmdReason = `calibration hold: evening sale suppressed, the charge we just bought is the measurement`;
-    }
-    if (_calTop) {
-        // Let the Multi taper on its own from here; forcing import into a pack at
-        // the ceiling just makes the BMS do the stopping instead of the charger.
-        _cmdReason = `calibration: max cell ${_calCellTxt} at or above ${CELL_FULL_V}V - absorption reached, forced charge released`;
-    } else if (_nowMs < CAL_CHARGE_UNTIL) {
-        // state 1 pins _maxDischarge to 0, so the cell floor still cannot be discharged
-        // through even if the pack somehow sits at the bottom while we are filling it.
-        _cmdState = 1;
-        _cmdReason = `calibration: forcing grid charge toward absorption (max cell ${_calCellTxt}, releasing at ${CELL_FULL_V}V)`;
-    }
-}
 
 // === Device parameters (Cerbo + Symo) ===
 // The published command carries the concrete settings each box is about to
