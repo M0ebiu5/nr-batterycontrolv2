@@ -2521,13 +2521,13 @@ function scenario23_cellVoltageFloor() {
     // At the export floor: stop selling, but the pack may still cover the house.
     check(`at CELL_EMPTY_V ${CELL_V.CELL_EMPTY_V}V`, run(CELL_V.CELL_EMPTY_V), { state: 3, maxDischarge: -1, latched: false });
     // Below the critical floor: stop discharging altogether, grid takes the house.
-    check(`at CELL_CRITICAL_V ${CELL_V.CELL_CRITICAL_V}V`, run(CELL_V.CELL_CRITICAL_V), { state: 3, maxDischarge: 0, latched: true });
+    check(`at CELL_CRITICAL_V ${CELL_V.CELL_CRITICAL_V}V`, run(CELL_V.CELL_CRITICAL_V), { state: 3, maxDischarge: -1, latched: true });
 
     // The latch: once tripped it must survive a rebound to 3.22V (above the
     // 3.20V export floor, below the 3.25V recovery point) and only release at 3.25V.
     const _mid = +((CELL_V.CELL_EMPTY_V + CELL_V.CELL_RECOVER_V) / 2).toFixed(3);
     const latched = { cellGuard: { latched: true, since: NOW - 600000 } };
-    check(`rebound to ${_mid}V stays latched`, run(_mid, latched), { state: 3, maxDischarge: 0, latched: true });
+    check(`rebound to ${_mid}V stays latched`, run(_mid, latched), { state: 3, maxDischarge: -1, latched: true });
     const recovering = { cellGuard: { latched: true, since: NOW - 600000 } };
     check(`recovered to ${CELL_V.CELL_RECOVER_V}V releases`, run(CELL_V.CELL_RECOVER_V, recovering), { state: 4, maxDischarge: -1, latched: false });
 

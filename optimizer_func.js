@@ -200,7 +200,10 @@ if (cellFloorLatched !== !!_cellGuard.latched) {
 }
 // Applied at i===0 only, exactly like gridChargeBlocked; future slots re-evaluate.
 const exportBlocked = cellFloorLatched || (minCellV !== null && minCellV <= CELL_EMPTY_V);
-const dischargeBlocked = cellFloorLatched;
+// 2026-09-25: the no-discharge tier is retired - each pack's BMS enforces its own
+// low-voltage cutoff, and pinning discharge to 0 put the house on the grid for
+// hours at a time. The latch still blocks export.
+const dischargeBlocked = false;
 
 // Current AC load
 let currentLoad = lastVal(raw.acload, 'acload');
