@@ -2894,4 +2894,24 @@ node.status(socStale
     : { fill: 'green', shape: 'dot',
         text: `s${_cmdState} soc=${currentSoc.toFixed(1)}% (${_socSource}) ${currentSlot ? currentSlot.marketPrice.toFixed(1) : '?'}ct` });
 
+// Per-run audit fields for the "to optlog points" node (one compact row per run
+// in infra_2y). Only values this run already computed; no extra work.
+const _tomorrowKey = berlinDateKey(now + 86400000);
+const _tomorrowSlots = output.filter(s => berlinDateKey(s.t) === _tomorrowKey);
+const _sunNow = getSunshineForecast(now);
+Object.assign(msg.summary, {
+    slotT: currentSlot ? currentSlot.t : null,
+    cmdState: _cmdState,
+    setPointW: _acSetPoint,
+    marketPrice: _mp,
+    pvFcW: currentSlot ? currentSlot.pvPower : null,
+    loadFcW: currentSlot ? currentSlot.loadEst : null,
+    sunMin: _sunNow === null ? null : Math.round(_sunNow * 60),
+    pvTomorrowKwh: _tomorrowSlots.length >= 92
+        ? _tomorrowSlots.reduce((a, s) => a + (s.pvPower || 0), 0) * INTERVAL_HOURS / 1000
+        : null,
+    tomorrowSunPoor: tomorrowSunPoor,
+    satWall: pvSatWall >= 0
+});
+
 return [msg, null, msg3];
