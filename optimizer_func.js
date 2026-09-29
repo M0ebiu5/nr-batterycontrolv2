@@ -12,7 +12,33 @@ const MAX_CHARGE_W = 3500;
 const MAX_DISCHARGE_W = 3500;
 const AVG_LOAD_W = 700;
 const MIN_SOC_PCT = 5;
-const CHARGE_EFFICIENCY = 0.94; // one-way charge efficiency for the predictedSoc projection only. Energy sent to the pack (grid charge or PV surplus) lands as SOC at ~94% (inverter AC→DC conversion + minor coulombic loss). Empirically calibrated 2026-07-04: predicted SOC ran ~+3–4% above true capacity-weighted BMS SOC during steep daytime charging (morning gain +45.4 predicted vs +42.5 true BMS → 0.936 ratio); overnight discharge already matched within 0.1%, so the factor is applied to charging deltas only. Planning sims are left at 100% (unchanged) — this only tightens the reported projection.
+// --- Prototype 2026-09-29: measured losses + evening sale against tomorrow's sun ---
+// Flags so a replay can compare old vs new; both false = the pre-2026-09-29 algorithm.
+const PLAN_WITH_LOSSES = false;   // round-trip economics and the arbitrage hurdle use the measured AC<->DC losses
+const DRAIN_WITH_LOSSES = true;   // the overnight-survival guard's trough walk drains 1/ETA_DISCHARGE SOC per AC kWh: its lossless walk planned a 10% trough that replayed to the 3% cutoff on 2026-09-19 (the spill/selling walks stay lossless - their thresholds are calibrated on it)
+const WALK_WITH_LOSSES = false;   // also apply them inside the planning SOC walks and the predictedSoc projection (off: the spill/ceiling/damping thresholds and reserve picks are calibrated on these walks)
+const EVENING_REFILL_SELL = false; // price stored energy that tomorrow's PV refills at that PV's export value, not at retail
+// Measured 2026-09-22..29: summed per-pack DC power vs the AC side (PV + import - export - load).
+// AC 120.5 kWh in -> 106.9 kWh DC; 110.1 kWh DC out -> 100.7 kWh AC. Round trip ~0.81, idle draw included.
+const ETA_CHARGE = 0.887;
+const ETA_DISCHARGE = 0.915;
+const FEEDIN_CYCLE_WEAR_CT = 1.5;  // per stored kWh cycled out
+const FEEDIN_MIN_PROFIT_CT = 1.5;  // what a stored kWh must still net after losses, wear and replacing it
+// --- PV forecast v2 (2026-09-29) ---
+// PV per slot = clear-sky PV for that hour x a saturating function of the hour's
+// forecast sunshine minutes. The old model scaled a matched-days profile LINEARLY
+// by sunshine, so an hour with 0 forecast sun made 0 W and a half-sunny day came
+// out at a third of reality: over 2026-09-01..28 it forecast 61% of actual PV
+// (RMSE 11.9 kWh/day). Fitted on hourly PV vs forecastnew sunshine for the same
+// period (split-half fits agree: floor 0.17-0.22, k 14-33 min): an overcast hour
+// still gives ~20% of clear sky from diffuse light, 30 min of sun ~68%, a full
+// sunny hour ~90%. v2 forecast 100% of actual, RMSE 2.8 kWh/day.
+const PV_FORECAST_V2 = true;
+const PV_SUN_FLOOR = 0.2;         // fraction of clear-sky PV with zero forecast sunshine (diffuse light)
+const PV_SUN_TOP = 0.95;          // fraction of clear-sky PV in a fully sunny hour
+const PV_SUN_K_MIN = 20;          // sunshine minutes at which ~63% of the floor->top rise is reached
+const PV_CLEARSKY_PCTL = 0.95;    // clear-sky hour = this percentile of that hour's history (+-15 days, all years)
+const CHARGE_EFFICIENCY = WALK_WITH_LOSSES ? ETA_CHARGE : 0.94; // one-way charge efficiency for the predictedSoc projection only. Energy sent to the pack (grid charge or PV surplus) lands as SOC at ~94% (inverter AC→DC conversion + minor coulombic loss). Empirically calibrated 2026-07-04: predicted SOC ran ~+3–4% above true capacity-weighted BMS SOC during steep daytime charging (morning gain +45.4 predicted vs +42.5 true BMS → 0.936 ratio); overnight discharge already matched within 0.1%, so the factor is applied to charging deltas only. Planning sims are left at 100% (unchanged) — this only tightens the reported projection.
 const INTERVAL_HOURS = 0.25; // 15 minutes
 const PV_PEAK_W = 5000;
 const BASE_GRID_FEE = 13; // ct/kWh
@@ -30,7 +56,7 @@ const CROSSDAY_HOLD_SLACK_CT = 3; // Phase 3d cross-day hold: don't sell tonight
 const CROSSDAY_HOLD_MAX_AGE_MS = 12 * 3600 * 1000; // how long a cross-day hold floor may be carried once horizonIsRefill flips false (see the carry branch in Phase 3d). Bounded so a floor computed from a stale horizon can't suppress feed-in indefinitely; the peak it was derived from must also still lie in the future.
 // Phase 3b-arb (arbitrage grid-charge): on exceptional-delta days, grid-charge cheap slots SPECIFICALLY to resell at a high feed-in peak before the next free PV refill. This deliberately opens the grid→feed-in path that the other phases block — guarded by a high NET hurdle so it only fires when the round-trip is genuinely profitable. Charged slots are tagged _plan='charge', so all existing charge handling (SOC sims, state=1 emit, Phase 3d feed-in budget + round-trip checks) sells the resulting surplus at the peak automatically.
 const ARB_MIN_NET_CT = 16;      // required NET profit per kWh after round-trip loss + cycle wear: peakMp*ARB_RT_EFF − chargeEff − ARB_CYCLE_WEAR_CT ≥ this
-const ARB_RT_EFF = 0.9;         // inverter+round-trip efficiency applied to sell revenue (~10% loss)
+const ARB_RT_EFF = PLAN_WITH_LOSSES ? ETA_CHARGE * ETA_DISCHARGE : 0.9;         // inverter+round-trip efficiency applied to sell revenue (~10% loss)
 const ARB_CYCLE_WEAR_CT = 1.5;  // battery cycle-wear cost per kWh cycled
 const ARB_CHARGE_SOC_PCT = SOC_CEILING_PCT; // arbitrage may fill to the planning ceiling (energy is dumped within hours; relaxes the normal 90% Phase 3c headroom cap, but not past the ceiling — the headroom the ceiling reserves is for PV the forecast missed, which arbitrage has no claim on)
 const TIMEZONE = 'Europe/Berlin';
@@ -355,7 +381,40 @@ function baselineForRatio(r) {
 }
 const fallbackBaseline = baselineForRatio(fallbackSunRatio);
 
+// Clear-sky hourly profile for PV_FORECAST_V2: a high percentile of each hour's
+// average PV across the +-15-day seasonal window (recent days and prior years).
+const clearSkyProfile = (() => {
+    const byHour = new Array(24).fill(null).map(() => []);
+    for (const d of Object.values(pvDays)) {
+        for (const [h, v] of Object.entries(d.hours)) byHour[parseInt(h)].push(v);
+    }
+    const prof = byHour.map(v => {
+        if (v.length < 5) return null;
+        const sorted = [...v].sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor(PV_CLEARSKY_PCTL * sorted.length))];
+    });
+    return prof.map(v => v || 0);
+})();
+const _clearSkyUsable = clearSkyProfile.reduce((a, b) => a + b, 0) > 5000; // cold start: fall back to v1
+const pvV2 = PV_FORECAST_V2 && _clearSkyUsable;
+
+// Share of clear-sky PV for a forecast sunshine ratio (0-1 = 0-60 min per hour).
+function pvSunFactor(ratio, floor = PV_SUN_FLOOR) {
+    const min = Math.max(0, Math.min(ratio, 1)) * 60;
+    return floor + (PV_SUN_TOP - floor) * (1 - Math.exp(-min / PV_SUN_K_MIN));
+}
+// The multiplier applied to a baseline profile hour for a slot's sunshine ratio.
+// The post-schedule walks (overnight bridge, multi-day reserve, post-schedule
+// overflow) pass floor 0: past the price horizon they are the safety margin for
+// sunless streaks (hold stored energy when the days ahead are dark), so they
+// keep the old "no sun, no PV" pessimism for dark hours while partly sunny
+// hours still get the realistic saturating curve.
+function pvSunScale(ratio, refRatio, floor = PV_SUN_FLOOR) {
+    return pvV2 ? pvSunFactor(ratio, floor) : Math.min(ratio / Math.max(refRatio, 0.1), 1.2);
+}
+
 function getDayBaseline(timeMs) {
+    if (pvV2) return { profile: clearSkyProfile, refRatio: 1 };
     const r = dailySunRatio[berlinDateKey(timeMs)];
     return r === undefined ? fallbackBaseline : baselineForRatio(r);
 }
@@ -436,7 +495,10 @@ function estimatePvBaseline(timeMs) {
     let basePv = basePvRaw;
     const slotForecast = getSunshineForecast(timeMs);
     if (slotForecast !== null && basePvRaw > 0) {
-        basePv = basePvRaw * Math.min(slotForecast / baselineRefRatio, 1.2);
+        basePv = basePvRaw * pvSunScale(slotForecast, baselineRefRatio);
+    } else if (pvV2) {
+        // no sunshine row for this hour: v2's profile is clear sky, so hedge to a half-sunny hour
+        basePv = basePvRaw * pvSunFactor(0.5);
     }
     return { basePvRaw, basePv };
 }
@@ -494,7 +556,7 @@ function estimatePvPower(timeMs) {
 
     // Historical profile with rain adjustment for further-out slots
     let rainFactor = 1;
-    if (weather.rainrate > 0) rainFactor = 0.3;
+    if (weather.rainrate > 0 && (!pvV2 || hoursAhead < 1)) rainFactor = 0.3;
 
     return Math.min(basePv * rainFactor, PV_PEAK_W);
 }
@@ -510,7 +572,7 @@ function estimatePvPowerForecastOnly(timeMs) {
     const { basePv } = estimatePvBaseline(timeMs);
     if (basePv <= 0) return 0;
     let rainFactor = 1;
-    if (weather.rainrate > 0) rainFactor = 0.3;
+    if (weather.rainrate > 0 && !pvV2) rainFactor = 0.3;
     return Math.min(basePv * rainFactor, PV_PEAK_W);
 }
 
@@ -549,6 +611,26 @@ function getLoadEstimate(timeMs) {
 
 function socToKwh(soc) {
     return (soc / 100) * BATTERY_CAPACITY_KWH;
+}
+
+// SOC change for a net AC energy flow into (+) or out of (-) the pack, as the
+// planning walks see it. With WALK_WITH_LOSSES the pack keeps ETA_CHARGE of what
+// goes in and gives up 1/ETA_DISCHARGE of SOC per AC kWh it delivers.
+function netToSoc(kwh) {
+    if (!WALK_WITH_LOSSES) return kwhToSoc(kwh);
+    return kwh > 0 ? kwhToSoc(kwh * ETA_CHARGE) : kwhToSoc(kwh / ETA_DISCHARGE);
+}
+function chargeToSoc(kwh) { return kwhToSoc(WALK_WITH_LOSSES ? kwh * ETA_CHARGE : kwh); }
+function drainToSoc(kwh) { return kwhToSoc(WALK_WITH_LOSSES ? kwh / ETA_DISCHARGE : kwh); }
+
+// Round-trip test for selling a stored kWh at mp when replacing it costs
+// replacementCt per AC kWh (grid effective price, or the export price the
+// refilling PV would otherwise have fetched). Selling yields mp*ETA_DISCHARGE;
+// putting the kWh back takes 1/ETA_CHARGE AC kWh. Without PLAN_WITH_LOSSES this
+// is the old flat FEEDIN_ROUNDTRIP_MARGIN_CT test.
+function roundTripClears(mp, replacementCt) {
+    if (!PLAN_WITH_LOSSES) return mp > replacementCt + FEEDIN_ROUNDTRIP_MARGIN_CT;
+    return mp * ETA_DISCHARGE - FEEDIN_CYCLE_WEAR_CT - replacementCt / ETA_CHARGE >= FEEDIN_MIN_PROFIT_CT;
 }
 
 function kwhToSoc(kwh) {
@@ -646,7 +728,7 @@ if (schedule.length > 0) {
                 const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
                 const slotForecast = getSunshineForecast(t);
                 const ratio = slotForecast !== null ? slotForecast : 0.5;
-                pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
+                pvW = basePvRaw * pvSunScale(ratio, baselineRefRatio, 0);
             }
             _bridgeKwh += Math.max(0, loadW - pvW) / 1000;
         }
@@ -698,7 +780,7 @@ if (schedule.length > 0) {
                 const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
                 const slotForecast = getSunshineForecast(t);
                 const ratio = slotForecast !== null ? slotForecast : tomorrowPvRatio;
-                pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
+                pvW = basePvRaw * pvSunScale(ratio, baselineRefRatio, 0);
             }
             walkDef += (loadW - pvW) / 1000; // can subtract on surplus hours
             if (walkDef < 0) walkDef = 0; // can't pre-charge from future PV
@@ -824,7 +906,7 @@ let targetSocForSunrise = null;
     // signal, not just forecast), else 40% — forecast alone isn't trusted
     // enough to drain deeper, and a higher floor protects the morning peak
     // if PV underperforms.
-    const capacityNeededPct = kwhToSoc(totalSurplusKwh);
+    const capacityNeededPct = chargeToSoc(totalSurplusKwh);
     const socFloor = negPriceSlots >= 4 ? 30 : 40;
     targetSocForSunrise = Math.max(socFloor, 100 - capacityNeededPct);
     // Negative daylight prices = solar glut ahead. PV-surplus estimate can
@@ -876,7 +958,7 @@ let targetSocForSunrise = null;
     let overflowPct = 0;
     for (const s of eveningSlots) {
         const netKwh = (s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000;
-        projSocAtSunrise += kwhToSoc(netKwh);
+        projSocAtSunrise += netToSoc(netKwh);
         if (projSocAtSunrise > SOC_CURTAIL_PCT) {
             overflowPct += projSocAtSunrise - SOC_CURTAIL_PCT;
             projSocAtSunrise = SOC_CURTAIL_PCT;
@@ -949,9 +1031,9 @@ let targetSocForSunrise = null;
             const gate = targetSocForSunrise + 3;
 
             const skipDelta = sortedChrono.map(s =>
-                kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000));
+                netToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000));
             const pickDelta = sortedChrono.map(s =>
-                -kwhToSoc(Math.max(0, MAX_DISCHARGE_W + s.loadEst - s.pvPower) * INTERVAL_HOURS / 1000));
+                -drainToSoc(Math.max(0, MAX_DISCHARGE_W + s.loadEst - s.pvPower) * INTERVAL_HOURS / 1000));
             // The Infinity replacement above used to be the only thing keeping
             // this path off cheap slots — `feedin_preemptive` bypasses
             // planSlot(), so neither the FEEDIN_MIN_MP_CT floor nor Phase 3d's
@@ -960,7 +1042,7 @@ let targetSocForSunrise = null;
             // price, both have to be stated here explicitly.
             const reward = sortedChrono.map((s, i) =>
                 s.marketPrice >= FEEDIN_MIN_MP_CT
-                && s.marketPrice > replacementCt + FEEDIN_ROUNDTRIP_MARGIN_CT
+                && roundTripClears(s.marketPrice, replacementCt)
                     ? s.marketPrice * (skipDelta[i] - pickDelta[i])
                     : -Infinity);
 
@@ -1044,7 +1126,7 @@ for (let i = 0; i < schedule.length; i++) {
     const loadW = s.loadEst;
     const netPvW = pvW - loadW;
     const netEnergy = netPvW * INTERVAL_HOURS / 1000;
-    passiveSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, passiveSoc + kwhToSoc(netEnergy)));
+    passiveSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, passiveSoc + netToSoc(netEnergy)));
     s._passiveSoc = passiveSoc;
 }
 
@@ -1138,14 +1220,14 @@ for (const s of schedule) {
         for (let i = 0; i < peakIdx; i++) { // SOC entering the peak = deliverable energy
             const s = schedule[i];
             if (s._plan === 'charge') {
-                s0 += kwhToSoc(maxChargeEnergy);
+                s0 += chargeToSoc(maxChargeEnergy);
             } else if (s._plan === 'feedin_preemptive') {
                 const drainW = Math.max(0, MAX_DISCHARGE_W + s.loadEst - s.pvPower);
-                s0 -= kwhToSoc(drainW * INTERVAL_HOURS / 1000);
+                s0 -= drainToSoc(drainW * INTERVAL_HOURS / 1000);
             } else if (isProfitChargeSlot(s)) {
-                s0 += kwhToSoc(maxChargeEnergy);
+                s0 += chargeToSoc(maxChargeEnergy);
             } else {
-                s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+                s0 += netToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
             }
             s0 = Math.max(MIN_SOC_PCT, Math.min(ARB_CHARGE_SOC_PCT, s0));
         }
@@ -1199,7 +1281,7 @@ let pvOnlyRefillsCeiling = false;
     let dippedBelowCeiling = false;
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
-        s0 += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+        s0 += netToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
         if (s0 > SOC_CURTAIL_PCT) {
             if (pvOnlySatIdx < 0) {
                 pvOnlySatIdx = i;
@@ -1223,6 +1305,59 @@ let pvOnlyRefillsCeiling = false;
 // unlock a sale against the multi-day reserve (Phase 3d).
 const pvSatWall = pvOnlyOverflowRaw >= PV_CURTAIL_MIN_SOC ? pvOnlySatIdx : -1;
 
+// --- PV-refillable stored energy (EVENING_REFILL_SELL) ---------------------
+// Stored energy sold tonight costs nothing to put back if tomorrow's sun fills
+// the pack to the planning ceiling anyway: the sale only shifts where the pack
+// tops out, and the PV that refills it is PV that would otherwise have been
+// exported. Its replacement price is therefore what that spilled PV would have
+// fetched, not tomorrow's retail import price — which is what the round-trip
+// check used to charge it, and why ~25–30ct evening peaks went unsold on
+// sunny-tomorrow days while the pack sat at 70–85% overnight.
+// The walk is PV-only, capped at MAX_CHARGE_W (surplus above the charge rate is
+// exported regardless of SOC, so it refills nothing), and only counts a spill
+// run that comes after a night. The refillable amount is bounded by the
+// overnight trough, so a sale never pushes the night below MIN+8 and into a
+// retail rebuy (see the overnight-survival guard, which still runs after).
+let pvRefillSoc = 0;
+let pvRefillRawSoc = 0;
+let pvRefillPriceCt = Infinity;
+let pvRefillStartIdx = -1;
+if (EVENING_REFILL_SELL && !tomorrowSunPoor) {
+    let s0 = currentSoc;
+    let trough = currentSoc;
+    let sawNight = false;
+    let spill = 0, spillVal = 0;
+    for (let i = 0; i < schedule.length; i++) {
+        const s = schedule[i];
+        const netW = s.pvPower - s.loadEst;
+        if (!isDaylight(s.time)) sawNight = true;
+        s0 += netToSoc(Math.min(netW, MAX_CHARGE_W) * INTERVAL_HOURS / 1000);
+        if (s0 > SOC_CEILING_PCT) {
+            if (sawNight) {
+                if (pvRefillStartIdx < 0) pvRefillStartIdx = i;
+                const x = s0 - SOC_CEILING_PCT;
+                spill += x;
+                spillVal += x * Math.max(0, s.marketPrice);
+            }
+            s0 = SOC_CEILING_PCT;
+        } else if (pvRefillStartIdx >= 0 && netW <= 0) {
+            break; // tomorrow's refill run is over
+        }
+        if (s0 < MIN_SOC_PCT) s0 = MIN_SOC_PCT;
+        if (pvRefillStartIdx < 0 && s0 < trough) trough = s0;
+    }
+    if (pvRefillStartIdx >= 0) {
+        pvRefillRawSoc = Math.max(0, Math.min(spill, trough - (MIN_SOC_PCT + 8)));
+        pvRefillPriceCt = spillVal / spill;
+    }
+}
+if (EVENING_REFILL_SELL) {
+    // Damped like every other spill claim, and fed a zero on sun-poor runs so a
+    // refill that only just appeared has to survive a second run before it sells.
+    pvRefillSoc = dampOverflow('pvRefillSoc', pvRefillRawSoc);
+    if (!(pvRefillSoc >= PV_CURTAIL_MIN_SOC)) pvRefillSoc = 0;
+}
+
 // --- 3c. Plan charging: horizon-wide cheapest-slot selection ---
 // Iteratively simulate the SOC trajectory across the whole schedule.
 // Whenever a slot falls below MIN_SOC+5, pick the cheapest unplanned
@@ -1245,15 +1380,15 @@ const pvSatWall = pvOnlyOverflowRaw >= PV_CURTAIL_MIN_SOC ? pvOnlySatIdx : -1;
             const loadW = s.loadEst;
             if (s._plan === 'charge') {
                 // Battery absorbs at most MAX_CHARGE_W total (grid + PV combined).
-                s0 += kwhToSoc(maxChargeEnergy);
+                s0 += chargeToSoc(maxChargeEnergy);
             } else if (s._plan === 'feedin_preemptive') {
                 const drainW = MAX_DISCHARGE_W + loadW - pvW;
-                s0 -= kwhToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);
+                s0 -= drainToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);
             } else if (isProfitChargeSlot(s)) {
                 // Phase 4 will profit-charge at MAX_CHARGE_W (grid + PV).
-                s0 += kwhToSoc(maxChargeEnergy);
+                s0 += chargeToSoc(maxChargeEnergy);
             } else {
-                s0 += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+                s0 += netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
             }
             // Clamp at MAX_GRID_CHARGE_SOC_PCT, not 100: once the projected
             // trajectory hits this cap, additional charge picks raise it by
@@ -1354,14 +1489,14 @@ for (let i = 0; i < schedule.length; i++) {
     const loadW = s.loadEst;
 
     if (s._plan === 'charge') {
-        simSoc += kwhToSoc(maxChargeEnergy);
+        simSoc += chargeToSoc(maxChargeEnergy);
     } else if (s._plan === 'feedin_preemptive') {
         const drainW = MAX_DISCHARGE_W + loadW - pvW;
-        simSoc -= kwhToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);
+        simSoc -= drainToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);
     } else if (isProfitChargeSlot(s)) {
-        simSoc += kwhToSoc(maxChargeEnergy);
+        simSoc += chargeToSoc(maxChargeEnergy);
     } else {
-        simSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+        simSoc += netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
     }
     simSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, simSoc));
     s._plannedSoc = simSoc;
@@ -1383,7 +1518,7 @@ for (let i = 0; i < schedule.length; i++) {
 
 function feedinDrainSoc(slot) {
     const drainW = Math.max(0, MAX_DISCHARGE_W + slot.loadEst - slot.pvPower);
-    return kwhToSoc(drainW * INTERVAL_HOURS / 1000);
+    return drainToSoc(drainW * INTERVAL_HOURS / 1000);
 }
 
 // Effective SOC relief from feeding in a slot vs. doing state=3 there.
@@ -1396,7 +1531,7 @@ function feedinDrainSoc(slot) {
 // picks and residual runtime curtailment.
 function feedinReliefSoc(slot) {
     const netKwh = (slot.pvPower - slot.loadEst) * INTERVAL_HOURS / 1000;
-    return feedinDrainSoc(slot) + kwhToSoc(netKwh);
+    return feedinDrainSoc(slot) + netToSoc(netKwh);
 }
 
 // Find the rolling horizon by walking passive SOC (PV-load only) and
@@ -1439,7 +1574,7 @@ let horizonIdx = schedule.length;
     let dipped = false;
     for (let i = 0; i < schedule.length; i++) {
         const s = schedule[i];
-        testSoc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+        testSoc += netToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
         testSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, testSoc));
         if (testSoc > peakSoc) peakSoc = testSoc;
         if (peakSoc - testSoc >= 5) dipped = true;
@@ -1499,13 +1634,13 @@ let satOverflowRawEager = 0;
         let delta;
         let deltaUsesPv = false;
         if (s._plan === 'charge') {
-            delta = kwhToSoc(maxChargeEnergy);
+            delta = chargeToSoc(maxChargeEnergy);
         } else if (s._plan === 'feedin_preemptive') {
             delta = -feedinDrainSoc(s);
         } else if (isProfitChargeSlot(s)) {
-            delta = kwhToSoc(maxChargeEnergy);
+            delta = chargeToSoc(maxChargeEnergy);
         } else {
-            delta = kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+            delta = netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
             deltaUsesPv = true;
         }
         projSoc += delta;
@@ -1518,7 +1653,7 @@ let satOverflowRawEager = 0;
         if (deltaUsesPv && isDawnEagerWindow(s.time)) {
             const pvWEager = Math.max(pvW, estimatePvPowerForecastOnly(s.time));
             if (pvWEager > pvW) {
-                physSoc += kwhToSoc((pvWEager - pvW) * INTERVAL_HOURS / 1000);
+                physSoc += chargeToSoc((pvWEager - pvW) * INTERVAL_HOURS / 1000);
             }
         }
         if (physSoc > SOC_CURTAIL_PCT) {
@@ -1556,13 +1691,13 @@ let satOverflowRawEager = 0;
             const pvW = s.pvPower;
             const loadW = s.loadEst;
             if (s._plan === 'charge') {
-                extSoc += kwhToSoc(maxChargeEnergy);
+                extSoc += chargeToSoc(maxChargeEnergy);
             } else if (s._plan === 'feedin_preemptive') {
                 extSoc -= feedinDrainSoc(s);
             } else if (isProfitChargeSlot(s)) {
-                extSoc += kwhToSoc(maxChargeEnergy);
+                extSoc += chargeToSoc(maxChargeEnergy);
             } else {
-                extSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+                extSoc += netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
             }
             if (extSoc > SOC_CEILING_PCT) {
                 postHorizonOverflow += extSoc - SOC_CEILING_PCT;
@@ -1686,6 +1821,7 @@ let satOverflowRawEager = 0;
     // drain, and every candidate still has to clear the round-trip check and
     // the cross-day hold — this widens the budget, it does not waive a price test.
     if (pvWillCurtail) freeRefillAhead = true;
+    if (pvRefillSoc > 0) freeRefillAhead = true;
 
     let feedinBudgetSoc;
     if (horizonIsRefill && !freeRefillAhead) {
@@ -1796,9 +1932,9 @@ let satOverflowRawEager = 0;
                 const basePvRaw = hourlyPv[berlinTime(t).hour] || 0;
                 const slotForecast = getSunshineForecast(t);
                 const ratio = slotForecast !== null ? slotForecast : 0.5;
-                pvW = basePvRaw * Math.min(ratio / Math.max(baselineRefRatio, 0.1), 1.2);
+                pvW = basePvRaw * pvSunScale(ratio, baselineRefRatio, 0);
             }
-            walkSoc += kwhToSoc((pvW - loadW) / 1000);
+            walkSoc += netToSoc((pvW - loadW) / 1000);
             if (walkSoc > SOC_CURTAIL_PCT) { postSchedPvOverflow += walkSoc - SOC_CURTAIL_PCT; walkSoc = SOC_CURTAIL_PCT; }
             if (walkSoc < MIN_SOC_PCT) walkSoc = MIN_SOC_PCT;
         }
@@ -1906,6 +2042,10 @@ let satOverflowRawEager = 0;
     }
 
     let usedBudget = 0;
+    let refillUsed = 0;
+    if (pvRefillSoc > 0) {
+        node.warn(`PV refill: tomorrow's sun refills ${pvRefillSoc.toFixed(1)}% (raw ${pvRefillRawSoc.toFixed(1)}%) from idx=${pvRefillStartIdx}; stored energy before it is priced against ${pvRefillPriceCt.toFixed(1)}ct spill PV`);
+    }
 
     // Price the runtime would achieve if we plan nothing and let Phase 4's
     // "battery full" branch dump into whatever slot happens to be current:
@@ -1940,6 +2080,18 @@ let satOverflowRawEager = 0;
             : eligibleOverflowHold;
         const isLate = idx > lastPlannedChargeIdx;
         const slotReplacementPrice = isLate ? replacementPriceLate : replacementPriceEarly;
+        // Stored-energy slot ahead of tomorrow's refill: the sun puts this back,
+        // so it is judged against the spill price and is not tomorrow's energy
+        // to hold (cross-day hold does not apply).
+        if (pvRefillSoc > 0 && idx < pvRefillStartIdx && s.pvPower < s.loadEst
+            && refillUsed + relief <= pvRefillSoc && !blindToTomorrow
+            && s.marketPrice >= FEEDIN_MIN_MP_CT
+            && roundTripClears(s.marketPrice, pvRefillPriceCt)) {
+            s._plan = 'feedin_surplus';
+            usedBudget += relief;
+            refillUsed += relief;
+            return true;
+        }
         const slotEligibleOverflow = isLate ? eligibleOverflowLate : pvOnlyOverflow + ceilingBandExempt;
         // Curtailment ("overflow") energy only physically exists in slots where
         // PV actually exceeds load and the battery is at cap. Feeding the early
@@ -1960,7 +2112,7 @@ let satOverflowRawEager = 0;
         const genuineOverflowExempt = (usedBudget + relief <= holdExemptSoc)
             && (isLate || s.pvPower > s.loadEst);
         if (!genuineOverflowExempt && s.marketPrice < futurePeakHoldPrice) return false;
-        if (!isOverflowOnly && (blindToTomorrow || s.marketPrice <= slotReplacementPrice + FEEDIN_ROUNDTRIP_MARGIN_CT)) return false;
+        if (!isOverflowOnly && (blindToTomorrow || !roundTripClears(s.marketPrice, slotReplacementPrice))) return false;
         s._plan = 'feedin_surplus';
         usedBudget += relief;
         return true;
@@ -2131,15 +2283,15 @@ let satOverflowRawEager = 0;
 
         let socDelta;
         if (s._plan === 'charge') {
-            socDelta = kwhToSoc(maxChargeEnergy);
+            socDelta = chargeToSoc(maxChargeEnergy);
         } else if (s._plan === 'feedin_preemptive'
                    || s._plan === 'feedin_surplus'
                    || s._plan === 'feedin_capacity') {
             socDelta = -feedinDrainSoc(s);
         } else if (profitCharge) {
-            socDelta = kwhToSoc(maxChargeEnergy);
+            socDelta = chargeToSoc(maxChargeEnergy);
         } else {
-            socDelta = kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+            socDelta = netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
         }
 
         walkSoc += socDelta;
@@ -2187,11 +2339,11 @@ let satOverflowRawEager = 0;
 {
     function applyDelta(s, soc) {
         let d;
-        if (s._plan === 'charge') d = kwhToSoc(maxChargeEnergy);
+        if (s._plan === 'charge') d = chargeToSoc(maxChargeEnergy);
         else if (s._plan === 'feedin_preemptive'
                  || s._plan === 'feedin_surplus'
                  || s._plan === 'feedin_capacity') d = -feedinDrainSoc(s);
-        else d = kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+        else d = netToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
         soc += d;
         if (soc > SOC_CEILING_PCT) soc = SOC_CEILING_PCT;
         if (soc < MIN_SOC_PCT) soc = MIN_SOC_PCT;
@@ -2201,7 +2353,7 @@ let satOverflowRawEager = 0;
     let walkSoc = currentSoc;
     let stretchStart = -1;
     let stretchEntrySoc = 0;
-    const socPerCharge = kwhToSoc(maxChargeEnergy);
+    const socPerCharge = chargeToSoc(maxChargeEnergy);
 
     function closeStretch(endIdx) {
         if (stretchStart < 0) return;
@@ -2261,19 +2413,23 @@ let satOverflowRawEager = 0;
 // tomorrow's PV genuinely refills.
 {
     const SURVIVAL_FLOOR = MIN_SOC_PCT + 5;
+    // With DRAIN_WITH_LOSSES the trough is walked on what the pack really gives
+    // up: every AC kWh out costs 1/ETA_DISCHARGE of stored energy.
+    const _drainDiv = (WALK_WITH_LOSSES || DRAIN_WITH_LOSSES) ? ETA_DISCHARGE : 1;
     function feedinTrough() {
         let soc = currentSoc;
         let minSoc = Infinity, minIdx = -1;
         for (let i = 0; i < schedule.length; i++) {
             const s = schedule[i];
             if (s._plan === 'charge') {
-                soc += kwhToSoc(maxChargeEnergy);
+                soc += chargeToSoc(maxChargeEnergy);
             } else if (s._plan === 'feedin_preemptive'
                        || s._plan === 'feedin_surplus'
                        || s._plan === 'feedin_capacity') {
-                soc -= feedinDrainSoc(s);
+                soc -= kwhToSoc(Math.max(0, MAX_DISCHARGE_W + s.loadEst - s.pvPower) * INTERVAL_HOURS / 1000 / _drainDiv);
             } else {
-                soc += kwhToSoc((s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000);
+                const netKwh = (s.pvPower - s.loadEst) * INTERVAL_HOURS / 1000;
+                soc += netKwh > 0 ? netToSoc(netKwh) : kwhToSoc(netKwh / _drainDiv);
             }
             if (soc > SOC_CEILING_PCT) soc = SOC_CEILING_PCT;
             // Do NOT clamp at MIN here: we need the true trough depth to know
@@ -2313,7 +2469,7 @@ let satOverflowRawEager = 0;
         const pvW = s.pvPower;
         const loadW = s.loadEst;
         if (s._plan === 'charge') {
-            walkSoc += kwhToSoc(maxChargeEnergy);
+            walkSoc += chargeToSoc(maxChargeEnergy);
         } else if (s._plan === 'feedin_preemptive'
                    || s._plan === 'feedin_surplus'
                    || s._plan === 'feedin_capacity') {
@@ -2321,12 +2477,12 @@ let satOverflowRawEager = 0;
             if (walkSoc - drain < MIN_SOC_PCT + 5) {
                 // Local infeasibility — demote to compensate
                 s._plan = null;
-                walkSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+                walkSoc += netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
             } else {
                 walkSoc -= drain;
             }
         } else {
-            walkSoc += kwhToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
+            walkSoc += netToSoc((pvW - loadW) * INTERVAL_HOURS / 1000);
         }
         walkSoc = Math.max(MIN_SOC_PCT, Math.min(SOC_CEILING_PCT, walkSoc));
         s._plannedSoc = walkSoc;
@@ -2382,7 +2538,7 @@ for (let i = 0; i < schedule.length; i++) {
     }
     else if (plan === 'feedin_preemptive' && soc > targetSocForSunrise + 3) {
         // Preemptive discharge for tomorrow's solar (only fires when mp >= 0 due to guard above)
-        if (soc > targetSocForSunrise + kwhToSoc(maxDischargeEnergy)) {
+        if (soc > targetSocForSunrise + drainToSoc(maxDischargeEnergy)) {
             state = 4; setPoint = -MAX_DISCHARGE_W;
             reason = `Pre-emptive discharge at ${mp.toFixed(1)}ct, target ${targetSocForSunrise.toFixed(0)}% for solar`;
         } else {
@@ -2410,7 +2566,7 @@ for (let i = 0; i < schedule.length; i++) {
         }
     }
     else if ((plan === 'feedin_surplus' || plan === 'feedin_capacity' || plan === 'feedin_saturation')
-             && soc > MIN_SOC_PCT + kwhToSoc(maxDischargeEnergy) + 5) {
+             && soc > MIN_SOC_PCT + drainToSoc(maxDischargeEnergy) + 5) {
         // Planned feed-in — already validated in Phase 3 with price-aware revocation
         state = 4; setPoint = -MAX_DISCHARGE_W;
         const tag = plan === 'feedin_capacity' ? 'free capacity for PV'
@@ -2537,12 +2693,12 @@ for (let i = 0; i < schedule.length; i++) {
         // Compensate: PV covers load first, surplus charges battery, deficit drains battery.
         // Surplus (charge) is de-rated by CHARGE_EFFICIENCY; deficit (discharge) is not.
         const netPvW = pvW - loadW;
-        const eff = netPvW > 0 ? CHARGE_EFFICIENCY : 1;
+        const eff = netPvW > 0 ? CHARGE_EFFICIENCY : (WALK_WITH_LOSSES ? 1 / ETA_DISCHARGE : 1);
         socDelta += kwhToSoc(netPvW * INTERVAL_HOURS / 1000 * eff);
     } else if (state === 4) {
         // Max discharge: battery feeds grid at max rate + covers load, PV offsets some
         const drainW = MAX_DISCHARGE_W + loadW - pvW;
-        socDelta -= kwhToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);
+        socDelta -= drainToSoc(Math.max(0, drainW) * INTERVAL_HOURS / 1000);
     }
 
     soc = Math.max(MIN_SOC_PCT, Math.min(100, soc + socDelta));

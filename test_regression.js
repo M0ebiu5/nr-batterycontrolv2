@@ -9,6 +9,15 @@ const path = require('path');
 
 const SRC = fs.readFileSync(path.join(__dirname, 'optimizer_func.js'), 'utf8');
 
+// Scenarios 1-23 pin PLANNING logic against PV fixtures that were calibrated on
+// the v1 forecast (history profile scaled linearly by sunshine). They run with
+// PV_FORECAST_V2 off so a forecast-model change cannot silently retarget them —
+// several carry "setup drift" checks that trip the moment their PV trajectory
+// moves. Scenario 24 pins the v2 forecast itself, and re-runs the reserve
+// scenario under v2.
+const SRC_PV_V1 = SRC.replace(/const PV_FORECAST_V2 = true;/, 'const PV_FORECAST_V2 = false;');
+let activeSrc = SRC_PV_V1;
+
 // --- Mock node-red node interface ---
 // warnLog collects every node.warn line so scenarios can assert on the
 // diagnostics the optimizer emits (not just on the resulting schedule).
@@ -37,7 +46,7 @@ function runOptimizer(msg, globalStore) {
     // We wrap as IIFE-style function.
     warnLog.length = 0;
     const store = globalStore || {};
-    const fn = new Function('msg', 'node', 'flow', 'global', SRC);
+    const fn = new Function('msg', 'node', 'flow', 'global', activeSrc);
     const flow = { get: () => null, set: () => {} };
     const global = {
         get: (key) => {
@@ -2510,6 +2519,57 @@ function scenario23_noCellVoltageGate() {
     return ok;
 }
 
+// ============================================================
+// SCENARIO 24: PV forecast v2 — diffuse floor, saturating sunshine curve,
+// conservative post-schedule walks. Fitted 2026-09-29 on Sep hourly PV vs
+// forecastnew sunshine: an overcast hour still makes ~20% of clear sky, 20 min
+// of sun ~2/3, a full hour ~95%. v1 put 0 W on every sunless hour and scaled
+// linearly, forecasting 61% of the month's real PV.
+// ============================================================
+function scenario24_pvForecastV2() {
+    console.log('\n=== SCENARIO 24: PV forecast v2 (diffuse floor, saturating sun curve) ===');
+    const num = (re) => Number((re.exec(SRC) || [])[1]);
+    const FLOOR = num(/const PV_SUN_FLOOR = ([\d.]+)/), TOP = num(/const PV_SUN_TOP = ([\d.]+)/), K = num(/const PV_SUN_K_MIN = ([\d.]+)/);
+    const factor = (min) => FLOOR + (TOP - FLOOR) * (1 - Math.exp(-min / K));
+    const NOW = Date.UTC(2026, 8, 9, 4, 0);          // 06:00 Berlin, no PV yet -> no live nowcast blending
+    const NOON = Date.UTC(2026, 8, 9, 11, 0);        // 13:00 Berlin
+    const clearNoon = 4500 * Math.sin(Math.PI * (13 - 6) / 13); // buildPvHistory's profile at 13h
+    const run = (minutes) => {
+        const solar = [];
+        for (let h = 0; h < 40; h++) solar.push({ time: NOW + h * 3600000, sunshineDurationInMinutes: minutes });
+        const msg = {
+            payload: {
+                soc: [{ time: NOW, soc: 50 }], acload: [{ time: NOW, acload: 500 }], power: [{ time: NOW, power: 0 }],
+                pv_now: [{ time: NOW, pv_now: 0 }], prices: buildPriceArray(NOW, 72, () => 15), solar,
+                load_history: buildLoadHistory(NOW), pv_history: buildPvHistory(NOW)
+            },
+            weather: { sunRise: new Date(Date.UTC(2026, 8, 9, 4, 45)).toISOString(), sunSet: new Date(Date.UTC(2026, 8, 9, 17, 30)).toISOString(), solarradiation: 0, rainrate: 0 }
+        };
+        const slot = getSchedule(withMockedNow(NOW, () => runOptimizer(msg))).find(s => s.t === NOON);
+        return slot ? slot.pvPower : NaN;
+    };
+    activeSrc = SRC;
+    let ok = true;
+    try {
+        const pv = { 0: run(0), 20: run(20), 60: run(60) };
+        for (const m of [0, 20, 60]) {
+            const want = clearNoon * factor(m), got = pv[m];
+            const good = Math.abs(got - want) <= 0.1 * clearNoon;
+            console.log(`  ${good ? 'ok  ' : 'FAIL'} ${m} min sun at 13h: pv=${Math.round(got)}W, expected ~${Math.round(want)}W (${(factor(m) * 100).toFixed(0)}% of ${Math.round(clearNoon)}W clear sky)`);
+            ok = ok && good;
+        }
+        if (!(pv[0] > 500)) { console.error('  FAIL: an overcast hour forecast ~0 W — the diffuse floor is gone'); ok = false; }
+        const linear = pv[0] + (pv[60] - pv[0]) * 20 / 60;
+        if (!(pv[20] > linear)) { console.error(`  FAIL: 20 min of sun (${Math.round(pv[20])}W) not above the linear interpolation (${Math.round(linear)}W) — the curve must saturate`); ok = false; }
+        console.log('  re-running scenario 6 (dead-PV multi-day reserve) under v2:');
+        if (!scenario6_endOfScheduleReserveBadForecast()) { console.error('  FAIL: post-schedule walks under v2 no longer hold the dark-streak reserve'); ok = false; }
+    } finally {
+        activeSrc = SRC_PV_V1;
+    }
+    if (ok) console.log('  PASS: diffuse floor, saturating curve and dark-streak reserve all hold under v2');
+    return ok;
+}
+
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
     ['no negative feed-in',         scenario2_noNegativeFeedIn],
@@ -2533,7 +2593,8 @@ const results = [
     ['evening peak not outbid by tomorrow',       scenario20_horizonAnchoredToTrough],
     ['preemptive drain acts after sunrise',       scenario21_preemptiveReplacementPostSunrise],
     ['ceiling band freed by next-day sun',        scenario22_ceilingBandFreedByNextDaySun],
-    ['no cell-voltage gate',                     scenario23_noCellVoltageGate]
+    ['no cell-voltage gate',                     scenario23_noCellVoltageGate],
+    ['PV forecast v2',                           scenario24_pvForecastV2]
 ];
 
 let passed = 0;
