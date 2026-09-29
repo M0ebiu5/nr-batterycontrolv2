@@ -2774,7 +2774,7 @@ const _cmdReason = socStale
 // receive, each with a one-line reason. cerbo_control and symo_gate consume
 // these instead of re-deriving them, so every threshold lives here only and a
 // subscriber can see what was commanded and why without replaying the planner.
-const IDLE_SETPOINT_W = 30;       // the Cerbo's normal self-consumption grid setpoint
+const IDLE_SETPOINT_W = 10;       // the Cerbo's normal self-consumption grid setpoint (30 until 2026-09-29: it bought ~22 kWh/month the pack could have covered)
 const MAX_TOTAL_FEEDIN_W = 4900;  // hard cap on COMBINED grid feed-in from every source
 const SYMO_DISABLE_MP_CT = -20;   // below this the grid pays us more than PV output is worth
 
