@@ -23,6 +23,10 @@
 // node before this one. msg.topic 'reset' re-seeds the virtual SOC from the
 // real BMS SOC and clears the totals.
 // Outputs: 1 = InfluxDB point (infra_2y dpshadow, one per settled slot).
+//          2 = the whole plan for forecast.batteryplan as fields dpState /
+//              dpPredictedSoc (beside the live optimizer's state / predictedSoc,
+//              same timestamps, so the dashboards can show both).
+//              dpPredictedSoc starts from the VIRTUAL battery's SOC.
 
 const CAP_KWH = 30;            // SOC scale that matches real BMS SOC drops
 const ETA_C = 0.887, ETA_D = 0.915; // measured AC->DC / DC->AC
@@ -63,13 +67,15 @@ function plan(fc, soc0) {
     const q = sorted[Math.floor((sorted.length - 1) * DP_TERM_PCTL)] * ETA_D;
     let V = new Float64Array(N);
     for (let i = 0; i < N; i++) V[i] = -q * i * kwhStep;
-    let firstG = null, firstV = null;
+    let firstV = null;
+    const acts = new Array(fc.length);
     for (let k = fc.length - 1; k >= 0; k--) {
         const P = fc[k].P / 1000, L = fc[k].L / 1000, mp = fc[k].mp, eff = effs[k];
-        const NV = new Float64Array(N), G0 = k === 0 ? new Int32Array(N) : null;
+        const NV = new Float64Array(N), A = new Int8Array(N);
         for (let i = 0; i < N; i++) {
-            let best = Infinity, bg = 10;
-            for (const G of GSET) {
+            let best = Infinity, ba = GSET.indexOf(10);
+            for (let a = 0; a < GSET.length; a++) {
+                const G = GSET[a];
                 let b = batteryFor(G, P, L, mp) / 4;            // kWh AC this slot
                 let d = b > 0 ? b * ETA_C : b / ETA_D;          // kWh in the cells
                 let x = i + d / kwhStep;
@@ -78,16 +84,29 @@ function plan(fc, soc0) {
                 const x0 = Math.floor(x), x1 = Math.min(N - 1, x0 + 1), w = x - x0;
                 const c = gridCost(L / 4 + b - P / 4, mp, eff) + (d < 0 ? -d * DP_WEAR_CT : 0)
                     + V[x0] * (1 - w) + V[x1] * w;
-                if (c < best - 1e-9) { best = c; bg = G; }
+                if (c < best - 1e-9) { best = c; ba = a; }
             }
             NV[i] = best;
-            if (G0) G0[i] = bg;
+            A[i] = ba;
         }
         V = NV;
-        if (k === 0) { firstG = G0; firstV = V; }
+        acts[k] = A;
+        if (k === 0) firstV = V;
     }
-    const i0 = Math.max(0, Math.min(N - 1, Math.round((soc0 - SOC_MIN) / DP_STEP)));
-    return { G: firstG[i0], planCostCt: firstV[i0], termCt: q };
+    const idx = soc => Math.max(0, Math.min(N - 1, Math.round((soc - SOC_MIN) / DP_STEP)));
+    // Forward walk: the plan the policy produces if the forecast comes true.
+    const traj = [];
+    let soc = soc0;
+    for (let k = 0; k < fc.length; k++) {
+        const G = GSET[acts[k][idx(soc)]];
+        const P = fc[k].P / 1000, L = fc[k].L / 1000;
+        let b = batteryFor(G, P, L, fc[k].mp) / 4;
+        if (b > 0) b = Math.min(b, (100 - soc) / 100 * CAP_KWH / ETA_C);
+        if (b < 0) b = Math.max(b, -(soc - SOC_MIN) / 100 * CAP_KWH * ETA_D);
+        soc += (b > 0 ? b * ETA_C : b / ETA_D) / CAP_KWH * 100;
+        traj.push({ t: fc[k].t, G, soc });
+    }
+    return { G: traj[0].G, planCostCt: firstV[idx(soc0)], termCt: q, traj };
 }
 
 // ---- inputs ---------------------------------------------------------------
@@ -149,12 +168,16 @@ if (st.cmd && st.cmd.t === slotT - SLOT && pvW !== null && balW !== null) {
 
 // ---- 2. plan the current slot --------------------------------------------
 const pred = ((global.get('pp', 'file') || {}).prediction || []).filter(s => typeof s.t === 'number' && s.t >= slotT);
-let why;
+let why, planPoints = null;
 if (pred.length >= 8 && pred[0].t === slotT) {
     const fc = pred.map(s => ({ t: s.t, P: Math.max(0, s.pvPower || 0), L: Math.max(0, s.loadEst || 0), mp: s.marketPrice }));
     const r = plan(fc, st.soc);
     st.cmd = { t: slotT, G: r.G, mp: fc[0].mp, eff: fc[0].mp + gridFee(slotT), liveState: pred[0].state, planCostCt: r.planCostCt, termCt: r.termCt };
     why = `sp ${r.G}W`;
+    planPoints = r.traj.map(x => ({
+        measurement: 'batteryplan', timestamp: new Date(x.t),
+        fields: { dpState: x.G > 10 ? 1 : x.G < 0 ? 4 : 3, dpPredictedSoc: Math.round(x.soc * 10) / 10 }
+    }));
 } else {
     // no fresh forecast this slot: hold self-consumption, like a live fallback
     const mp = pred[0] && pred[0].t === slotT ? pred[0].marketPrice : (st.cmd ? st.cmd.mp : 0);
@@ -168,4 +191,4 @@ const socAdj = ((st.soc - st.socRef) - ((realSoc ?? st.socRef) - st.socRef)) / 1
 const gain = (st.cumLive - st.cumSh + socAdj) / 100;
 node.status({ fill: 'blue', shape: 'dot',
     text: `${why} | vSOC ${st.soc.toFixed(1)}% | ${st.slots} slots: shadow ${(st.cumSh / 100).toFixed(2)}€ live ${(st.cumLive / 100).toFixed(2)}€ gain ${gain.toFixed(2)}€` });
-return point ? { payload: [point] } : null;
+return [point ? { payload: [point] } : null, planPoints ? { payload: planPoints } : null];
