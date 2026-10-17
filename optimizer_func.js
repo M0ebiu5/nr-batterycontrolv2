@@ -63,12 +63,25 @@ const TIMEZONE = 'Europe/Berlin';
 
 // Timezone-aware time extraction (all logic must use local Berlin time, not UTC)
 const _tzFmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: TIMEZONE, hour: 'numeric', minute: 'numeric', month: 'numeric', hour12: false
+    timeZone: TIMEZONE, hour: 'numeric', minute: 'numeric', month: 'numeric', hourCycle: 'h23'
 });
 function berlinTime(timeMs) {
     const parts = _tzFmt.formatToParts(new Date(timeMs));
     const get = type => parseInt(parts.find(p => p.type === type).value);
     return { hour: get('hour'), minute: get('minute'), month: get('month') };
+}
+
+// A grid-charge slot is "pre-publish" only if it lies before ~13:00 Berlin on
+// TODAY's date: charging there bets that tomorrow's still-unpublished prices are
+// no cheaper (user 2026-05-20). Tomorrow-morning slots seen from an evening run
+// are already priced, so they compete on price alone; once their own day starts
+// they become today-morning slots and the preference applies again. Keying on
+// the slot's hour alone made every evening run skip a 15.5ct 06:00 slot for
+// 18.9ct ones tonight (2026-10-17).
+const _tzDayFmt = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+function isPrePublishSlot(timeMs) {
+    return berlinTime(timeMs).hour < 13
+        && _tzDayFmt.format(new Date(timeMs)) === _tzDayFmt.format(new Date(Date.now()));
 }
 
 // --- Parse inputs ---
@@ -1206,7 +1219,7 @@ for (const s of schedule) {
         if (s.effectivePrice < 0) continue;
         const net = peakMp * ARB_RT_EFF - s.effectivePrice - ARB_CYCLE_WEAR_CT;
         if (net < ARB_MIN_NET_CT) continue;
-        cands.push({ idx: i, eff: s.effectivePrice, net, prePublish: berlinTime(s.time).hour < 13 });
+        cands.push({ idx: i, eff: s.effectivePrice, net, prePublish: isPrePublishSlot(s.time) });
     }
     if (cands.length === 0) return;
     // Cheapest charge first; prefer post-13:00 (prices published) on ties.
@@ -1450,7 +1463,7 @@ if (EVENING_REFILL_SELL) {
                 // trajectory clamps at MAX_GRID_CHARGE_SOC_PCT (90), so the
                 // spill above the physical rail never appears in it.
                 if (pvSatWall >= 0 && i < pvSatWall && d >= pvSatWall) { wallBlocked++; continue; }
-                eligible.push({ idx: i, effPrice: s.effectivePrice, prePublish: berlinTime(s.time).hour < 13 });
+                eligible.push({ idx: i, effPrice: s.effectivePrice, prePublish: isPrePublishSlot(s.time) });
             }
             // Prefer slots at/after the ~13:00 Berlin price publish. Grid-charging
             // earlier is a blind bet on prices that haven't published yet (user

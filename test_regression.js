@@ -2570,6 +2570,74 @@ function scenario24_pvForecastV2() {
     return ok;
 }
 
+// ============================================================
+// SCENARIO 25: A priced tomorrow-morning slot is not "pre-publish".
+// User report 2026-10-17 (14:00 run): Phase 3c planned 18.9ct grid charges
+// tonight while tomorrow 06:00 sat at 15.5ct, because the post-13:00
+// preference keyed on the slot's hour and ranked every pre-13:00 slot last —
+// including tomorrow's, whose prices were already published. Bracketed from
+// the other side: a run BEFORE today's 13:00 must still prefer the afternoon.
+// ============================================================
+function scenario25_pricedMorningNotPrePublish() {
+    console.log('\n=== SCENARIO 25: Priced tomorrow-morning slot competes on price ===');
+    const NO_SUN = (startMs, hours) => buildSolarForecast(startMs, hours).map(r => ({ ...r, sunshineDurationInMinutes: 0 }));
+
+    function run(nowMs, slots, priceFn, soc) {
+        const msg = {
+            payload: {
+                soc: [{ time: nowMs, soc }],
+                acload: [{ time: nowMs, acload: 700 }],
+                power: [{ time: nowMs, power: -700 }],
+                pv_now: [{ time: nowMs, pv_now: 0 }],
+                prices: buildPriceArray(nowMs, slots, priceFn),
+                solar: NO_SUN(nowMs, Math.ceil(slots / 4) + 12),
+                load_history: buildLoadHistory(nowMs),
+                pv_history: buildPvHistory(nowMs)
+            },
+            weather: {
+                sunRise: new Date(nowMs + 16 * 3600e3).toISOString(),
+                sunSet: new Date(nowMs + 4 * 3600e3).toISOString(),
+                solarradiation: 0, rainrate: 0
+            }
+        };
+        return getSchedule(withMockedNow(nowMs, () => runOptimizer(msg, {})));
+    }
+    const berlinH = t => ((new Date(t).getUTCHours() + 2) % 24);
+    const charged = (sched, mp) => sched.some(s => s.state === 1 && Math.abs(s.marketPrice - mp) < 0.001);
+
+    // a) 14:00 Berlin, prices through tomorrow 24:00: one 18.91ct slot tonight
+    //    (22:45) and one 15.53ct slot tomorrow 06:00, everything else 26ct.
+    const NOW_A = Date.UTC(2026, 9, 17, 12, 0);
+    const tA = i => NOW_A + i * 900e3;
+    const schedA = run(NOW_A, 136, (t) => {
+        const h = berlinH(t), m = new Date(t).getUTCMinutes(), tomorrow = t - NOW_A > 10 * 3600e3;
+        if (!tomorrow && h === 22 && m === 45) return 18.91;
+        if (tomorrow && h === 6 && m === 0) return 15.53;
+        return 26;
+    }, 30);
+    const okA = charged(schedA, 15.53);
+    if (!schedA.some(s => s.state === 1)) console.error('  setup drift: run (a) planned no grid charge at all — no deficit to cover');
+    console.log(`  ${okA ? 'ok  ' : 'FAIL'} 14:00 run: tomorrow 06:00 @15.53ct charged=${okA}, tonight 22:45 @18.91ct charged=${charged(schedA, 18.91)}`);
+
+    // b) 08:00 Berlin, prices through today 24:00 only: 09:00 @15.53ct vs
+    //    14:00 @15.91ct. Tomorrow is unpublished → the afternoon slot wins.
+    const NOW_B = Date.UTC(2026, 9, 17, 6, 0);
+    const schedB = run(NOW_B, 64, (t) => {
+        const h = berlinH(t), m = new Date(t).getUTCMinutes();
+        if (h === 9 && m === 0) return 15.53;
+        if (h === 14 && m === 0) return 15.91;
+        return 26;
+    }, 30);
+    const okB = charged(schedB, 15.91) && !charged(schedB, 15.53);
+    console.log(`  ${okB ? 'ok  ' : 'FAIL'} 08:00 run: 14:00 @15.91ct charged=${charged(schedB, 15.91)}, 09:00 @15.53ct charged=${charged(schedB, 15.53)} (wanted afternoon only)`);
+
+    const ok = okA && okB;
+    console.log(ok
+        ? '  PASS: priced morning slots compete on price; today-morning slots still yield to the afternoon'
+        : '  FAIL: pre-publish preference misapplied');
+    return ok;
+}
+
 const results = [
     ['evening slot below avgPrice', scenario1_eveningSlotBelowAvg],
     ['no negative feed-in',         scenario2_noNegativeFeedIn],
@@ -2594,7 +2662,8 @@ const results = [
     ['preemptive drain acts after sunrise',       scenario21_preemptiveReplacementPostSunrise],
     ['ceiling band freed by next-day sun',        scenario22_ceilingBandFreedByNextDaySun],
     ['no cell-voltage gate',                     scenario23_noCellVoltageGate],
-    ['PV forecast v2',                           scenario24_pvForecastV2]
+    ['PV forecast v2',                           scenario24_pvForecastV2],
+    ['priced morning slot not pre-publish',      scenario25_pricedMorningNotPrePublish]
 ];
 
 let passed = 0;
