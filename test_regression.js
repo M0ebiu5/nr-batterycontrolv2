@@ -1529,8 +1529,15 @@ function scenario17_saturatingRefillUnlocksEveningPeak() {
         // flag it so a silent setup change can't hollow the test out.
         console.warn(`  note: wall refused 0 candidates (reserve satisfied without picks)`);
     }
-    if (bought.length > 0) {
-        console.error(`  FAIL: ${bought.length} grid-charge slot(s) planned although PV spills ${spillPct}% at idx=${wallIdx}`);
+    // Under test: energy bought BEFORE the wall to cover a deficit beyond it (it
+    // spills at the wall). A top-up after the wall serves the end-of-horizon
+    // reserve, which sits MIN_SOC_PCT-relative: raising the floor to 10 % on
+    // 2026-10-17 added one at the horizon's last night. Reported, not failed.
+    const boughtBefore = bought.filter(s => schedule.indexOf(s) < Number(wallIdx));
+    const boughtAfter = bought.length - boughtBefore.length;
+    if (boughtAfter > 0) console.log(`  note: ${boughtAfter} reserve top-up(s) after the wall (end-of-horizon reserve)`);
+    if (boughtBefore.length > 0) {
+        console.error(`  FAIL: ${boughtBefore.length} grid-charge slot(s) before the wall although PV spills ${spillPct}% at idx=${wallIdx}`);
         ok = false;
     }
     if (tonightSold.length === 0) {
@@ -1539,7 +1546,7 @@ function scenario17_saturatingRefillUnlocksEveningPeak() {
     }
     if (ok) {
         console.log(`  PASS: ${tonightSold.length}/${tonight.length} evening slots sell at 22ct; `
-            + `no grid charge behind the wall (idx=${wallIdx}, ${spillPct}% spill, ${refused} candidate(s) refused)`);
+            + `no grid charge before the wall (idx=${wallIdx}, ${spillPct}% spill, ${refused} candidate(s) refused)`);
     }
     return ok;
 }

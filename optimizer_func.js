@@ -11,7 +11,7 @@ const BATTERY_CAPACITY_KWH = 30;
 const MAX_CHARGE_W = 3500;
 const MAX_DISCHARGE_W = 3500;
 const AVG_LOAD_W = 700;
-const MIN_SOC_PCT = 5;
+const MIN_SOC_PCT = 10; // planning floor on the ess.Soc scale. 5 until 2026-10-17: cell-voltage anchors showed ess.Soc 9-15 % with the cells already at the LFP knee (3.14-3.20 V), so 5 % planned the pack onto its cutoff
 // --- Prototype 2026-09-29: measured losses + evening sale against tomorrow's sun ---
 // Flags so a replay can compare old vs new; both false = the pre-2026-09-29 algorithm.
 const PLAN_WITH_LOSSES = false;   // round-trip economics and the arbitrage hurdle use the measured AC<->DC losses

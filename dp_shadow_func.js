@@ -29,7 +29,8 @@
 //              made from the LIVE SOC, so both curves start at the same point.
 //
 // SOC: exactly the live optimizer's source chain ("SOC from global"):
-// global.ess.Soc, falling back to a fresh global.bms.weightedSoc. The virtual
+// global.ess.Soc, falling back to the BMS moved onto the ess scale (weightedSoc -
+// essOffset, offset < 12 h old). The virtual
 // battery is seeded from it, and the totals value the end-SOC gap against it,
 // so real and shadow are always measured on the same scale.
 
@@ -37,7 +38,7 @@ const CAP_KWH = 30;            // SOC scale that matches real BMS SOC drops
 const ETA_C = 0.887, ETA_D = 0.915; // measured AC->DC / DC->AC
 const MAX_W = 3500;            // charge / discharge limit
 const MAX_FEEDIN_W = 4900;     // combined export cap
-const SOC_MIN = 5;             // planning floor
+const SOC_MIN = 10;            // planning floor (= live MIN_SOC_PCT since 2026-10-17: at ess 9-15 % the cells already sit at the LFP knee)
 const SOC_CUTOFF = 3;          // packs stop discharging here (virtual physics)
 const DP_STEP = 0.25;          // SOC grid of the DP, %
 const DP_WEAR_CT = 1.5;        // per kWh out of the cells
@@ -121,8 +122,11 @@ const bms = global.get('bms') || {};
 const essSoc = (global.get('ess') || {}).Soc;
 const essOk = typeof essSoc === 'number' && essSoc >= 0 && essSoc <= 100;
 const bmsOk = typeof bms.ts === 'number' && bms.ts > now - 1800000 && typeof bms.weightedSoc === 'number';
-const realSoc = essOk ? essSoc : (bmsOk ? bms.weightedSoc : null);   // = the live optimizer's SOC
-const socSrc = essOk ? 'ess' : (bmsOk ? 'bms' : 'none');
+// BMS moved onto the ess scale, only while the offset is < 12 h old (query_soc, 2026-10-17)
+const offOk = typeof bms.essOffset === 'number' && typeof bms.essOffsetTs === 'number' && bms.essOffsetTs > now - 43200000;
+const bmsOnEss = bmsOk && offOk ? Math.max(0, Math.min(100, bms.weightedSoc - bms.essOffset)) : null;
+const realSoc = essOk ? essSoc : bmsOnEss;   // = the live optimizer's SOC
+const socSrc = essOk ? 'ess' : (bmsOnEss !== null ? 'bms-offset' : 'none');
 let st = flow.get('dpShadow', 'file');
 if (msg.topic === 'reset' || !st || typeof st.soc !== 'number') {
     if (realSoc === null) { node.status({ fill: 'red', shape: 'ring', text: 'no live SOC (ess/bms) to seed from' }); return null; }
