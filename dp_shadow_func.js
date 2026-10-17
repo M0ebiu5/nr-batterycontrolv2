@@ -21,12 +21,17 @@
 // Inputs: msg.payload = raw InfluxDB results for the slot that just ended
 // (PV mean, grid mean balanceeme (+ = export), battery mean), from the query
 // node before this one. msg.topic 'reset' re-seeds the virtual SOC from the
-// real BMS SOC and clears the totals.
+// live SOC (same source as the optimizer) and clears the totals.
 // Outputs: 1 = InfluxDB point (infra_2y dpshadow, one per settled slot).
 //          2 = the whole plan for forecast.batteryplan as fields dpState /
 //              dpPredictedSoc (beside the live optimizer's state / predictedSoc,
-//              same timestamps, so the dashboards can show both).
-//              dpPredictedSoc starts from the VIRTUAL battery's SOC.
+//              same timestamps, so the dashboards can show both). This plan is
+//              made from the LIVE SOC, so both curves start at the same point.
+//
+// SOC: exactly the live optimizer's source chain ("SOC from global"):
+// global.ess.Soc, falling back to a fresh global.bms.weightedSoc. The virtual
+// battery is seeded from it, and the totals value the end-SOC gap against it,
+// so real and shadow are always measured on the same scale.
 
 const CAP_KWH = 30;            // SOC scale that matches real BMS SOC drops
 const ETA_C = 0.887, ETA_D = 0.915; // measured AC->DC / DC->AC
@@ -113,10 +118,14 @@ function plan(fc, soc0) {
 const now = Date.now();
 const slotT = Math.floor(now / SLOT) * SLOT;          // the slot starting now
 const bms = global.get('bms') || {};
-const realSoc = typeof bms.weightedSoc === 'number' ? bms.weightedSoc : null;
+const essSoc = (global.get('ess') || {}).Soc;
+const essOk = typeof essSoc === 'number' && essSoc >= 0 && essSoc <= 100;
+const bmsOk = typeof bms.ts === 'number' && bms.ts > now - 1800000 && typeof bms.weightedSoc === 'number';
+const realSoc = essOk ? essSoc : (bmsOk ? bms.weightedSoc : null);   // = the live optimizer's SOC
+const socSrc = essOk ? 'ess' : (bmsOk ? 'bms' : 'none');
 let st = flow.get('dpShadow', 'file');
 if (msg.topic === 'reset' || !st || typeof st.soc !== 'number') {
-    if (realSoc === null) { node.status({ fill: 'red', shape: 'ring', text: 'no BMS SOC to seed from' }); return null; }
+    if (realSoc === null) { node.status({ fill: 'red', shape: 'ring', text: 'no live SOC (ess/bms) to seed from' }); return null; }
     st = { soc: realSoc, since: now, cmd: null, cumSh: 0, cumLive: 0, socRef: realSoc, dcSh: 0, dcLive: 0, slots: 0 };
 }
 
@@ -157,7 +166,7 @@ if (st.cmd && st.cmd.t === slotT - SLOT && pvW !== null && balW !== null) {
             sh_sp: c.G, sh_state: c.G > 10 ? 1 : c.G < 0 ? 4 : 3,
             sh_soc: Math.round(st.soc * 10) / 10, sh_grid: Math.round(grid * 1000), sh_cost: Math.round(shCost * 100) / 100,
             live_state: c.liveState, live_grid: Math.round(gridImpW), live_cost: Math.round(liveCost * 100) / 100,
-            real_soc: realSoc === null ? undefined : Math.round(realSoc * 10) / 10,
+            real_soc: realSoc === null ? undefined : Math.round(realSoc * 10) / 10, soc_src: socSrc,
             pv: Math.round(pvW), load: Math.round(loadW), mp: c.mp,
             plan_ct: Math.round(c.planCostCt), term_ct: Math.round(c.termCt * 10) / 10,
             sh_dcout: Math.round(dcOut * 1000) / 1000, live_dcout: Math.round(liveDc * 1000) / 1000
@@ -174,7 +183,9 @@ if (pred.length >= 8 && pred[0].t === slotT) {
     const r = plan(fc, st.soc);
     st.cmd = { t: slotT, G: r.G, mp: fc[0].mp, eff: fc[0].mp + gridFee(slotT), liveState: pred[0].state, planCostCt: r.planCostCt, termCt: r.termCt };
     why = `sp ${r.G}W`;
-    planPoints = r.traj.map(x => ({
+    // The displayed plan starts from the live SOC; the virtual battery's own plan (r) only drives the cost comparison.
+    const rShow = realSoc === null ? r : plan(fc, realSoc);
+    planPoints = rShow.traj.map(x => ({
         measurement: 'batteryplan', timestamp: new Date(x.t),
         fields: { dpState: x.G > 10 ? 1 : x.G < 0 ? 4 : 3, dpPredictedSoc: Math.round(x.soc * 10) / 10 }
     }));
