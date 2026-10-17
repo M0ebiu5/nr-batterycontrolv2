@@ -1338,6 +1338,15 @@ if (_cmdState === 1) {
     _maxDischarge = -1;
     _setPointWhy = `state 4 at ${_mpTxt}: force ${-_acSetPoint}W export, this is a grid setpoint so it caps total feed-in`;
     _maxDischargeWhy = '-1 = no limit, the setpoint alone decides how hard the pack is pushed';
+} else if (currentSoc <= MIN_SOC_PCT) {
+    // The DP's model stops discharging at the planning floor and lets the grid
+    // carry the house, but the Cerbo has no floor of its own (MinimumSocLimit 0),
+    // so self-consumption kept draining: 2026-10-18 night, 3 % at 01:00 while the
+    // plan showed 10 %. Pin discharge to 0 here; PV surplus can still charge.
+    _acSetPoint = IDLE_SETPOINT_W;
+    _maxDischarge = 0;
+    _setPointWhy = `state 3 at ${_mpTxt}: SOC ${currentSoc.toFixed(1)}% at/below the ${MIN_SOC_PCT}% floor, the grid carries the house`;
+    _maxDischargeWhy = `pinned to 0 at the ${MIN_SOC_PCT}% planning floor - the Cerbo's own minimum SOC is 0, so nothing else stops the drain`;
 } else {
     _acSetPoint = IDLE_SETPOINT_W;
     _maxDischarge = -1;
