@@ -80,3 +80,17 @@ SELECT sum(mean_PAC)/4000 FROM two_years.pv WHERE time > now()-30d GROUP BY time
 -- how often each decision path fired
 SELECT count(state) FROM optrun WHERE time > now()-30d GROUP BY reason
 ```
+
+## 3. DP comparison
+
+`tools/replay-dp.js` runs the same replay with a dynamic-programming planner in place of
+the optimizer (see its header). 2026-10-17, cost + wear, SOC-adjusted:
+
+| | Sep 1-28 | Sep 20 - Oct 15 | lowest SOC |
+|---|---|---|---|
+| live optimizer (`--policy opt`) | -8.74 EUR | -5.64 EUR | 3% |
+| `--policy dpg` (median end value) | -17.18 EUR | -7.12 EUR | 16% |
+| `--policy dpg --perfect` gap | about 1-3 EUR/month more | | |
+
+The `dpg` planner runs live as a shadow on the "Battery DP Shadow" tab
+(`battery_dp_shadow.json`, `dp_shadow_func.js`) and logs to `infra_2y.dpshadow`.
