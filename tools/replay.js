@@ -88,7 +88,7 @@ function main() {
     let prevBat = 0;
     const rows = [];
     for (let t = D.meta.t0; t < D.meta.t1; t += SLOT) {
-        NOW = t;
+        NOW = t + 30000; // live runs fire a few seconds after the slot start; at exactly t the schedule still holds the slot that just ended, and the optimizer acts on it
         const cur = byT.get(t), prev = byT.get(t - SLOT) || cur, prev2 = byT.get(t - 2 * SLOT) || prev;
         const bt = berlin(t);
         // Prices: the cache holds yesterday+today until the 13:05 fetch, then today+tomorrow.

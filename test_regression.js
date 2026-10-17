@@ -7,7 +7,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const SRC = fs.readFileSync(path.join(__dirname, 'optimizer_func.js'), 'utf8');
+// OPT_SRC=optimizer_dp_func.js runs the suite against the DP planner (the live node since 2026-10-17).
+const SRC = fs.readFileSync(path.join(__dirname, process.env.OPT_SRC || 'optimizer_func.js'), 'utf8');
 
 // Scenarios 1-23 pin PLANNING logic against PV fixtures that were calibrated on
 // the v1 forecast (history profile scaled linearly by sunshine). They run with

@@ -77,7 +77,7 @@ function sunTimes(ms) {
 // ---- DP planner (cost first, wear second via o.wear ct per DC kWh out) ----
 const DP = (() => {
     const GSET = (process.env.GSET || '3500,1750,10,-1750,-3500').split(',').map(Number);
-    const dS = 0.25, SMIN = 5, SMAX = 100, N = Math.round((SMAX - SMIN) / dS) + 1;
+    const dS = 0.25, SMIN = 10, SMAX = 100, N = Math.round((SMAX - SMIN) / dS) + 1;
     const kwhPerStep = dS / 100 * CAP_KWH;
     const feeOf = t => { const b = berlin(t); return (b.mon >= 4 && b.mon <= 9 && b.h >= 10 && b.h < 16) ? 10.4 : 13; };
     // grid kWh in a slot -> cost ct (curtail export when mp<0)
@@ -190,7 +190,7 @@ function main() {
     let prevBat = 0;
     const rows = [];
     for (let t = D.meta.t0; t < D.meta.t1; t += SLOT) {
-        NOW = t;
+        NOW = t + 30000; // live runs fire a few seconds after the slot start; at exactly t the schedule still holds the slot that just ended, and the optimizer acts on it
         const cur = byT.get(t), prev = byT.get(t - SLOT) || cur, prev2 = byT.get(t - 2 * SLOT) || prev;
         const bt = berlin(t);
         // Prices: the cache holds yesterday+today until the 13:05 fetch, then today+tomorrow.
