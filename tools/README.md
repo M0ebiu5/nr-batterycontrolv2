@@ -51,6 +51,14 @@ variants in parallel (`&`).
 **Compare `SOC-adj` across variants.** It values the end-SOC difference at
 18 ct/kWh.
 
+Leistungspreis (Austrian grid tariff from 2027): `LP EUR` bills each calendar
+month's highest 15-min grid import, at least 2 kW, at `--lp` EUR per kW and year
+(default 33.82, E-Control's final-stage model; about 19 at the start stage;
+`--lp 0` turns it off). Partial months are pro-rated. `SOC-adj+LP` (replay.js)
+and `costInclWearLP` (replay-dp.js) add it, and the `peaks` line shows each
+month's peak and when it happened. The Netz OÖ amounts and start date come with
+the SNE-T-V (due December 2026).
+
 Fidelity: the pre-2026-09-29 optimizer replays September at -14.00 EUR net
 against -14.20 EUR actual.
 

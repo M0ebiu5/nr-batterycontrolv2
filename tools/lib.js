@@ -43,7 +43,37 @@ function berlinMidnight(date) {
     return t;
 }
 
+// Leistungspreis (Austrian grid tariff from 2027, SNE-G-V 2026): each calendar month
+// bills its highest 15-min average grid IMPORT in kW, at least LP_MIN_KW. rows need
+// t (ms) and grid (W, + = import, the slot mean). A month the data covers only part of
+// is pro-rated by its share of slots, so partial-month replays stay comparable.
+// eurPerKwYear: E-Control's final-stage model value is 33.82 (up to 10 kW; above
+// 10 kW it doubles, not modelled: the 3.5 kW inverter keeps us far below).
+const LP_MIN_KW = 2;
+function peakCharge(rows, eurPerKwYear) {
+    const m = {};
+    for (const r of rows) {
+        const b = berlin(r.t), k = b.date.slice(0, 7);
+        const e = m[k] || (m[k] = { month: k, peakKw: 0, at: null, n: 0 });
+        e.n++;
+        if (r.grid / 1000 > e.peakKw) { e.peakKw = r.grid / 1000; e.at = b.date.slice(5) + ' ' + String(b.h).padStart(2, '0') + ':' + String(b.m).padStart(2, '0'); }
+    }
+    let eur = 0;
+    const months = Object.values(m).map(e => {
+        const [y, mo] = e.month.split('-').map(Number);
+        const frac = e.n / (new Date(Date.UTC(y, mo, 0)).getUTCDate() * 96);
+        const billedKw = Math.max(e.peakKw, LP_MIN_KW);
+        const cost = billedKw * eurPerKwYear / 12 * frac;
+        eur += cost;
+        return Object.assign(e, { billedKw, frac, eur: cost });
+    });
+    return { months, eur };
+}
+function fmtPeaks(pc) {
+    return pc.months.map(e => `${e.month} ${e.peakKw.toFixed(2)}kW@${e.at}`).join(', ');
+}
+
 function writeGz(path, obj) { fs.writeFileSync(path, zlib.gzipSync(JSON.stringify(obj))); }
 function readGz(path) { return JSON.parse(zlib.gunzipSync(fs.readFileSync(path))); }
 
-module.exports = { query, berlin, berlinMidnight, writeGz, readGz, SLOT };
+module.exports = { query, berlin, berlinMidnight, writeGz, readGz, peakCharge, fmtPeaks, SLOT };

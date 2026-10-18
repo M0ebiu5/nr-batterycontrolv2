@@ -20,6 +20,10 @@
 //     --label NAME        name in the summary line (default: the --set list)
 //     --no-weather        feed the pre-2026-09-29 weather (no sunrise/radiation)
 //     --out FILE          write per-slot results as JSON
+//     --lp EUR            Leistungspreis in EUR per kW and year (default 33.82, E-Control's
+//                         final-stage model; ~19 at the start stage). Billed per month on the
+//                         highest 15-min import, min 2 kW; 0 turns it off. Also printed: each
+//                         month's peak and when it happened.
 //
 // Each 15-min slot: build the inputs the live flow would have built at that
 // moment, run the optimizer, apply the Cerbo setpoint it returns to the slot's
@@ -29,7 +33,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { readGz, berlin, SLOT } = require('./lib');
+const { readGz, berlin, peakCharge, fmtPeaks, SLOT } = require('./lib');
 
 // Battery model, measured 2026-09-22..29 (see memory: round-trip efficiency).
 const ETA_C = 0.887, ETA_D = 0.915;
@@ -39,7 +43,7 @@ const MAX_W = 3500, MAX_FEEDIN_W = 4900;
 const LAT = 48.2, LON = 14.1; // matches the station's sunrise/sunset within minutes
 
 function args() {
-    const a = process.argv.slice(2), o = { set: [], weather: true, policy: 'opt', wear: 1.5, term: 'median' };
+    const a = process.argv.slice(2), o = { set: [], weather: true, lp: 33.82, policy: 'opt', wear: 1.5, term: 'median' };
     o.data = a.shift();
     while (a.length) {
         const k = a.shift();
@@ -48,6 +52,7 @@ function args() {
         else if (k === '--label') o.label = a.shift();
         else if (k === '--no-weather') o.weather = false;
         else if (k === '--out') o.out = a.shift();
+        else if (k === '--lp') o.lp = +a.shift();
         else if (k === '--policy') o.policy = a.shift();
         else if (k === '--wear') o.wear = +a.shift();
         else if (k === '--term') o.term = a.shift();
@@ -258,10 +263,12 @@ function main() {
     const days = {};
     rows.forEach(r => { days[r.date] = Math.min(days[r.date] ?? 100, r.soc); });
     const lows = Object.values(days);
+    const pc = peakCharge(rows, o.lp);
     console.log(`${(o.label || o.set.join(' ') || 'as-is').padEnd(30)} net EUR ${cost.toFixed(2)}  SOC-adj EUR ${adj.toFixed(2)}`
         + `  SOC ${soc0.toFixed(1)}->${soc.toFixed(1)}%  imp ${sum(r => r.imp).toFixed(0)} exp ${sum(r => r.exp).toFixed(0)} kWh`
         + `  feed-in slots ${rows.filter(r => r.state === 4).length}  charge slots ${rows.filter(r => r.state === 1).length}`
-        + `  min SOC ${Math.min(...lows).toFixed(1)}%  days<10% ${lows.filter(x => x < 10).length}  DCout ${dis.toFixed(0)} kWh  costInclWear ${(adj + dis * 0.015).toFixed(2)}`);
+        + `  min SOC ${Math.min(...lows).toFixed(1)}%  days<10% ${lows.filter(x => x < 10).length}  DCout ${dis.toFixed(0)} kWh  costInclWear ${(adj + dis * 0.015).toFixed(2)}`
+        + `  LP EUR ${pc.eur.toFixed(2)}  costInclWearLP ${(adj + dis * 0.015 + pc.eur).toFixed(2)}\n    peaks ${fmtPeaks(pc)}`);
     if (o.out) fs.writeFileSync(o.out, JSON.stringify(rows));
 }
 try { main(); } catch (e) { console.error(e.message); process.exit(1); }
