@@ -102,3 +102,19 @@ the optimizer (see its header). 2026-10-17, cost + wear, SOC-adjusted:
 
 The `dpg` planner runs live as a shadow on the "Battery DP Shadow" tab
 (`battery_dp_shadow.json`, `dp_shadow_func.js`) and logs to `infra_2y.dpshadow`.
+
+### Import-capped charging (Leistungspreis), 2026-10-18
+
+`GSET=<cap>,<cap/2>,10,-1750,-3500 node tools/replay-dp.js D --policy dpg --no-pin`
+on Sep 1 - Oct 16 (costInclWear + LP, EUR; LP at 33.82 / 19 EUR per kW-year):
+
+| charge setpoints | peak Sep/Oct kW | at 33.82 | at 19 |
+|---|---|---|---|
+| 3500, discharge pinned (live) | 3.50 / 4.93 | +3.85 | -3.62 |
+| 3500 no-pin | 3.50 / 3.50 | +1.31 | -5.24 |
+| 3000 no-pin | 3.00 / 3.00 | +0.38 | -5.24 |
+| 2500 no-pin | 2.50 / 2.50 | -1.99 | -6.68 |
+| 2000 no-pin | 2.00 / 2.00 | **-3.36** | **-7.10** |
+| 1500 no-pin | 1.50 / 1.82 | -2.50 | -6.24 |
+
+Autumn only; winter (more grid charging) is not in the data yet.

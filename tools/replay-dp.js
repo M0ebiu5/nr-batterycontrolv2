@@ -7,6 +7,9 @@
 //              the DP shadow tab runs (dp_shadow_func.js)
 //     dp3/dpc  earlier variants: 3 battery modes / continuous battery power
 //     --perfect  the DP sees actual PV/load instead of the optimizer's forecast
+//     --no-pin   charge setpoints leave discharge free (MaxDischargePower -1): the Cerbo holds
+//                the grid at the setpoint, so a load above it is covered by the pack. With a
+//                low charge setpoint in GSET this caps the import peak (Leistungspreis).
 // The DP uses the optimizer's own forecasts (pvPower/loadEst of its schedule), so the
 // difference is the algorithm, not the forecast. Extra summary fields: DCout (kWh out of
 // the cells) and costInclWear (SOC-adj + 1.5 ct per DCout kWh).
@@ -57,6 +60,7 @@ function args() {
         else if (k === '--wear') o.wear = +a.shift();
         else if (k === '--term') o.term = a.shift();
         else if (k === '--perfect') o.perfect = true;
+        else if (k === '--no-pin') o.noPin = true;
         else throw new Error('unknown option ' + k);
     }
     if (!o.data) throw new Error('usage: replay.js DATA.json.gz [--src F] [--set NAME=VALUE]... [--label L] [--no-weather] [--out F]');
@@ -118,7 +122,7 @@ const DP = (() => {
                 } else if (o.policy === 'dpg') {
                     for (const G of GSET) {
                         let bAc = Math.max(-MAX_W / 4000, Math.min(MAX_W / 4000, G / 4000 + P - L));
-                        if (G > 10) bAc = Math.max(0, bAc);
+                        if (G > 10 && !o.noPin) bAc = Math.max(0, bAc);
                         if (mp < 0) bAc = Math.max(bAc, Math.min(MAX_W / 4000, P - L)); // PreventFeedback: no export
                         let d = bAc > 0 ? bAc * ETA_C : bAc / ETA_D;
                         let x = i + d / kwhPerStep;
@@ -239,7 +243,7 @@ function main() {
             });
             const G = DP.plan(fc, soc, o);
             cmd = { state: G.state };
-            cb = { AcPowerSetPoint: { value: G.sp }, MaxDischargePower: { value: G.state === 1 ? 0 : -1 }, PreventFeedback: { value: fc[0].mp < 0 ? 1 : 0 } };
+            cb = { AcPowerSetPoint: { value: G.sp }, MaxDischargePower: { value: G.state === 1 && !o.noPin ? 0 : -1 }, PreventFeedback: { value: fc[0].mp < 0 ? 1 : 0 } };
         }
         // Physics: the Cerbo holds the grid at the setpoint, within battery limits.
         const P = cur.pv, L = cur.load, mp = cur.mp;
