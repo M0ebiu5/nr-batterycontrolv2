@@ -1156,7 +1156,21 @@ const DP_STEP = 0.25;              // % SOC per DP state
 const DP_WEAR_CT = FEEDIN_CYCLE_WEAR_CT; // 1.5 ct per kWh out of the cells
 const DP_TERM_PCTL = 0.5;
 const DP_SELF_W = 10;              // self-consumption setpoint (= IDLE_SETPOINT_W below)
-const DP_GSET = [MAX_CHARGE_W, MAX_CHARGE_W / 2, DP_SELF_W, -MAX_DISCHARGE_W / 2, -MAX_DISCHARGE_W];
+// Leistungspreis (Austrian grid tariff, SNE-G-V 2026): from LP_FROM the grid bills
+// each month's highest 15-min IMPORT in kW (min 2 kW). Netz OÖ has not set its
+// start date yet (between 2027-01-01 and 2028-07-01), so null = off and nothing
+// below changes. When on, charge setpoints are capped at LP_CHARGE_CAP_W and
+// discharge stays free while charging: the Cerbo holds the grid at the setpoint
+// and the pack covers any load above it, so a house spike during a charge slot no
+// longer lands on the meter. Replay 2026-09-01..10-16 (cost + wear + LP):
+// 3500 W pinned +3.85 EUR (peak 4.93 kW), 2000 W free -3.36 EUR at 33.82 EUR/kW-yr
+// (final stage), -3.62 vs -7.10 EUR at 19 (start stage); 1500 W saves no LP (2 kW
+// minimum) and loses spread. Autumn only, winter not replayed yet.
+const LP_FROM = null;              // e.g. '2027-01-01T00:00:00+01:00' (Netz OÖ start)
+const LP_CHARGE_CAP_W = 2000;      // = the 2 kW billing minimum
+const _lpActive = LP_FROM !== null && now >= Date.parse(LP_FROM);
+const DP_CHARGE_W = _lpActive ? Math.min(LP_CHARGE_CAP_W, MAX_CHARGE_W) : MAX_CHARGE_W;
+const DP_GSET = [DP_CHARGE_W, DP_CHARGE_W / 2, DP_SELF_W, -MAX_DISCHARGE_W / 2, -MAX_DISCHARGE_W];
 const DP_MAX_FEEDIN_W = 4900;      // combined export cap (= MAX_TOTAL_FEEDIN_W below)
 
 function dpGridCost(kwh, mp, ep) {
@@ -1166,7 +1180,7 @@ function dpGridCost(kwh, mp, ep) {
 // Battery AC power (kW, + = charge) the Cerbo produces for setpoint G.
 function dpBattery(G, pvKw, loadKw, mp) {
     let b = Math.max(-MAX_DISCHARGE_W / 1000, Math.min(MAX_CHARGE_W / 1000, G / 1000 + pvKw - loadKw));
-    if (G > DP_SELF_W) b = Math.max(0, b);
+    if (G > DP_SELF_W && !_lpActive) b = Math.max(0, b);
     if (mp < 0) b = Math.max(b, Math.min(MAX_CHARGE_W / 1000, pvKw - loadKw));
     return b;
 }
@@ -1329,10 +1343,12 @@ const _negPrice = (_mp !== null && _mp < 0);
 let _acSetPoint, _maxDischarge, _setPointWhy, _maxDischargeWhy;
 const _dpSp = currentSlot && typeof currentSlot.acPowerSetPoint === 'number' ? currentSlot.acPowerSetPoint : null;
 if (_cmdState === 1) {
-    _acSetPoint = _dpSp !== null && _dpSp > IDLE_SETPOINT_W ? _dpSp : MAX_CHARGE_W;
-    _maxDischarge = 0;
+    _acSetPoint = _dpSp !== null && _dpSp > IDLE_SETPOINT_W ? _dpSp : DP_CHARGE_W;
+    _maxDischarge = _lpActive ? -1 : 0;
     _setPointWhy = `state 1 at ${_mpTxt}: force ${_acSetPoint}W import to charge the pack`;
-    _maxDischargeWhy = 'pinned to 0 so the pack cannot discharge back out while we are paying to fill it';
+    _maxDischargeWhy = _lpActive
+        ? `-1 = free: Leistungspreis on, the grid is held at the ${_acSetPoint}W setpoint and the pack covers any load above it, so the monthly import peak stays at the setpoint`
+        : 'pinned to 0 so the pack cannot discharge back out while we are paying to fill it';
 } else if (_cmdState === 4) {
     _acSetPoint = _dpSp !== null && _dpSp < 0 ? _dpSp : -MAX_DISCHARGE_W;
     _maxDischarge = -1;
