@@ -1,0 +1,7 @@
+[Unit]
+Description=Repair a JK pack batmon lost over Bluetooth
+After=docker.service bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/batmon-watchdog.sh
