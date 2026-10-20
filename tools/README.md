@@ -136,3 +136,23 @@ Every correction loses: a kWh bought at night reaches the morning at
 (mp + 13 ct fee) / 0.81, so storing only beats buying in the morning above ~27 ct,
 and on the sunny mornings the pessimistic plan bought energy PV would have supplied.
 Recheck when the per-kWh grid fee drops (2027) or in winter with higher morning peaks.
+
+### Gas heat credit for battery losses, 2026-10-20
+
+The packs and inverter are indoors, and the house is heated with gas, so in
+Oct-Apr the conversion losses replace gas heat. `--heat-ct 10.4` = Grünwelt
+4.00 ct net + Netz OÖ 2.2339 ct net (2026, zone 1) + Erdgasabgabe/CO2 1.91 ct
+gross, all +20 % VAT = 9.4 ct/kWh gas, / 0.9 condensing boiler. Same dataset,
+costInclWear incl. the credit (EUR):
+
+| variant | EUR | end SOC |
+|---|---|---|
+| current DP (credit in accounting only) | -3.80 | 31 % |
+| `--heat-plan` (DP plans with the credit) | -3.35 | 63 % |
+| `--heat-plan --scen 0.35,0.25` | -1.65 | 65 % |
+| `--heat-plan --pv-am 0.66` | -1.12 | 70 % |
+
+The losses already earn 4.91 EUR of heat in Oct 1-19 (~47 kWh). Planning with
+the credit is a tie within the end-SOC valuation (18 ct/kWh; at 25 ct the
+heat-aware DP would come out ~0.2 EUR ahead); the fog variants still lose.
+Only 19 heating days: rerun on Nov-Jan data.

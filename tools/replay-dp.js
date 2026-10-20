@@ -12,6 +12,10 @@
 //                     the forecast of a day is the one its 00:00 run saw
 //     --scen P,F      fog hedge (dpg): plan "forecast" and "morning PV x F", take the first
 //                     action with the lowest expected cost at fog probability P
+//     --heat-ct H     heating season (Oct-Apr): every kWh lost in charging/discharging warms
+//                     the house and saves gas heat worth H ct (gas incl. grid/taxes / boiler
+//                     efficiency); credited in the cost of every variant
+//     --heat-plan     the DP plans with that credit too
 //     --no-pin   charge setpoints leave discharge free (MaxDischargePower -1): the Cerbo holds
 //                the grid at the setpoint, so a load above it is covered by the pack. With a
 //                low charge setpoint in GSET this caps the import peak (Leistungspreis).
@@ -66,6 +70,8 @@ function args() {
         else if (k === '--term') o.term = a.shift();
         else if (k === '--perfect') o.perfect = true;
         else if (k === '--no-pin') o.noPin = true;
+        else if (k === '--heat-ct') o.heatCt = +a.shift();
+        else if (k === '--heat-plan') o.heatPlan = true;
         else if (k === '--pv-am') o.pvAm = +a.shift();
         else if (k === '--pv-am-adapt') o.pvAmAdapt = +a.shift();
         else if (k === '--scen') { const [p, f] = a.shift().split(',').map(Number); o.scen = { p, f }; }
@@ -90,6 +96,8 @@ function sunTimes(ms) {
     return { rise: noon - w / (2 * Math.PI) * 86400000, set: noon + w / (2 * Math.PI) * 86400000 };
 }
 
+
+const isHeating = t => { const m = berlin(t).mon; return m >= 10 || m <= 4; };
 
 // ---- DP planner (cost first, wear second via o.wear ct per DC kWh out) ----
 const DP = (() => {
@@ -116,6 +124,7 @@ const DP = (() => {
         const maxUp = Math.floor(MAX_W / 4000 * ETA_C / kwhPerStep), maxDn = Math.floor(MAX_W / 4000 / ETA_D / kwhPerStep);
         for (let k = K - 1; k >= 0; k--) {
             const f = fc[k], P = f.P / 4000, L = f.L / 4000, mp = f.mp, eff = effs[k];
+            const heatK = o.heatPlan && o.heatCt && isHeating(f.t) ? o.heatCt : 0;
             const NV = new Float64Array(N);
             const acts = k === 0 ? new Array(N) : null;
             const i0q = Math.max(0, Math.min(N - 1, Math.round((soc0 - SMIN) / dS)));
@@ -140,7 +149,7 @@ const DP = (() => {
                         if (x < 0) { x = 0; d = (x - i) * kwhPerStep; bAc = d * ETA_D; }
                         const x0 = Math.floor(x), x1 = Math.min(N - 1, x0 + 1), w = x - x0;
                         const v = V[x0] * (1 - w) + V[x1] * w;
-                        const c = gcost(L + bAc - P, mp, eff) + (d < 0 ? -d * o.wear : 0) + v;
+                        const c = gcost(L + bAc - P, mp, eff) + (d < 0 ? -d * o.wear : 0) + v - heatK * (bAc - d);
                         if (k === 0 && i === i0q) q0.set(G, c);
                         if (c < best - 1e-9) { best = c; bm = G; }
                     }
@@ -291,12 +300,14 @@ function main() {
         if (cb.PreventFeedback.value === 1 && grid < 0) { curtail += -grid; grid = 0; }
         soc += (b > 0 ? b * ETA_C : b / ETA_D) * 0.25 / 1000 / CAP_KWH * 100;
         prevBat = b;
+        const lossKwh = (b - (b > 0 ? b * ETA_C : b / ETA_D)) / 4000;   // AC - DC, always >= 0
+        const heat = o.heatCt && isHeating(t) ? lossKwh * o.heatCt : 0; // ct of gas heat saved
         const fee = (bt.mon >= 4 && bt.mon <= 9 && bt.h >= 10 && bt.h < 16) ? 10.4 : 13;
         rows.push({ t, date: bt.date, h: bt.h, state: cmd.state, mp, eff: mp + fee, P, L, b: Math.round(b), grid: Math.round(grid),
-            soc: Math.round(soc * 10) / 10, imp: Math.max(grid, 0) / 4000, exp: Math.max(-grid, 0) / 4000, curtail: Math.round(curtail) });
+            soc: Math.round(soc * 10) / 10, imp: Math.max(grid, 0) / 4000, exp: Math.max(-grid, 0) / 4000, curtail: Math.round(curtail), heat });
     }
     const sum = f => rows.reduce((a, r) => a + f(r), 0);
-    const cost = sum(r => r.imp * r.eff - r.exp * r.mp) / 100;
+    const cost = sum(r => r.imp * r.eff - r.exp * r.mp - r.heat) / 100;
     const adj = cost - (soc - soc0) / 100 * CAP_KWH * 0.18; // stored energy valued at 18 ct
     const dis = sum(r => r.b < 0 ? -r.b / 4000 / ETA_D : 0);
     const days = {};
@@ -306,7 +317,7 @@ function main() {
     console.log(`${(o.label || o.set.join(' ') || 'as-is').padEnd(30)} net EUR ${cost.toFixed(2)}  SOC-adj EUR ${adj.toFixed(2)}`
         + `  SOC ${soc0.toFixed(1)}->${soc.toFixed(1)}%  imp ${sum(r => r.imp).toFixed(0)} exp ${sum(r => r.exp).toFixed(0)} kWh`
         + `  feed-in slots ${rows.filter(r => r.state === 4).length}  charge slots ${rows.filter(r => r.state === 1).length}`
-        + `  min SOC ${Math.min(...lows).toFixed(1)}%  days<10% ${lows.filter(x => x < 10).length}  DCout ${dis.toFixed(0)} kWh  costInclWear ${(adj + dis * 0.015).toFixed(2)}`
+        + `  min SOC ${Math.min(...lows).toFixed(1)}%  days<10% ${lows.filter(x => x < 10).length}  DCout ${dis.toFixed(0)} kWh  costInclWear ${(adj + dis * 0.015).toFixed(2)}  heatCredit EUR ${(sum(r => r.heat) / 100).toFixed(2)}`
         + `  LP EUR ${pc.eur.toFixed(2)}  costInclWearLP ${(adj + dis * 0.015 + pc.eur).toFixed(2)}\n    peaks ${fmtPeaks(pc)}`);
     if (o.out) fs.writeFileSync(o.out, JSON.stringify(rows));
 }
