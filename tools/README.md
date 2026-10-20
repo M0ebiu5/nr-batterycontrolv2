@@ -118,3 +118,21 @@ on Sep 1 - Oct 16 (costInclWear + LP, EUR; LP at 33.82 / 19 EUR per kW-year):
 | 1500 no-pin | 1.50 / 1.82 | -2.50 | -6.24 |
 
 Autumn only; winter (more grid charging) is not in the data yet.
+
+### Morning-PV fog corrections, 2026-10-20
+
+`tools/data/2026-09-21_2026-10-19.json.gz`, `--policy dpg`, costInclWear (EUR, lower is better):
+
+| variant | EUR | vs current |
+|---|---|---|
+| current DP (forecast as is) | 1.12 | |
+| `--pv-am-adapt 7` (last 7 mornings' actual/forecast) | 1.67 | +0.55 |
+| `--scen 0.35,0.25` (hedge, 35 % fog at 25 % PV) | 2.79 | +1.67 |
+| `--pv-am 0.66` | 2.90 | +1.78 |
+| `--scen 0.5,0.25` | 3.51 | +2.39 |
+| `--pv-am 0.5` | 3.90 | +2.78 |
+
+Every correction loses: a kWh bought at night reaches the morning at
+(mp + 13 ct fee) / 0.81, so storing only beats buying in the morning above ~27 ct,
+and on the sunny mornings the pessimistic plan bought energy PV would have supplied.
+Recheck when the per-kWh grid fee drops (2027) or in winter with higher morning peaks.

@@ -7,6 +7,11 @@
 //              the DP shadow tab runs (dp_shadow_func.js)
 //     dp3/dpc  earlier variants: 3 battery modes / continuous battery power
 //     --perfect  the DP sees actual PV/load instead of the optimizer's forecast
+//     --pv-am F       morning PV (forecast slots before 11:00 Berlin) x F
+//     --pv-am-adapt K morning PV x (actual / forecast morning PV over the last K days, 0.2-1);
+//                     the forecast of a day is the one its 00:00 run saw
+//     --scen P,F      fog hedge (dpg): plan "forecast" and "morning PV x F", take the first
+//                     action with the lowest expected cost at fog probability P
 //     --no-pin   charge setpoints leave discharge free (MaxDischargePower -1): the Cerbo holds
 //                the grid at the setpoint, so a load above it is covered by the pack. With a
 //                low charge setpoint in GSET this caps the import peak (Leistungspreis).
@@ -61,6 +66,9 @@ function args() {
         else if (k === '--term') o.term = a.shift();
         else if (k === '--perfect') o.perfect = true;
         else if (k === '--no-pin') o.noPin = true;
+        else if (k === '--pv-am') o.pvAm = +a.shift();
+        else if (k === '--pv-am-adapt') o.pvAmAdapt = +a.shift();
+        else if (k === '--scen') { const [p, f] = a.shift().split(',').map(Number); o.scen = { p, f }; }
         else throw new Error('unknown option ' + k);
     }
     if (!o.data) throw new Error('usage: replay.js DATA.json.gz [--src F] [--set NAME=VALUE]... [--label L] [--no-weather] [--out F]');
@@ -96,6 +104,7 @@ const DP = (() => {
         return mp < 0 ? 0 : -e * mp;
     }
     function plan(fc, soc0, o) {
+        const q0 = new Map();   // dpg: cost-to-go of each setpoint from the start state
         const K = fc.length;
         const effs = fc.map(f => f.mp + feeOf(f.t));
         let q;
@@ -109,6 +118,7 @@ const DP = (() => {
             const f = fc[k], P = f.P / 4000, L = f.L / 4000, mp = f.mp, eff = effs[k];
             const NV = new Float64Array(N);
             const acts = k === 0 ? new Array(N) : null;
+            const i0q = Math.max(0, Math.min(N - 1, Math.round((soc0 - SMIN) / dS)));
             for (let i = 0; i < N; i++) {
                 let best = Infinity, bj = i, bm = 3;
                 if (o.policy === 'dpc') {
@@ -131,6 +141,7 @@ const DP = (() => {
                         const x0 = Math.floor(x), x1 = Math.min(N - 1, x0 + 1), w = x - x0;
                         const v = V[x0] * (1 - w) + V[x1] * w;
                         const c = gcost(L + bAc - P, mp, eff) + (d < 0 ? -d * o.wear : 0) + v;
+                        if (k === 0 && i === i0q) q0.set(G, c);
                         if (c < best - 1e-9) { best = c; bm = G; }
                     }
                 } else {
@@ -162,7 +173,7 @@ const DP = (() => {
             const sp = (L + bAc - P) * 4000;
             return { state: bAc > selfB ? 1 : 4, sp: Math.round(sp) };
         }
-        if (o.policy === 'dpg') return { state: a.m > 10 ? 1 : a.m < 0 ? 4 : 3, sp: a.m };
+        if (o.policy === 'dpg') return { state: a.m > 10 ? 1 : a.m < 0 ? 4 : 3, sp: a.m, q0 };
         return { state: a.m, sp: a.m === 1 ? MAX_W : a.m === 4 ? -MAX_W : 10 };
     }
     return { plan };
@@ -197,6 +208,7 @@ function main() {
     if (typeof soc !== 'number') soc = D.slots.find(s => s.t >= D.meta.t0 && typeof s.soc === 'number').soc;
     const soc0 = soc;
     let prevBat = 0;
+    const amFc = {}, amAct = {};
     const rows = [];
     for (let t = D.meta.t0; t < D.meta.t1; t += SLOT) {
         NOW = t + 30000; // live runs fire a few seconds after the slot start; at exactly t the schedule still holds the slot that just ended, and the optimizer acts on it
@@ -241,12 +253,35 @@ function main() {
                 const a = byT.get(s.t);
                 return o.perfect && a ? { t: s.t, P: a.pv, L: a.load, mp: s.marketPrice } : { t: s.t, P: s.pvPower, L: s.loadEst, mp: s.marketPrice };
             });
-            const G = DP.plan(fc, soc, o);
+            // Morning-PV corrections (fog). Forecast of each day = what its 00:00 run saw.
+            if (bt.h === 0 && bt.m === 0) {
+                amFc[bt.date] = fc.filter(f => berlin(f.t).date === bt.date && berlin(f.t).h < 11).reduce((x, f) => x + f.P, 0);
+            }
+            const isAm = f => berlin(f.t).h < 11;
+            let amK = 1;
+            if (o.pvAm) amK = o.pvAm;
+            if (o.pvAmAdapt) {
+                const ds = Object.keys(amFc).filter(d => d < bt.date).sort().slice(-o.pvAmAdapt);
+                const f = ds.reduce((x, d) => x + amFc[d], 0), r = ds.reduce((x, d) => x + (amAct[d] || 0), 0);
+                if (ds.length && f > 0) amK = Math.max(0.2, Math.min(1, r / f));
+            }
+            if (amK !== 1) fc.forEach(f => { if (isAm(f)) f.P *= amK; });
+            let G = DP.plan(fc, soc, o);
+            if (o.scen && o.policy === 'dpg') {
+                const G2 = DP.plan(fc.map(f => isAm(f) ? Object.assign({}, f, { P: f.P * o.scen.f }) : f), soc, o);
+                let best = Infinity, bsp = G.sp;
+                for (const [sp, c1] of G.q0) {
+                    const e = (1 - o.scen.p) * c1 + o.scen.p * (G2.q0.get(sp) ?? c1);
+                    if (e < best - 1e-9) { best = e; bsp = sp; }
+                }
+                G = { state: bsp > 10 ? 1 : bsp < 0 ? 4 : 3, sp: bsp };
+            }
             cmd = { state: G.state };
             cb = { AcPowerSetPoint: { value: G.sp }, MaxDischargePower: { value: G.state === 1 && !o.noPin ? 0 : -1 }, PreventFeedback: { value: fc[0].mp < 0 ? 1 : 0 } };
         }
         // Physics: the Cerbo holds the grid at the setpoint, within battery limits.
         const P = cur.pv, L = cur.load, mp = cur.mp;
+        if (bt.h < 11) amAct[bt.date] = (amAct[bt.date] || 0) + P;
         let b = Math.max(-MAX_W, Math.min(MAX_W, cb.AcPowerSetPoint.value + P - L));
         if (cb.MaxDischargePower.value === 0) b = Math.max(0, b);
         if (b > 0) b = Math.min(b, (100 - soc) / 100 * CAP_KWH / ETA_C / 0.25 * 1000);
