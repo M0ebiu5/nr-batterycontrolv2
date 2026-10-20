@@ -1214,7 +1214,14 @@ if (schedule.length > 0) {
                 let d = b > 0 ? b * ETA_CHARGE : b / ETA_DISCHARGE;
                 let x = i + d / _dpKwhStep;
                 if (x > _dpN - 1) { x = _dpN - 1; d = (x - i) * _dpKwhStep; b = d / ETA_CHARGE; }
-                if (x < 0) { x = 0; d = (x - i) * _dpKwhStep; b = d * ETA_DISCHARGE; }
+                if (x < 0) {
+                    // An export setpoint does not stop at the floor: the Cerbo holds
+                    // the grid at G and drains the pack for it. Clipping made it look
+                    // free here, and on 2026-10-20 the DP sold 1750 W at 20 ct from
+                    // 10 % down to 7 %. Feed-in must fit above the floor.
+                    if (DP_GSET[a] < 0) continue;
+                    x = 0; d = (x - i) * _dpKwhStep; b = d * ETA_DISCHARGE;
+                }
                 const x0 = Math.floor(x), x1 = Math.min(_dpN - 1, x0 + 1), w = x - x0;
                 const c = dpGridCost(L / 4 + b - P / 4, mp, ep) + (d < 0 ? -d * DP_WEAR_CT : 0)
                     + V[x0] * (1 - w) + V[x1] * w;
@@ -1319,9 +1326,13 @@ var weather7 = global.get("weather7days", "file")
 // state 3 (cover the household load) rather than acting on it. Emitting nothing
 // would leave the Cerbo pinned in whatever state 1 or 4 the last good run had
 // commanded, charging or draining blind - worse than doing nothing.
-const _cmdState = socStale ? 3 : (currentSlot ? currentSlot.state : 3);
+// Backstop for the same floor: never command an export with the pack at or below it.
+const _floorFeedin = !socStale && currentSlot && currentSlot.state === 4 && currentSoc <= MIN_SOC_PCT;
+const _cmdState = socStale || _floorFeedin ? 3 : (currentSlot ? currentSlot.state : 3);
 const _cmdReason = socStale
     ? `SOC stale (${currentSoc.toFixed(1)}% flat ${Math.round(_socFlatMin)}min, source ${_socSource}) - holding at load compensation`
+    : _floorFeedin
+    ? `Skip planned feed-in - SOC ${currentSoc.toFixed(1)}% at/below the ${MIN_SOC_PCT}% floor, compensate`
     : (currentSlot ? currentSlot.reason : 'no data');
 
 // === Device parameters (Cerbo + Symo) ===
