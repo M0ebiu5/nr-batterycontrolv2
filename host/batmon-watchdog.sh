@@ -20,6 +20,7 @@ STALE_S=300          # packs report every ~1.5-3 min
 ERR_WIN=3m ERR_N=2
 GRACE_S=300          # after an add-on (re)start, give the first poll round time
 COOLDOWN_S=900
+PROXY=192.168.4.105    # bt-proxy-batterie (ESP32-C6 at the Cerbo)
 STATE=/var/lib/batmon-watchdog/last_repair
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 
@@ -54,10 +55,16 @@ if [ $((now - last)) -lt $COOLDOWN_S ]; then
     log "repair needed for ${bad[*]}, but the last one was $(( (now - last) / 60 )) min ago - waiting"
     exit 0
 fi
-for p in "${bad[@]}"; do
-    log "removing $p (${MAC[$p]}) from BlueZ"
-    run bluetoothctl remove "${MAC[$p]}"
-done
+# Since 2026-10-21 batmon talks to the packs through the ESPHome proxy at the Cerbo
+# (ble_stack: esphome); BlueZ on big is not involved then, so only restart.
+if docker logs $CONTAINER 2>&1 | grep -m1 'BLE stack:' | grep -q esphome; then
+    ping -c1 -W3 $PROXY >/dev/null 2>&1 || log "ESPHome proxy $PROXY does not answer ping"
+else
+    for p in "${bad[@]}"; do
+        log "removing $p (${MAC[$p]}) from BlueZ"
+        run bluetoothctl remove "${MAC[$p]}"
+    done
+fi
 log "restarting batmon"
 run docker exec hassio_cli ha apps restart $ADDON
 [ $DRY = 1 ] || { mkdir -p "$(dirname $STATE)"; echo "$now" > $STATE; }

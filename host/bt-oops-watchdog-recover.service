@@ -1,0 +1,12 @@
+[Unit]
+Description=Clean up after a bt-oops-watchdog reboot (HA safe mode, notify)
+Before=docker.service
+ConditionPathExists=/var/lib/bt-oops-watchdog/pending
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/bt-oops-watchdog.sh unlock
+ExecStart=/usr/local/bin/bt-oops-watchdog.sh recover
+
+[Install]
+WantedBy=multi-user.target
