@@ -8,6 +8,7 @@
 // the old rule stack read are left in place unused.
 // Battery: 30 kWh, charger max 3500W, planning floor MIN_SOC_PCT
 // States: 1=charge from grid, 3=compensate load, 4=feed-in (setpoint per slot)
+// 5=hold in the logs only (batteryplan, optrun): commanded as 3 with MaxDischargePower 0
 // Grid fee: +13 ct/kWh, reduced 20% in months 4-9 between 10:00-16:00
 // Hard rule: NEVER feed in at negative market prices (we'd pay the grid)
 // ============================================================
