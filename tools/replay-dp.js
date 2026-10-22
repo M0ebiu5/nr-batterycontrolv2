@@ -16,6 +16,8 @@
 //                     the house and saves gas heat worth H ct (gas incl. grid/taxes / boiler
 //                     efficiency); credited in the cost of every variant
 //     --heat-plan     the DP plans with that credit too
+//     --hold     dpg: add the hold action (setpoint 10 W, MaxDischargePower 0): the grid
+//                covers the house, PV surplus still charges, the pack never discharges
 //     --no-pin   charge setpoints leave discharge free (MaxDischargePower -1): the Cerbo holds
 //                the grid at the setpoint, so a load above it is covered by the pack. With a
 //                low charge setpoint in GSET this caps the import peak (Leistungspreis).
@@ -70,6 +72,7 @@ function args() {
         else if (k === '--term') o.term = a.shift();
         else if (k === '--perfect') o.perfect = true;
         else if (k === '--no-pin') o.noPin = true;
+        else if (k === '--hold') o.hold = true;
         else if (k === '--heat-ct') o.heatCt = +a.shift();
         else if (k === '--heat-plan') o.heatPlan = true;
         else if (k === '--pv-am') o.pvAm = +a.shift();
@@ -102,6 +105,7 @@ const isHeating = t => { const m = berlin(t).mon; return m >= 10 || m <= 4; };
 // ---- DP planner (cost first, wear second via o.wear ct per DC kWh out) ----
 const DP = (() => {
     const GSET = (process.env.GSET || '3500,1750,10,-1750,-3500').split(',').map(Number);
+    const HOLD = 'hold';   // setpoint 10 W with MaxDischargePower 0 (--hold)
     const dS = 0.25, SMIN = 10, SMAX = 100, N = Math.round((SMAX - SMIN) / dS) + 1;
     const kwhPerStep = dS / 100 * CAP_KWH;
     const feeOf = t => { const b = berlin(t); return (b.mon >= 4 && b.mon <= 9 && b.h >= 10 && b.h < 16) ? 10.4 : 13; };
@@ -139,9 +143,10 @@ const DP = (() => {
                         if (c < best) { best = c; bj = j; }
                     }
                 } else if (o.policy === 'dpg') {
-                    for (const G of GSET) {
+                    for (const A of o.hold ? [...GSET, HOLD] : GSET) {
+                        const G = A === HOLD ? 10 : A;
                         let bAc = Math.max(-MAX_W / 4000, Math.min(MAX_W / 4000, G / 4000 + P - L));
-                        if (G > 10 && !o.noPin) bAc = Math.max(0, bAc);
+                        if ((G > 10 && !o.noPin) || A === HOLD) bAc = Math.max(0, bAc);
                         if (mp < 0) bAc = Math.max(bAc, Math.min(MAX_W / 4000, P - L)); // PreventFeedback: no export
                         let d = bAc > 0 ? bAc * ETA_C : bAc / ETA_D;
                         let x = i + d / kwhPerStep;
@@ -150,8 +155,8 @@ const DP = (() => {
                         const x0 = Math.floor(x), x1 = Math.min(N - 1, x0 + 1), w = x - x0;
                         const v = V[x0] * (1 - w) + V[x1] * w;
                         const c = gcost(L + bAc - P, mp, eff) + (d < 0 ? -d * o.wear : 0) + v - heatK * (bAc - d);
-                        if (k === 0 && i === i0q) q0.set(G, c);
-                        if (c < best - 1e-9) { best = c; bm = G; }
+                        if (k === 0 && i === i0q) q0.set(A, c);
+                        if (c < best - 1e-9) { best = c; bm = A; }
                     }
                 } else {
                     for (const m of [1, 3, 4]) {
@@ -182,10 +187,10 @@ const DP = (() => {
             const sp = (L + bAc - P) * 4000;
             return { state: bAc > selfB ? 1 : 4, sp: Math.round(sp) };
         }
-        if (o.policy === 'dpg') return { state: a.m > 10 ? 1 : a.m < 0 ? 4 : 3, sp: a.m, q0 };
+        if (o.policy === 'dpg') return a.m === HOLD ? { state: 3, sp: 10, hold: true, q0 } : { state: a.m > 10 ? 1 : a.m < 0 ? 4 : 3, sp: a.m, q0 };
         return { state: a.m, sp: a.m === 1 ? MAX_W : a.m === 4 ? -MAX_W : 10 };
     }
-    return { plan };
+    return { plan, HOLD };
 })();
 
 function main() {
@@ -283,10 +288,10 @@ function main() {
                     const e = (1 - o.scen.p) * c1 + o.scen.p * (G2.q0.get(sp) ?? c1);
                     if (e < best - 1e-9) { best = e; bsp = sp; }
                 }
-                G = { state: bsp > 10 ? 1 : bsp < 0 ? 4 : 3, sp: bsp };
+                G = bsp === DP.HOLD ? { state: 3, sp: 10, hold: true } : { state: bsp > 10 ? 1 : bsp < 0 ? 4 : 3, sp: bsp };
             }
-            cmd = { state: G.state };
-            cb = { AcPowerSetPoint: { value: G.sp }, MaxDischargePower: { value: G.state === 1 && !o.noPin ? 0 : -1 }, PreventFeedback: { value: fc[0].mp < 0 ? 1 : 0 } };
+            cmd = { state: G.state, hold: !!G.hold };
+            cb = { AcPowerSetPoint: { value: G.sp }, MaxDischargePower: { value: (G.state === 1 && !o.noPin) || G.hold ? 0 : -1 }, PreventFeedback: { value: fc[0].mp < 0 ? 1 : 0 } };
         }
         // Physics: the Cerbo holds the grid at the setpoint, within battery limits.
         const P = cur.pv, L = cur.load, mp = cur.mp;
@@ -303,7 +308,7 @@ function main() {
         const lossKwh = (b - (b > 0 ? b * ETA_C : b / ETA_D)) / 4000;   // AC - DC, always >= 0
         const heat = o.heatCt && isHeating(t) ? lossKwh * o.heatCt : 0; // ct of gas heat saved
         const fee = (bt.mon >= 4 && bt.mon <= 9 && bt.h >= 10 && bt.h < 16) ? 10.4 : 13;
-        rows.push({ t, date: bt.date, h: bt.h, state: cmd.state, mp, eff: mp + fee, P, L, b: Math.round(b), grid: Math.round(grid),
+        rows.push({ t, date: bt.date, h: bt.h, state: cmd.state, hold: !!cmd.hold, mp, eff: mp + fee, P, L, b: Math.round(b), grid: Math.round(grid),
             soc: Math.round(soc * 10) / 10, imp: Math.max(grid, 0) / 4000, exp: Math.max(-grid, 0) / 4000, curtail: Math.round(curtail), heat });
     }
     const sum = f => rows.reduce((a, r) => a + f(r), 0);
@@ -316,7 +321,7 @@ function main() {
     const pc = peakCharge(rows, o.lp);
     console.log(`${(o.label || o.set.join(' ') || 'as-is').padEnd(30)} net EUR ${cost.toFixed(2)}  SOC-adj EUR ${adj.toFixed(2)}`
         + `  SOC ${soc0.toFixed(1)}->${soc.toFixed(1)}%  imp ${sum(r => r.imp).toFixed(0)} exp ${sum(r => r.exp).toFixed(0)} kWh`
-        + `  feed-in slots ${rows.filter(r => r.state === 4).length}  charge slots ${rows.filter(r => r.state === 1).length}`
+        + `  feed-in slots ${rows.filter(r => r.state === 4).length}  charge slots ${rows.filter(r => r.state === 1).length}  hold slots ${rows.filter(r => r.hold).length}`
         + `  min SOC ${Math.min(...lows).toFixed(1)}%  days<10% ${lows.filter(x => x < 10).length}  DCout ${dis.toFixed(0)} kWh  costInclWear ${(adj + dis * 0.015).toFixed(2)}  heatCredit EUR ${(sum(r => r.heat) / 100).toFixed(2)}`
         + `  LP EUR ${pc.eur.toFixed(2)}  costInclWearLP ${(adj + dis * 0.015 + pc.eur).toFixed(2)}\n    peaks ${fmtPeaks(pc)}`);
     if (o.out) fs.writeFileSync(o.out, JSON.stringify(rows));

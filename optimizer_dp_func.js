@@ -1147,7 +1147,11 @@ let tomorrowSunPoor = false;
 // Actions are Cerbo grid setpoints, modelled the way the Cerbo executes them:
 // battery = clamp(setpoint + PV - load). > DP_SELF_W = charge (discharge
 // pinned to 0), < 0 = export, DP_SELF_W = self-consumption. At mp < 0 export
-// is blocked (PreventFeedback, see the device parameters).
+// is blocked (PreventFeedback, see the device parameters). The last action,
+// hold, is DP_SELF_W with discharge pinned to 0: the grid carries the house and
+// PV surplus still charges. Without it the pack could only drain or charge, so
+// on 2026-10-22 it covered the night at 20 ct, hit the floor at 03:15 and left
+// the 29 ct morning peak to the grid. Replay Sep 22-Oct 21: -1.71 EUR.
 // State: SOC on a DP_STEP grid from MIN_SOC_PCT to 100 %. Energy left at the
 // horizon end is worth the DP_TERM_PCTL import price of the horizon x
 // ETA_DISCHARGE. Replay 2026-09-01..10-16 (46 days, cost + wear, SOC-adjusted):
@@ -1170,7 +1174,8 @@ const LP_FROM = null;              // e.g. '2027-01-01T00:00:00+01:00' (Netz OÖ
 const LP_CHARGE_CAP_W = 2000;      // = the 2 kW billing minimum
 const _lpActive = LP_FROM !== null && now >= Date.parse(LP_FROM);
 const DP_CHARGE_W = _lpActive ? Math.min(LP_CHARGE_CAP_W, MAX_CHARGE_W) : MAX_CHARGE_W;
-const DP_GSET = [DP_CHARGE_W, DP_CHARGE_W / 2, DP_SELF_W, -MAX_DISCHARGE_W / 2, -MAX_DISCHARGE_W];
+const DP_GSET = [DP_CHARGE_W, DP_CHARGE_W / 2, DP_SELF_W, -MAX_DISCHARGE_W / 2, -MAX_DISCHARGE_W, DP_SELF_W];
+const DP_HOLD_A = DP_GSET.length - 1;   // index of the hold action
 const DP_MAX_FEEDIN_W = 4900;      // combined export cap (= MAX_TOTAL_FEEDIN_W below)
 
 function dpGridCost(kwh, mp, ep) {
@@ -1178,15 +1183,15 @@ function dpGridCost(kwh, mp, ep) {
     return mp < 0 ? 0 : -Math.min(-kwh, DP_MAX_FEEDIN_W / 4000) * mp;
 }
 // Battery AC power (kW, + = charge) the Cerbo produces for setpoint G.
-function dpBattery(G, pvKw, loadKw, mp) {
+function dpBattery(G, pvKw, loadKw, mp, hold) {
     let b = Math.max(-MAX_DISCHARGE_W / 1000, Math.min(MAX_CHARGE_W / 1000, G / 1000 + pvKw - loadKw));
-    if (G > DP_SELF_W && !_lpActive) b = Math.max(0, b);
+    if ((G > DP_SELF_W && !_lpActive) || hold) b = Math.max(0, b);
     if (mp < 0) b = Math.max(b, Math.min(MAX_CHARGE_W / 1000, pvKw - loadKw));
     return b;
 }
 // One slot's battery kWh (AC) and SOC delta, clipped to the SOC range.
-function dpStep(G, s, socPct) {
-    let b = dpBattery(G, s.pvPower / 1000, s.loadEst / 1000, s.marketPrice) / 4;
+function dpStep(G, s, socPct, hold) {
+    let b = dpBattery(G, s.pvPower / 1000, s.loadEst / 1000, s.marketPrice, hold) / 4;
     if (b > 0) b = Math.min(b, (100 - socPct) / 100 * BATTERY_CAPACITY_KWH / ETA_CHARGE);
     if (b < 0) b = Math.max(b, -(socPct - MIN_SOC_PCT) / 100 * BATTERY_CAPACITY_KWH * ETA_DISCHARGE);
     const dcKwh = b > 0 ? b * ETA_CHARGE : b / ETA_DISCHARGE;
@@ -1210,7 +1215,7 @@ if (schedule.length > 0) {
         for (let i = 0; i < _dpN; i++) {
             let best = Infinity, ba = DP_GSET.indexOf(DP_SELF_W);
             for (let a = 0; a < DP_GSET.length; a++) {
-                let b = dpBattery(DP_GSET[a], P, L, mp) / 4;
+                let b = dpBattery(DP_GSET[a], P, L, mp, a === DP_HOLD_A) / 4;
                 let d = b > 0 ? b * ETA_CHARGE : b / ETA_DISCHARGE;
                 let x = i + d / _dpKwhStep;
                 if (x > _dpN - 1) { x = _dpN - 1; d = (x - i) * _dpKwhStep; b = d / ETA_CHARGE; }
@@ -1241,7 +1246,8 @@ if (schedule.length > 0) {
     for (let i = 0; i < schedule.length; i++) {
         const slot = schedule[i];
         const mp = slot.marketPrice, ep = slot.effectivePrice;
-        let G = DP_GSET[_dpActs[i][_dpIdx(soc)]];
+        const a = _dpActs[i][_dpIdx(soc)];
+        let G = DP_GSET[a], hold = a === DP_HOLD_A;
         let reason;
         if (i === 0 && G > DP_SELF_W && gridChargeBlocked) {
             G = DP_SELF_W;
@@ -1255,15 +1261,17 @@ if (schedule.length > 0) {
             G = DP_SELF_W;   // cannot happen (export is priced out), kept as the hard guard
             reason = `Skip feed-in at ${mp.toFixed(1)}ct (neg price), compensate`;
         }
-        const st = dpStep(G, slot, soc);
+        const st = dpStep(G, slot, soc, hold);
         soc = Math.max(MIN_SOC_PCT, Math.min(100, soc + st.dSoc));
         const state = G > DP_SELF_W ? 1 : G < 0 ? 4 : 3;
         if (!reason) {
             reason = state === 1 ? `DP charge: grid ${G}W at ${ep.toFixed(1)}ct`
                 : state === 4 ? `DP feed-in: grid ${G}W at ${mp.toFixed(1)}ct`
+                : hold ? `DP hold: grid covers the house at ${ep.toFixed(1)}ct, pack kept for later`
                 : `DP compensate: self-consumption at ${ep.toFixed(1)}ct`;
         }
         slot.state = state;
+        slot.hold = hold;
         slot.acPowerSetPoint = G;
         slot.predictedSoc = Math.round(soc * 10) / 10;
         slot.reason = reason;
@@ -1286,6 +1294,7 @@ const output = schedule.map(s => ({
     time: s.timeStr,
     state: s.state,
     acPowerSetPoint: s.acPowerSetPoint,
+    hold: s.hold,
     predictedSoc: s.predictedSoc,
     marketPrice: s.marketPrice,
     effectivePrice: Math.round(s.effectivePrice * 100) / 100,
@@ -1374,6 +1383,11 @@ if (_cmdState === 1) {
     _maxDischarge = 0;
     _setPointWhy = `state 3 at ${_mpTxt}: SOC ${currentSoc.toFixed(1)}% at/below the ${MIN_SOC_PCT}% floor, the grid carries the house`;
     _maxDischargeWhy = `pinned to 0 at the ${MIN_SOC_PCT}% planning floor - the Cerbo's own minimum SOC is 0, so nothing else stops the drain`;
+} else if (!socStale && currentSlot && currentSlot.hold) {
+    _acSetPoint = IDLE_SETPOINT_W;
+    _maxDischarge = 0;
+    _setPointWhy = `state 3 hold at ${_mpTxt}: the grid carries the house, the pack is kept for a dearer slot`;
+    _maxDischargeWhy = 'pinned to 0 so the pack holds its charge; PV surplus can still charge it';
 } else {
     _acSetPoint = IDLE_SETPOINT_W;
     _maxDischarge = -1;
