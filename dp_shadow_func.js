@@ -15,8 +15,9 @@
 //
 // Actions are Cerbo grid setpoints, executed the way the Cerbo executes them:
 // battery = clamp(setpoint + PV - load). >10 W = charge (discharge pinned to 0),
-// <0 = export, 10 = self-consumption. At mp < 0 export is blocked
-// (PreventFeedback), as live.
+// <0 = export, 10 = self-consumption, hold = 10 with discharge pinned to 0 (the
+// grid carries the house; as live since 2026-10-22). At mp < 0 export is
+// blocked (PreventFeedback), as live. dpState / sh_state 5 = hold.
 //
 // Inputs: msg.payload = raw InfluxDB results for the slot that just ended
 // (PV mean, grid mean balanceeme (+ = export), battery mean), from the query
@@ -43,7 +44,8 @@ const SOC_CUTOFF = 3;          // packs stop discharging here (virtual physics)
 const DP_STEP = 0.25;          // SOC grid of the DP, %
 const DP_WEAR_CT = 1.5;        // per kWh out of the cells
 const DP_TERM_PCTL = 0.5;      // energy left at the horizon end is worth this percentile of the horizon's import price x ETA_D
-const GSET = [3500, 1750, 10, -1750, -3500]; // grid setpoints the DP may choose (W)
+const GSET = [3500, 1750, 10, -1750, -3500, 10]; // grid setpoints the DP may choose (W); the last is hold
+const HOLD_A = GSET.length - 1;
 const BASE_GRID_FEE = 13;
 const SLOT = 15 * 60 * 1000;
 
@@ -59,12 +61,15 @@ function gridCost(kwh, mp, eff) {
     return mp < 0 ? 0 : -Math.min(-kwh, MAX_FEEDIN_W / 4000) * mp;
 }
 // Battery AC power (kW, + = charge) the Cerbo produces for setpoint G.
-function batteryFor(G, pvKw, loadKw, mp) {
+function batteryFor(G, pvKw, loadKw, mp, hold) {
     let b = Math.max(-MAX_W / 1000, Math.min(MAX_W / 1000, G / 1000 + pvKw - loadKw));
-    if (G > 10) b = Math.max(0, b);
+    if (G > 10 || hold) b = Math.max(0, b);
     if (mp < 0) b = Math.max(b, Math.min(MAX_W / 1000, pvKw - loadKw));
     return b;
 }
+
+// Logged state: 1 charge, 3 self-consumption, 4 feed-in, 5 hold.
+const stateOf = (G, hold) => hold ? 5 : G > 10 ? 1 : G < 0 ? 4 : 3;
 
 function plan(fc, soc0) {
     const N = Math.round((100 - SOC_MIN) / DP_STEP) + 1, kwhStep = DP_STEP / 100 * CAP_KWH;
@@ -82,7 +87,7 @@ function plan(fc, soc0) {
             let best = Infinity, ba = GSET.indexOf(10);
             for (let a = 0; a < GSET.length; a++) {
                 const G = GSET[a];
-                let b = batteryFor(G, P, L, mp) / 4;            // kWh AC this slot
+                let b = batteryFor(G, P, L, mp, a === HOLD_A) / 4; // kWh AC this slot
                 let d = b > 0 ? b * ETA_C : b / ETA_D;          // kWh in the cells
                 let x = i + d / kwhStep;
                 if (x > N - 1) { x = N - 1; d = (x - i) * kwhStep; b = d / ETA_C; }
@@ -104,15 +109,15 @@ function plan(fc, soc0) {
     const traj = [];
     let soc = soc0;
     for (let k = 0; k < fc.length; k++) {
-        const G = GSET[acts[k][idx(soc)]];
+        const a = acts[k][idx(soc)], G = GSET[a], hold = a === HOLD_A;
         const P = fc[k].P / 1000, L = fc[k].L / 1000;
-        let b = batteryFor(G, P, L, fc[k].mp) / 4;
+        let b = batteryFor(G, P, L, fc[k].mp, hold) / 4;
         if (b > 0) b = Math.min(b, (100 - soc) / 100 * CAP_KWH / ETA_C);
         if (b < 0) b = Math.max(b, -(soc - SOC_MIN) / 100 * CAP_KWH * ETA_D);
         soc += (b > 0 ? b * ETA_C : b / ETA_D) / CAP_KWH * 100;
-        traj.push({ t: fc[k].t, G, soc });
+        traj.push({ t: fc[k].t, G, hold, soc });
     }
-    return { G: traj[0].G, planCostCt: firstV[idx(soc0)], termCt: q, traj };
+    return { G: traj[0].G, hold: traj[0].hold, planCostCt: firstV[idx(soc0)], termCt: q, traj };
 }
 
 // ---- inputs ---------------------------------------------------------------
@@ -151,7 +156,7 @@ if (st.cmd && st.cmd.t === slotT - SLOT && pvW !== null && balW !== null) {
     const loadW = Math.max(0, pvW + gridImpW - (batW || 0)); // load = PV + grid - battery
     const P = Math.max(0, pvW) / 1000, L = loadW / 1000;
     // virtual battery under the shadow's command, the replay's physics
-    let b = batteryFor(c.G, P, L, c.mp);
+    let b = batteryFor(c.G, P, L, c.mp, c.hold);
     if (b > 0) b = Math.min(b, (100 - st.soc) / 100 * CAP_KWH / ETA_C * 4);
     if (b < 0) b = Math.max(b, -(st.soc - SOC_CUTOFF) / 100 * CAP_KWH * ETA_D * 4);
     let grid = L + b - P;
@@ -167,7 +172,7 @@ if (st.cmd && st.cmd.t === slotT - SLOT && pvW !== null && balW !== null) {
         measurement: 'dpshadow',
         timestamp: new Date(c.t),
         fields: {
-            sh_sp: c.G, sh_state: c.G > 10 ? 1 : c.G < 0 ? 4 : 3,
+            sh_sp: c.G, sh_state: stateOf(c.G, c.hold),
             sh_soc: Math.round(st.soc * 10) / 10, sh_grid: Math.round(grid * 1000), sh_cost: Math.round(shCost * 100) / 100,
             live_state: c.liveState, live_grid: Math.round(gridImpW), live_cost: Math.round(liveCost * 100) / 100,
             real_soc: realSoc === null ? undefined : Math.round(realSoc * 10) / 10, soc_src: socSrc,
@@ -185,13 +190,13 @@ let why, planPoints = null;
 if (pred.length >= 8 && pred[0].t === slotT) {
     const fc = pred.map(s => ({ t: s.t, P: Math.max(0, s.pvPower || 0), L: Math.max(0, s.loadEst || 0), mp: s.marketPrice }));
     const r = plan(fc, st.soc);
-    st.cmd = { t: slotT, G: r.G, mp: fc[0].mp, eff: fc[0].mp + gridFee(slotT), liveState: pred[0].state, planCostCt: r.planCostCt, termCt: r.termCt };
-    why = `sp ${r.G}W`;
+    st.cmd = { t: slotT, G: r.G, hold: r.hold, mp: fc[0].mp, eff: fc[0].mp + gridFee(slotT), liveState: pred[0].state, planCostCt: r.planCostCt, termCt: r.termCt };
+    why = r.hold ? 'hold' : `sp ${r.G}W`;
     // The displayed plan starts from the live SOC; the virtual battery's own plan (r) only drives the cost comparison.
     const rShow = realSoc === null ? r : plan(fc, realSoc);
     planPoints = rShow.traj.map(x => ({
         measurement: 'batteryplan', timestamp: new Date(x.t),
-        fields: { dpState: x.G > 10 ? 1 : x.G < 0 ? 4 : 3, dpPredictedSoc: Math.round(x.soc * 10) / 10 }
+        fields: { dpState: stateOf(x.G, x.hold), dpPredictedSoc: Math.round(x.soc * 10) / 10 }
     }));
 } else {
     // no fresh forecast this slot: hold self-consumption, like a live fallback
