@@ -1360,7 +1360,7 @@ const _negPrice = (_mp !== null && _mp < 0);
 
 // Only AcPowerSetPoint can *force* an import or an export; the other four
 // settings are limits that gate what the ESS is allowed to do on its own.
-let _acSetPoint, _maxDischarge, _setPointWhy, _maxDischargeWhy;
+let _acSetPoint, _maxDischarge, _setPointWhy, _maxDischargeWhy, _cmdHold = false;
 const _dpSp = currentSlot && typeof currentSlot.acPowerSetPoint === 'number' ? currentSlot.acPowerSetPoint : null;
 if (_cmdState === 1) {
     _acSetPoint = _dpSp !== null && _dpSp > IDLE_SETPOINT_W ? _dpSp : DP_CHARGE_W;
@@ -1388,6 +1388,7 @@ if (_cmdState === 1) {
     _maxDischarge = 0;
     _setPointWhy = `state 3 hold at ${_mpTxt}: the grid carries the house, the pack is kept for a dearer slot`;
     _maxDischargeWhy = 'pinned to 0 so the pack holds its charge; PV surplus can still charge it';
+    _cmdHold = true;
 } else {
     _acSetPoint = IDLE_SETPOINT_W;
     _maxDischarge = -1;
@@ -1494,6 +1495,7 @@ const _sunNow = getSunshineForecast(now);
 Object.assign(msg.summary, {
     slotT: currentSlot ? currentSlot.t : null,
     cmdState: _cmdState,
+    cmdHold: _cmdHold,
     setPointW: _acSetPoint,
     marketPrice: _mp,
     pvFcW: currentSlot ? currentSlot.pvPower : null,
