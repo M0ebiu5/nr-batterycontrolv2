@@ -260,7 +260,7 @@
             "id": "cb_trend_query",
             "type": "influxdb in",
             "z": "8a7a85d30c1477cc",
-            "influxdb": "influxdb_config_infra",
+            "influxdb": "influxdb_config",
             "name": "24h cell_delta medians",
             "query": "SELECT MEDIAN(cell_delta) FROM bms_health WHERE time > now() - 24h GROUP BY time(1h), bank FILL(none)",
             "rawOutput": true,
